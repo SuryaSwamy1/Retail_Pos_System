@@ -1,0 +1,437 @@
+SUBROUTINE INV.READ(ITEM.ID.IN, STORE.ID.IN, ITEM.REC.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: INV.READ
+* Purpose: Read Inventory Item Record with Calculated Fields
+* Parameters:
+*   ITEM.ID.IN (IN) - Item ID to read (or SKU/UPC)
+*   STORE.ID.IN (IN) - Store ID for store-specific quantities (blank = all)
+*   ITEM.REC.OUT (OUT) - Item record with calculated fields
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+ITEM.REC.OUT = ''
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate input
+IF ITEM.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Item ID, SKU, or UPC is required'
+   RETURN
+END
+
+* Determine if input is Item ID, SKU, or UPC
+ACTUAL.ITEM.ID = ''
+GOSUB RESOLVE.ITEM.ID
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Read item record with record locking
+READU ITEM.REC.OUT FROM F.INVENTORY, ACTUAL.ITEM.ID LOCKED
+   * Record is locked by another user
+   ERROR.CODE = ERR.RECORD.LOCKED
+   ERROR.MSG = 'Item record is locked by another user'
+   RETURN
+END ELSE
+   * Record does not exist
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Item not found: ' : ITEM.ID.IN
+   RETURN
+END
+
+* Release the lock (we only needed it for reading)
+RELEASE F.INVENTORY, ACTUAL.ITEM.ID
+
+* Calculate derived fields
+GOSUB CALCULATE.DERIVED.FIELDS
+
+* Get store-specific information if store ID provided
+IF STORE.ID.IN # '' THEN
+   GOSUB GET.STORE.SPECIFIC.DATA
+END
+
+* Get additional context information
+GOSUB GET.SALES.HISTORY
+GOSUB GET.RECEIVING.HISTORY
+GOSUB CHECK.PROMOTIONAL.STATUS
+GOSUB CHECK.REORDER.STATUS
+
+RETURN
+
+**************************************************************************
+* Resolve Item ID from SKU or UPC
+**************************************************************************
+RESOLVE.ITEM.ID:
+   * First try as direct Item ID
+   READ TEST.REC FROM F.INVENTORY, ITEM.ID.IN ELSE
+      * Not found as Item ID, try SKU
+      SELECT.CMD = 'SELECT INVENTORY WITH SKU = "' : ITEM.ID.IN : '"'
+      EXECUTE SELECT.CMD
+      READNEXT ACTUAL.ITEM.ID ELSE
+         * Not found as SKU, try UPC
+         SELECT.CMD = 'SELECT INVENTORY WITH UPC = "' : ITEM.ID.IN : '"'
+         EXECUTE SELECT.CMD
+         READNEXT ACTUAL.ITEM.ID ELSE
+            * Not found by any identifier
+            ERROR.CODE = ERR.RECORD.NOT.FOUND
+            ERROR.MSG = 'Item not found by ID, SKU, or UPC: ' : ITEM.ID.IN
+            RETURN
+         END
+      END
+   END
+   IF ACTUAL.ITEM.ID = '' THEN
+      ACTUAL.ITEM.ID = ITEM.ID.IN
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Derived Fields
+**************************************************************************
+CALCULATE.DERIVED.FIELDS:
+   * Calculate total quantity on hand across all stores
+   TOTAL.QTY.ON.HAND = 0
+   TOTAL.QTY.ALLOCATED = 0
+   TOTAL.QTY.AVAILABLE = 0
+
+   QTY.COUNT = DCOUNT(ITEM.REC.OUT<QTY.ON.HAND>, VM)
+   FOR I = 1 TO QTY.COUNT
+      ON.HAND = ITEM.REC.OUT<QTY.ON.HAND, I>
+      ALLOCATED = ITEM.REC.OUT<QTY.ALLOCATED, I>
+
+      IF ON.HAND = '' THEN ON.HAND = 0
+      IF ALLOCATED = '' THEN ALLOCATED = 0
+
+      TOTAL.QTY.ON.HAND += ON.HAND
+      TOTAL.QTY.ALLOCATED += ALLOCATED
+
+      * Calculate available for this store
+      AVAILABLE = ON.HAND - ALLOCATED
+      ITEM.REC.OUT<QTY.AVAILABLE, I> = AVAILABLE
+      TOTAL.QTY.AVAILABLE += AVAILABLE
+   NEXT I
+
+   * Calculate inventory value
+   AVG.COST.VAL = ITEM.REC.OUT<AVG.COST>
+   IF AVG.COST.VAL = '' THEN AVG.COST.VAL = 0
+   INVENTORY.VALUE = TOTAL.QTY.ON.HAND * AVG.COST.VAL
+
+   * Calculate markup and margin percentages
+   COST.VAL = ITEM.REC.OUT<COST>
+   PRICE.VAL = ITEM.REC.OUT<PRICE.LEVEL1>
+   IF COST.VAL = '' THEN COST.VAL = 0
+   IF PRICE.VAL = '' THEN PRICE.VAL = 0
+
+   IF COST.VAL > 0 THEN
+      MARKUP.PCT = ((PRICE.VAL - COST.VAL) / COST.VAL) * 100
+   END ELSE
+      MARKUP.PCT = 0
+   END
+
+   IF PRICE.VAL > 0 THEN
+      MARGIN.PCT = ((PRICE.VAL - COST.VAL) / PRICE.VAL) * 100
+   END ELSE
+      MARGIN.PCT = 0
+   END
+
+   * Check if item is on sale
+   ON.SALE = 'N'
+   SALE.START = ITEM.REC.OUT<SALE.START.DATE>
+   SALE.END = ITEM.REC.OUT<SALE.END.DATE>
+   IF SALE.START # '' AND SALE.END # '' THEN
+      IF SYSTEM.DATE >= SALE.START AND SYSTEM.DATE <= SALE.END THEN
+         ON.SALE = 'Y'
+      END
+   END
+
+   * Determine current selling price
+   IF ON.SALE = 'Y' THEN
+      CURRENT.PRICE = ITEM.REC.OUT<SALE.PRICE>
+   END ELSE
+      CURRENT.PRICE = PRICE.VAL
+   END
+
+   * Calculate days since last sale
+   IF ITEM.REC.OUT<LAST.SALE.DATE> # '' THEN
+      DAYS.SINCE.SALE = SYSTEM.DATE - ITEM.REC.OUT<LAST.SALE.DATE>
+   END ELSE
+      DAYS.SINCE.SALE = -1
+   END
+
+   * Calculate days since last receipt
+   IF ITEM.REC.OUT<LAST.RECEIPT.DATE> # '' THEN
+      DAYS.SINCE.RECEIPT = SYSTEM.DATE - ITEM.REC.OUT<LAST.RECEIPT.DATE>
+   END ELSE
+      DAYS.SINCE.RECEIPT = -1
+   END
+
+   * Append calculated fields (using high attribute numbers)
+   ITEM.REC.OUT<200> = TOTAL.QTY.ON.HAND
+   ITEM.REC.OUT<201> = TOTAL.QTY.ALLOCATED
+   ITEM.REC.OUT<202> = TOTAL.QTY.AVAILABLE
+   ITEM.REC.OUT<203> = INVENTORY.VALUE
+   ITEM.REC.OUT<204> = MARKUP.PCT
+   ITEM.REC.OUT<205> = MARGIN.PCT
+   ITEM.REC.OUT<206> = ON.SALE
+   ITEM.REC.OUT<207> = CURRENT.PRICE
+   ITEM.REC.OUT<208> = DAYS.SINCE.SALE
+   ITEM.REC.OUT<209> = DAYS.SINCE.RECEIPT
+   RETURN
+
+**************************************************************************
+* Get Store-Specific Data
+**************************************************************************
+GET.STORE.SPECIFIC.DATA:
+   * Find the store in the multivalued list
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   STORE.INDEX = 0
+   STORE.COUNT = 0
+   LOOP
+      READNEXT STORE.ID ELSE EXIT
+      STORE.COUNT += 1
+      IF STORE.ID = STORE.ID.IN THEN
+         STORE.INDEX = STORE.COUNT
+      END
+   REPEAT
+
+   IF STORE.INDEX = 0 THEN
+      * Store not found or no data
+      ITEM.REC.OUT<210> = 0  ; Store qty on hand
+      ITEM.REC.OUT<211> = 0  ; Store qty allocated
+      ITEM.REC.OUT<212> = 0  ; Store qty available
+      ITEM.REC.OUT<213> = ''  ; Store location
+      ITEM.REC.OUT<214> = ''  ; Store bin location
+      ITEM.REC.OUT<215> = 0  ; Store reorder point
+   END ELSE
+      * Get store-specific quantities
+      STORE.QTY.OH = ITEM.REC.OUT<QTY.ON.HAND, STORE.INDEX>
+      STORE.QTY.ALLOC = ITEM.REC.OUT<QTY.ALLOCATED, STORE.INDEX>
+      STORE.QTY.AVAIL = ITEM.REC.OUT<QTY.AVAILABLE, STORE.INDEX>
+      STORE.LOC = ITEM.REC.OUT<LOCATION, STORE.INDEX>
+      STORE.BIN = ITEM.REC.OUT<BIN.LOCATION, STORE.INDEX>
+      STORE.REORDER = ITEM.REC.OUT<REORDER.POINT, STORE.INDEX>
+
+      IF STORE.QTY.OH = '' THEN STORE.QTY.OH = 0
+      IF STORE.QTY.ALLOC = '' THEN STORE.QTY.ALLOC = 0
+      IF STORE.QTY.AVAIL = '' THEN STORE.QTY.AVAIL = 0
+      IF STORE.REORDER = '' THEN STORE.REORDER = 0
+
+      ITEM.REC.OUT<210> = STORE.QTY.OH
+      ITEM.REC.OUT<211> = STORE.QTY.ALLOC
+      ITEM.REC.OUT<212> = STORE.QTY.AVAIL
+      ITEM.REC.OUT<213> = STORE.LOC
+      ITEM.REC.OUT<214> = STORE.BIN
+      ITEM.REC.OUT<215> = STORE.REORDER
+
+      * Check if below reorder point
+      IF STORE.QTY.AVAIL <= STORE.REORDER THEN
+         ITEM.REC.OUT<216> = 'Y'  ; Needs reorder
+      END ELSE
+         ITEM.REC.OUT<216> = 'N'
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Get Sales History
+**************************************************************************
+GET.SALES.HISTORY:
+   * Get sales for last 30, 60, 90 days
+   DATE.30 = SYSTEM.DATE - 30
+   DATE.60 = SYSTEM.DATE - 60
+   DATE.90 = SYSTEM.DATE - 90
+
+   SALES.30.QTY = 0
+   SALES.60.QTY = 0
+   SALES.90.QTY = 0
+   SALES.30.AMT = 0
+   SALES.60.AMT = 0
+   SALES.90.AMT = 0
+
+   * Select transactions for this item
+   SELECT.CMD = 'SELECT POS.TRANS WITH T.ITEM.ID = "' : ACTUAL.ITEM.ID : '"'
+   SELECT.CMD := ' AND TRANS.DATE >= "' : DATE.90 : '"'
+   SELECT.CMD := ' AND STATUS # "' : STATUS.VOID : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      TRANS.DATE = TRANS.REC<TRANS.DATE>
+      TRANS.TYPE = TRANS.REC<TRANS.TYPE>
+
+      * Find this item in the transaction
+      ITEM.COUNT = DCOUNT(TRANS.REC<T.ITEM.ID>, VM)
+      FOR I = 1 TO ITEM.COUNT
+         IF TRANS.REC<T.ITEM.ID, I> = ACTUAL.ITEM.ID THEN
+            QTY = TRANS.REC<T.QTY, I>
+            AMT = TRANS.REC<T.LINE.TOTAL, I>
+            IF QTY = '' THEN QTY = 0
+            IF AMT = '' THEN AMT = 0
+
+            * Negative for returns
+            IF TRANS.TYPE = TXN.RETURN THEN
+               QTY = -QTY
+               AMT = -AMT
+            END
+
+            * Accumulate by date range
+            IF TRANS.DATE >= DATE.30 THEN
+               SALES.30.QTY += QTY
+               SALES.30.AMT += AMT
+            END
+            IF TRANS.DATE >= DATE.60 THEN
+               SALES.60.QTY += QTY
+               SALES.60.AMT += AMT
+            END
+            IF TRANS.DATE >= DATE.90 THEN
+               SALES.90.QTY += QTY
+               SALES.90.AMT += AMT
+            END
+         END
+      NEXT I
+   REPEAT
+
+   * Store sales history
+   ITEM.REC.OUT<220> = SALES.30.QTY
+   ITEM.REC.OUT<221> = SALES.60.QTY
+   ITEM.REC.OUT<222> = SALES.90.QTY
+   ITEM.REC.OUT<223> = SALES.30.AMT
+   ITEM.REC.OUT<224> = SALES.60.AMT
+   ITEM.REC.OUT<225> = SALES.90.AMT
+
+   * Calculate velocity (avg units per day)
+   IF SALES.90.QTY > 0 THEN
+      VELOCITY = SALES.90.QTY / 90
+   END ELSE
+      VELOCITY = 0
+   END
+   ITEM.REC.OUT<226> = VELOCITY
+   RETURN
+
+**************************************************************************
+* Get Receiving History
+**************************************************************************
+GET.RECEIVING.HISTORY:
+   * Get receipts for last 90 days
+   DATE.90 = SYSTEM.DATE - 90
+
+   RECEIVED.QTY = 0
+   RECEIVED.AMT = 0
+
+   * Select receipts for this item
+   SELECT.CMD = 'SELECT RECEIPTS WITH ITEM.ID = "' : ACTUAL.ITEM.ID : '"'
+   SELECT.CMD := ' AND RECEIPT.DATE >= "' : DATE.90 : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT RECEIPT.ID ELSE EXIT
+
+      READ RECEIPT.REC FROM F.RECEIPTS, RECEIPT.ID ELSE CONTINUE
+
+      * Find this item in the receipt
+      ITEM.COUNT = DCOUNT(RECEIPT.REC<10>, VM)  ; Item IDs at position 10
+      FOR I = 1 TO ITEM.COUNT
+         IF RECEIPT.REC<10, I> = ACTUAL.ITEM.ID THEN
+            QTY = RECEIPT.REC<15, I>  ; Received qty at position 15
+            COST = RECEIPT.REC<16, I>  ; Unit cost at position 16
+            IF QTY = '' THEN QTY = 0
+            IF COST = '' THEN COST = 0
+
+            RECEIVED.QTY += QTY
+            RECEIVED.AMT += (QTY * COST)
+         END
+      NEXT I
+   REPEAT
+
+   ITEM.REC.OUT<230> = RECEIVED.QTY
+   ITEM.REC.OUT<231> = RECEIVED.AMT
+   RETURN
+
+**************************************************************************
+* Check Promotional Status
+**************************************************************************
+CHECK.PROMOTIONAL.STATUS:
+   * Check if item is in any active promotions
+   PROMO.ACTIVE = 'N'
+   PROMO.CODES = ''
+
+   SELECT.CMD = 'SELECT PROMOTIONS WITH STATUS = "ACTIVE"'
+   SELECT.CMD := ' AND START.DATE <= "' : SYSTEM.DATE : '"'
+   SELECT.CMD := ' AND END.DATE >= "' : SYSTEM.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   PROMO.COUNT = 0
+   LOOP
+      READNEXT PROMO.ID ELSE EXIT
+
+      READ PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE CONTINUE
+
+      * Check if this item is included in promotion
+      APPLIES.TO = PROMO.REC<17>  ; APPLIES.TO field
+
+      BEGIN CASE
+         CASE APPLIES.TO = 'ITEMS'
+            * Check item list
+            LOCATE ACTUAL.ITEM.ID IN PROMO.REC<18, 1> USING VM SETTING POS THEN
+               PROMO.ACTIVE = 'Y'
+               PROMO.COUNT += 1
+               PROMO.CODES<PROMO.COUNT> = PROMO.REC<2>  ; PROMO.CODE
+            END
+         CASE APPLIES.TO = 'CATEGORIES'
+            * Check category list
+            ITEM.CAT = ITEM.REC.OUT<CATEGORY>
+            LOCATE ITEM.CAT IN PROMO.REC<19, 1> USING VM SETTING POS THEN
+               PROMO.ACTIVE = 'Y'
+               PROMO.COUNT += 1
+               PROMO.CODES<PROMO.COUNT> = PROMO.REC<2>
+            END
+         CASE APPLIES.TO = 'BRANDS'
+            * Check brand list
+            ITEM.BRAND = ITEM.REC.OUT<BRAND>
+            LOCATE ITEM.BRAND IN PROMO.REC<20, 1> USING VM SETTING POS THEN
+               PROMO.ACTIVE = 'Y'
+               PROMO.COUNT += 1
+               PROMO.CODES<PROMO.COUNT> = PROMO.REC<2>
+            END
+      END CASE
+   REPEAT
+
+   ITEM.REC.OUT<240> = PROMO.ACTIVE
+   ITEM.REC.OUT<241> = PROMO.CODES
+   RETURN
+
+**************************************************************************
+* Check Reorder Status
+**************************************************************************
+CHECK.REORDER.STATUS:
+   * Check if item needs reordering
+   NEEDS.REORDER = 'N'
+   REORDER.STORES = ''
+
+   * Check each store
+   QTY.COUNT = DCOUNT(ITEM.REC.OUT<QTY.AVAILABLE>, VM)
+   FOR I = 1 TO QTY.COUNT
+      AVAIL.QTY = ITEM.REC.OUT<QTY.AVAILABLE, I>
+      REORDER.PT = ITEM.REC.OUT<REORDER.POINT, I>
+
+      IF AVAIL.QTY = '' THEN AVAIL.QTY = 0
+      IF REORDER.PT = '' THEN REORDER.PT = 0
+
+      IF AVAIL.QTY <= REORDER.PT THEN
+         NEEDS.REORDER = 'Y'
+         REORDER.STORES<-1> = I  ; Store index
+      END
+   NEXT I
+
+   ITEM.REC.OUT<250> = NEEDS.REORDER
+   ITEM.REC.OUT<251> = REORDER.STORES
+   RETURN
+
+END

@@ -1,0 +1,468 @@
+SUBROUTINE PO.CREATE(PO.REC, PO.NUMBER.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: PO.CREATE
+* Purpose: Create New Purchase Order
+* Parameters:
+*   PO.REC (IN) - Purchase order record with all fields populated
+*   PO.NUMBER.OUT (OUT) - Generated PO number
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+PO.NUMBER.OUT = ''
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate required fields
+GOSUB VALIDATE.PO
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Verify vendor exists and is active
+GOSUB VERIFY.VENDOR
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Verify all items exist and are orderable
+GOSUB VERIFY.ITEMS
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check approval requirements
+GOSUB CHECK.APPROVAL.REQUIRED
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Generate PO number
+GOSUB GENERATE.PO.NUMBER
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Calculate PO totals
+GOSUB CALCULATE.PO.TOTALS
+
+* Set audit fields
+PO.REC<60> = USER.ID  ; CREATED.BY
+PO.REC<61> = SYSTEM.DATE  ; CREATED.DATE
+PO.REC<62> = SYSTEM.TIME  ; CREATED.TIME
+PO.REC<63> = USER.ID  ; MODIFIED.BY
+PO.REC<64> = SYSTEM.DATE  ; MODIFIED.DATE
+PO.REC<65> = SYSTEM.TIME  ; MODIFIED.TIME
+
+* Set initial status
+IF PO.REC<37> = '' THEN  ; STATUS
+   IF APPROVAL.REQUIRED THEN
+      PO.REC<37> = 'PENDING'
+   END ELSE
+      PO.REC<37> = 'APPROVED'
+   END
+END
+
+* Initialize tracking fields
+PO.REC<44> = ''  ; RECEIPTS (multivalued)
+PO.REC<45> = ''  ; RECEIPT.DATES
+PO.REC<46> = ''  ; INVOICES
+PO.REC<47> = ''  ; INVOICE.DATES
+PO.REC<48> = ''  ; INVOICE.AMOUNTS
+
+* Write PO record
+WRITE PO.REC TO F.PURCHASE.ORDERS, PO.NUMBER.OUT ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write purchase order'
+   RETURN
+END
+
+* Update item quantities on order
+GOSUB UPDATE.ITEM.ON.ORDER
+
+* Create PO approval record if needed
+IF APPROVAL.REQUIRED THEN
+   GOSUB CREATE.APPROVAL.REQUEST
+END
+
+* Log PO creation
+LOG.MSG = 'Purchase order created: ' : PO.NUMBER.OUT
+LOG.MSG := ', Vendor: ' : PO.REC<3>  ; VENDOR.ID
+LOG.MSG := ', Total: ' : PO.REC<36>  ; TOTAL.AMOUNT
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+* Send notification to buyer
+GOSUB SEND.PO.NOTIFICATION
+
+RETURN
+
+**************************************************************************
+* Validate Purchase Order
+**************************************************************************
+VALIDATE.PO:
+   * Check vendor ID
+   IF PO.REC<3> = '' THEN  ; VENDOR.ID
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Vendor ID is required'
+      RETURN
+   END
+
+   * Check buyer ID
+   IF PO.REC<5> = '' THEN  ; BUYER.ID
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Buyer ID is required'
+      RETURN
+   END
+
+   * Verify buyer exists
+   READ BUYER.REC FROM F.EMPLOYEES, PO.REC<5> ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Buyer not found: ' : PO.REC<5>
+      RETURN
+   END
+
+   * Check ship to store
+   IF PO.REC<6> = '' THEN  ; SHIP.TO.STORE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Ship to store is required'
+      RETURN
+   END
+
+   * Verify store exists
+   READ STORE.REC FROM F.STORES, PO.REC<6> ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Store not found: ' : PO.REC<6>
+      RETURN
+   END
+
+   * Check for items
+   ITEM.COUNT = DCOUNT(PO.REC<16>, VM)  ; ITEM.ID
+   IF ITEM.COUNT = 0 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Purchase order must have at least one item'
+      RETURN
+   END
+
+   * Validate quantities
+   FOR I = 1 TO ITEM.COUNT
+      QTY = PO.REC<20, I>  ; QTY.ORDERED
+      IF QTY = '' OR NOT(NUM(QTY)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid quantity for line ' : I
+         RETURN
+      END
+      IF QTY <= 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Quantity must be greater than zero for line ' : I
+         RETURN
+      END
+
+      * Validate unit cost
+      COST = PO.REC<23, I>  ; UNIT.COST
+      IF COST = '' OR NOT(NUM(COST)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid unit cost for line ' : I
+         RETURN
+      END
+      IF COST < 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Unit cost cannot be negative for line ' : I
+         RETURN
+      END
+   NEXT I
+
+   * Validate payment terms
+   IF PO.REC<10> = '' THEN  ; PAYMENT.TERMS
+      PO.REC<10> = 'NET30'  ; Default
+   END
+
+   * Validate freight terms
+   IF PO.REC<11> = '' THEN  ; FREIGHT.TERMS
+      PO.REC<11> = 'PREPAID'  ; Default
+   END
+
+   * Set PO date if not provided
+   IF PO.REC<2> = '' THEN  ; PO.DATE
+      PO.REC<2> = SYSTEM.DATE
+   END
+   RETURN
+
+**************************************************************************
+* Verify Vendor
+**************************************************************************
+VERIFY.VENDOR:
+   VENDOR.ID = PO.REC<3>
+
+   READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Vendor not found: ' : VENDOR.ID
+      RETURN
+   END
+
+   * Check vendor status
+   IF VENDOR.REC<25> # STATUS.ACTIVE THEN  ; Field 25 = STATUS
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Vendor is not active'
+      RETURN
+   END
+
+   * Store vendor information in PO
+   PO.REC<4> = VENDOR.REC<2>  ; VENDOR.NAME
+   PO.REC<8> = VENDOR.REC<4>  ; VENDOR.CONTACT
+   PO.REC<9> = VENDOR.REC<6, 1>  ; VENDOR.PHONE (first phone)
+
+   * Use vendor's default terms if not specified
+   IF PO.REC<10> = '' THEN
+      PO.REC<10> = VENDOR.REC<17>  ; PAYMENT.TERMS
+   END
+
+   IF PO.REC<11> = '' THEN
+      PO.REC<11> = VENDOR.REC<19>  ; FREIGHT.TERMS
+   END
+
+   * Store lead time
+   IF PO.REC<14> = '' THEN  ; EXPECTED.DATE
+      LEAD.DAYS = VENDOR.REC<21>  ; LEAD.TIME
+      IF LEAD.DAYS = '' THEN LEAD.DAYS = 7
+      PO.REC<14> = SYSTEM.DATE + LEAD.DAYS
+   END
+   RETURN
+
+**************************************************************************
+* Verify Items
+**************************************************************************
+VERIFY.ITEMS:
+   ITEM.COUNT = DCOUNT(PO.REC<16>, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = PO.REC<16, I>
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+         ERROR.CODE = ERR.RECORD.NOT.FOUND
+         ERROR.MSG = 'Item not found: ' : ITEM.ID
+         RETURN
+      END
+
+      * Check item status
+      IF ITEM.REC<ITEM.STATUS> = 'D' THEN  ; Discontinued
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Item is discontinued: ' : ITEM.ID
+         RETURN
+      END
+
+      * Store item details in PO
+      PO.REC<17, I> = ITEM.REC<SKU>  ; SKU
+      PO.REC<18, I> = ITEM.REC<ITEM.DESC>  ; ITEM.DESC
+      PO.REC<19, I> = ITEM.REC<VENDOR.ITEM>  ; VENDOR.ITEM
+
+      * Use item's standard cost if not provided
+      IF PO.REC<23, I> = '' THEN
+         PO.REC<23, I> = ITEM.REC<COST>  ; UNIT.COST
+      END
+
+      * Initialize received quantities
+      PO.REC<21, I> = 0  ; QTY.RECEIVED
+      PO.REC<22, I> = PO.REC<20, I>  ; QTY.OUTSTANDING = QTY.ORDERED
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Check Approval Required
+**************************************************************************
+CHECK.APPROVAL.REQUIRED:
+   APPROVAL.REQUIRED = FALSE
+
+   * Calculate total amount
+   TOTAL.AMT = 0
+   ITEM.COUNT = DCOUNT(PO.REC<16>, VM)
+   FOR I = 1 TO ITEM.COUNT
+      QTY = PO.REC<20, I>
+      COST = PO.REC<23, I>
+      IF QTY = '' THEN QTY = 0
+      IF COST = '' THEN COST = 0
+      TOTAL.AMT += (QTY * COST)
+   NEXT I
+
+   * Approval required for orders over $10,000
+   IF TOTAL.AMT > 10000 THEN
+      APPROVAL.REQUIRED = TRUE
+   END
+
+   * Check user level
+   IF USER.LEVEL < 7 AND TOTAL.AMT > 5000 THEN
+      APPROVAL.REQUIRED = TRUE
+   END
+
+   PO.REC<38> = APPROVAL.REQUIRED  ; APPROVAL.REQUIRED flag
+   RETURN
+
+**************************************************************************
+* Generate PO Number
+**************************************************************************
+GENERATE.PO.NUMBER:
+   * Format: PO-YYYYMMDD-XXXX
+   DATE.STR = OCONV(SYSTEM.DATE, 'D4-YMD')
+   DATE.STR = CONVERT('-', '', DATE.STR)
+
+   * Get next sequence for today
+   SEQ.KEY = 'PO-SEQ*' : SYSTEM.DATE
+
+   OPEN 'PO.SEQUENCES' TO F.PO.SEQ ELSE
+      EXECUTE 'CREATE.FILE PO.SEQUENCES 1 1'
+      OPEN 'PO.SEQUENCES' TO F.PO.SEQ ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open PO sequence file'
+         RETURN
+      END
+   END
+
+   READU SEQ.REC FROM F.PO.SEQ, SEQ.KEY LOCKED
+      SLEEP 1
+      READ SEQ.REC FROM F.PO.SEQ, SEQ.KEY ELSE
+         SEQ.NUM = 1
+      END
+      SEQ.NUM = SEQ.REC<1>
+   END ELSE
+      SEQ.NUM = 1
+   END
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.PO.SEQ, SEQ.KEY
+
+   * Format sequence
+   SEQ.STR = OCONV(SEQ.NUM, 'R(0)#4')
+
+   PO.NUMBER.OUT = 'PO-' : DATE.STR : '-' : SEQ.STR
+   PO.REC<1> = PO.NUMBER.OUT
+   RETURN
+
+**************************************************************************
+* Calculate PO Totals
+**************************************************************************
+CALCULATE.PO.TOTALS:
+   SUBTOTAL = 0
+   TOTAL.DISCOUNT = 0
+   TOTAL.TAX = 0
+
+   ITEM.COUNT = DCOUNT(PO.REC<16>, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      QTY = PO.REC<20, I>
+      COST = PO.REC<23, I>
+      DISC.PCT = PO.REC<25, I>  ; DISCOUNT.PCT
+      DISC.AMT = PO.REC<26, I>  ; DISCOUNT.AMT
+
+      IF QTY = '' THEN QTY = 0
+      IF COST = '' THEN COST = 0
+      IF DISC.PCT = '' THEN DISC.PCT = 0
+      IF DISC.AMT = '' THEN DISC.AMT = 0
+
+      * Calculate extended cost
+      EXTENDED = QTY * COST
+      PO.REC<24, I> = EXTENDED  ; EXTENDED.COST
+
+      * Apply discount
+      IF DISC.PCT > 0 THEN
+         DISC.AMT = EXTENDED * (DISC.PCT / 100)
+         PO.REC<26, I> = DISC.AMT
+      END
+
+      * Calculate line total
+      LINE.TOTAL = EXTENDED - DISC.AMT
+      PO.REC<27, I> = LINE.TOTAL  ; LINE.TOTAL
+
+      * Accumulate totals
+      SUBTOTAL += EXTENDED
+      TOTAL.DISCOUNT += DISC.AMT
+   NEXT I
+
+   * Calculate freight
+   IF PO.REC<34> = '' THEN  ; FREIGHT.COST
+      PO.REC<34> = 0
+   END
+   FREIGHT = PO.REC<34>
+
+   * Calculate tax
+   IF PO.REC<35> = '' THEN  ; TOTAL.TAX
+      PO.REC<35> = 0
+   END
+   TOTAL.TAX = PO.REC<35>
+
+   * Calculate total
+   TOTAL.AMT = SUBTOTAL - TOTAL.DISCOUNT + FREIGHT + TOTAL.TAX
+
+   * Round amounts
+   CALL UTILS.COMMON('ROUND.AMOUNT', SUBTOTAL, SUBTOTAL)
+   CALL UTILS.COMMON('ROUND.AMOUNT', TOTAL.DISCOUNT, TOTAL.DISCOUNT)
+   CALL UTILS.COMMON('ROUND.AMOUNT', TOTAL.AMT, TOTAL.AMT)
+
+   * Update PO record
+   PO.REC<32> = SUBTOTAL
+   PO.REC<33> = TOTAL.DISCOUNT
+   PO.REC<36> = TOTAL.AMT
+   RETURN
+
+**************************************************************************
+* Update Item Quantity On Order
+**************************************************************************
+UPDATE.ITEM.ON.ORDER:
+   ITEM.COUNT = DCOUNT(PO.REC<16>, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = PO.REC<16, I>
+      QTY = PO.REC<20, I>
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+         CONTINUE
+      END
+
+      * Add to quantity on order
+      OLD.ON.ORDER = ITEM.REC<QTY.ON.ORDER>
+      IF OLD.ON.ORDER = '' THEN OLD.ON.ORDER = 0
+
+      ITEM.REC<QTY.ON.ORDER> = OLD.ON.ORDER + QTY
+
+      WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Create Approval Request
+**************************************************************************
+CREATE.APPROVAL.REQUEST:
+   OPEN 'PO.APPROVALS' TO F.PO.APPROVALS ELSE
+      EXECUTE 'CREATE.FILE PO.APPROVALS 1 101'
+      OPEN 'PO.APPROVALS' TO F.PO.APPROVALS ELSE
+         RETURN
+      END
+   END
+
+   APPR.ID = PO.NUMBER.OUT
+   APPR.REC = ''
+   APPR.REC<1> = PO.NUMBER.OUT
+   APPR.REC<2> = PO.REC<5>  ; BUYER.ID
+   APPR.REC<3> = PO.REC<36>  ; TOTAL.AMOUNT
+   APPR.REC<4> = SYSTEM.DATE
+   APPR.REC<5> = 'PENDING'
+   APPR.REC<6> = ''  ; APPROVED.BY
+   APPR.REC<7> = ''  ; APPROVED.DATE
+   APPR.REC<8> = ''  ; NOTES
+
+   WRITE APPR.REC TO F.PO.APPROVALS, APPR.ID
+
+   * Log approval request
+   LOG.MSG = 'Approval requested for PO: ' : PO.NUMBER.OUT
+   LOG.MSG := ', Amount: ' : PO.REC<36>
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Send PO Notification
+**************************************************************************
+SEND.PO.NOTIFICATION:
+   * Send email to buyer
+   NOTIF.MSG = 'Purchase Order Created' : AM
+   NOTIF.MSG := 'PO Number: ' : PO.NUMBER.OUT : AM
+   NOTIF.MSG := 'Vendor: ' : PO.REC<4> : AM
+   NOTIF.MSG := 'Total: ' : PO.REC<36> : AM
+   NOTIF.MSG := 'Status: ' : PO.REC<37>
+
+   EMAIL.LOG = 'PO creation notification sent for: ' : PO.NUMBER.OUT
+   CALL UTILS.COMMON('LOG.ERROR', EMAIL.LOG, 'INFO')
+   RETURN
+
+END

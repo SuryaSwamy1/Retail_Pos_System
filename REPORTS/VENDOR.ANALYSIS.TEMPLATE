@@ -1,0 +1,86 @@
+================================================================================
+                        RETAIL POS SYSTEM
+                    VENDOR PERFORMANCE REPORT
+================================================================================
+
+Store ID: [STORE_ID]                           Date: [REPORT_DATE]
+Store Name: [STORE_NAME]                       Period: [PERIOD]
+
+--------------------------------------------------------------------------------
+VENDOR SUMMARY
+--------------------------------------------------------------------------------
+Total Active Vendors:                                            [TOTAL_VEND]
+Total Purchase Orders:                                           [TOTAL_PO]
+Total Purchases:                                        $[TOTAL_PURCH]
+Average Order Value:                                    $[AVG_ORDER]
+--------------------------------------------------------------------------------
+
+TOP VENDORS BY PURCHASE VOLUME
+--------------------------------------------------------------------------------
+Rank  Vendor ID    Name                          Orders  Amount      On-Time%
+--------------------------------------------------------------------------------
+1     [ID1]        [NAME1]                       [CNT1]  $[AMT1]     [OT1]%
+2     [ID2]        [NAME2]                       [CNT2]  $[AMT2]     [OT2]%
+3     [ID3]        [NAME3]                       [CNT3]  $[AMT3]     [OT3]%
+4     [ID4]        [NAME4]                       [CNT4]  $[AMT4]     [OT4]%
+5     [ID5]        [NAME5]                       [CNT5]  $[AMT5]     [OT5]%
+--------------------------------------------------------------------------------
+
+VENDOR PERFORMANCE METRICS
+--------------------------------------------------------------------------------
+Vendor ID    Name                  Orders  Avg Lead  On-Time  Quality Score
+                                           Time      Delivery
+--------------------------------------------------------------------------------
+[ID1]        [NAME1]               [CNT1]  [LEAD1]   [OT1]%   [QUAL1]/10
+[ID2]        [NAME2]               [CNT2]  [LEAD2]   [OT2]%   [QUAL2]/10
+[ID3]        [NAME3]               [CNT3]  [LEAD3]   [OT3]%   [QUAL3]/10
+[ID4]        [NAME4]               [CNT4]  [LEAD4]   [OT4]%   [QUAL4]/10
+[ID5]        [NAME5]               [CNT5]  [LEAD5]   [OT5]%   [QUAL5]/10
+--------------------------------------------------------------------------------
+
+PURCHASES BY CATEGORY
+--------------------------------------------------------------------------------
+Category            Vendors  Orders   Amount         % of Total
+--------------------------------------------------------------------------------
+ELECTRONICS         [CNT1]   [ORD1]   $[AMT1]        [PCT1]%
+CLOTHING            [CNT2]   [ORD2]   $[AMT2]        [PCT2]%
+FOOTWEAR            [CNT3]   [ORD3]   $[AMT3]        [PCT3]%
+BOOKS               [CNT4]   [ORD4]   $[AMT4]        [PCT4]%
+FOOD                [CNT5]   [ORD5]   $[AMT5]        [PCT5]%
+APPLIANCES          [CNT6]   [ORD6]   $[AMT6]        [PCT6]%
+--------------------------------------------------------------------------------
+
+PAYMENT TERMS ANALYSIS
+--------------------------------------------------------------------------------
+Terms           Vendors  Orders   Amount         Average Days
+--------------------------------------------------------------------------------
+NET15           [CNT1]   [ORD1]   $[AMT1]        [DAYS1]
+NET30           [CNT2]   [ORD2]   $[AMT2]        [DAYS2]
+NET45           [CNT3]   [ORD3]   $[AMT3]        [DAYS3]
+NET60           [CNT4]   [ORD4]   $[AMT4]        [DAYS4]
+--------------------------------------------------------------------------------
+
+PENDING PURCHASE ORDERS
+--------------------------------------------------------------------------------
+PO Number    Vendor ID    Vendor Name          Amount      Expected Date
+--------------------------------------------------------------------------------
+[PO1]        [VID1]       [VNAME1]             $[AMT1]     [DATE1]
+[PO2]        [VID2]       [VNAME2]             $[AMT2]     [DATE2]
+[PO3]        [VID3]       [VNAME3]             $[AMT3]     [DATE3]
+[PO4]        [VID4]       [VNAME4]             $[AMT4]     [DATE4]
+[PO5]        [VID5]       [VNAME5]             $[AMT5]     [DATE5]
+--------------------------------------------------------------------------------
+Total Pending:                                      $[PENDING_TOTAL]
+--------------------------------------------------------------------------------
+
+VENDOR ISSUES
+--------------------------------------------------------------------------------
+Vendor ID    Name                  Issue Type           Date        Status
+--------------------------------------------------------------------------------
+[ID1]        [NAME1]               Late Delivery        [DATE1]     OPEN
+[ID2]        [NAME2]               Quality Issue        [DATE2]     RESOLVED
+[ID3]        [NAME3]               Wrong Quantity       [DATE3]     OPEN
+--------------------------------------------------------------------------------
+
+Report Generated: [TIMESTAMP]
+================================================================================

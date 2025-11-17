@@ -1,0 +1,341 @@
+SUBROUTINE PRICE.CHANGE(ITEM.ID, NEW.PRICE, CHANGE.REASON, EFFECTIVE.DATE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: PRICE.CHANGE
+* Purpose: Process Price Change for Item
+* Parameters:
+*   ITEM.ID (IN) - Item ID
+*   NEW.PRICE (IN) - New selling price
+*   CHANGE.REASON (IN) - Reason for price change
+*   EFFECTIVE.DATE (IN) - When price becomes effective
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate item ID
+IF ITEM.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Item ID is required'
+   RETURN
+END
+
+* Read item record
+READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Item not found'
+   RETURN
+END
+
+* Validate new price
+GOSUB VALIDATE.NEW.PRICE
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.INVENTORY, ITEM.ID
+   RETURN
+END
+
+* Validate reason
+GOSUB VALIDATE.CHANGE.REASON
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.INVENTORY, ITEM.ID
+   RETURN
+END
+
+* Validate effective date
+IF EFFECTIVE.DATE = '' THEN EFFECTIVE.DATE = SYSTEM.DATE
+
+IF EFFECTIVE.DATE < SYSTEM.DATE THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Effective date cannot be in the past'
+   RELEASE F.INVENTORY, ITEM.ID
+   RETURN
+END
+
+* Check authorization
+GOSUB CHECK.PRICE.CHANGE.AUTHORIZATION
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.INVENTORY, ITEM.ID
+   RETURN
+END
+
+* Get current price
+CURRENT.PRICE = ITEM.REC<SELLING.PRICE>
+IF CURRENT.PRICE = '' THEN CURRENT.PRICE = 0
+
+* Calculate price change
+PRICE.DIFF = NEW.PRICE - CURRENT.PRICE
+IF CURRENT.PRICE > 0 THEN
+   PRICE.CHANGE.PCT = (PRICE.DIFF / CURRENT.PRICE) * 100
+END ELSE
+   PRICE.CHANGE.PCT = 0
+END
+
+* If immediate, update price now
+IF EFFECTIVE.DATE = SYSTEM.DATE THEN
+   GOSUB UPDATE.ITEM.PRICE
+   WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+END ELSE
+   * Schedule for future
+   GOSUB SCHEDULE.PRICE.CHANGE
+   RELEASE F.INVENTORY, ITEM.ID
+END
+
+* Create price change history
+GOSUB CREATE.PRICE.HISTORY
+
+* Create price change audit
+GOSUB CREATE.PRICE.AUDIT
+
+* Send notifications
+GOSUB SEND.PRICE.CHANGE.NOTIFICATIONS
+
+LOG.MSG = 'Price change: ' : ITEM.ID : ' - Old: $' : CURRENT.PRICE : ', New: $' : NEW.PRICE
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate New Price
+**************************************************************************
+VALIDATE.NEW.PRICE:
+   IF NEW.PRICE = '' OR NOT(NUM(NEW.PRICE)) THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'New price must be numeric'
+      RETURN
+   END
+
+   IF NEW.PRICE < 0 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Price cannot be negative'
+      RETURN
+   END
+
+   * Check reasonable price
+   AVG.COST = ITEM.REC<AVG.COST>
+   IF AVG.COST = '' THEN AVG.COST = 0
+
+   IF NEW.PRICE > 0 AND AVG.COST > 0 THEN
+      IF NEW.PRICE < (AVG.COST * 0.5) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Price too low (less than 50% of cost)'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Validate Change Reason
+**************************************************************************
+VALIDATE.CHANGE.REASON:
+   VALID.REASONS = 'MARKDOWN':VM:'MARKUP':VM:'COST.CHANGE':VM:'COMPETITION'
+   VALID.REASONS := VM:'PROMOTION':VM:'CLEARANCE':VM:'SEASONAL':VM:'ERROR.CORRECTION'
+   VALID.REASONS := VM:'VENDOR.CHANGE':VM:'OTHER'
+
+   LOCATE CHANGE.REASON IN VALID.REASONS<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid price change reason'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Check Price Change Authorization
+**************************************************************************
+CHECK.PRICE.CHANGE.AUTHORIZATION:
+   * Calculate absolute change percentage
+   ABS.CHANGE = ABS(PRICE.CHANGE.PCT)
+
+   * Authorization levels based on price change percentage
+   * < 10% = Level 5+
+   * 10-25% = Level 7+
+   * 25-50% = Level 9+
+   * > 50% = Level 10+
+
+   USER.LEVEL = 5  ; Default
+
+   * Get user's security level
+   READ USER.REC FROM F.EMPLOYEES, USER.ID ELSE
+      USER.LEVEL = 1
+   END
+   USER.LEVEL = USER.REC<SECURITY.LEVEL>
+   IF USER.LEVEL = '' THEN USER.LEVEL = 1
+
+   BEGIN CASE
+      CASE USER.LEVEL >= 10
+         * Unlimited authorization
+         RETURN
+
+      CASE USER.LEVEL >= 9
+         IF ABS.CHANGE > 50 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Price change exceeds authorization limit'
+            RETURN
+         END
+
+      CASE USER.LEVEL >= 7
+         IF ABS.CHANGE > 25 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Price change exceeds authorization limit'
+            RETURN
+         END
+
+      CASE USER.LEVEL >= 5
+         IF ABS.CHANGE > 10 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Price change exceeds authorization limit'
+            RETURN
+         END
+
+      CASE 1
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Insufficient authorization for price changes'
+         RETURN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Update Item Price
+**************************************************************************
+UPDATE.ITEM.PRICE:
+   * Update selling price
+   ITEM.REC<SELLING.PRICE> = NEW.PRICE
+
+   * Update last price change date
+   ITEM.REC<LAST.PRICE.CHANGE> = SYSTEM.DATE
+
+   * Update price change count
+   PRICE.CHANGES = ITEM.REC<PRICE.CHANGES>
+   IF PRICE.CHANGES = '' THEN PRICE.CHANGES = 0
+   ITEM.REC<PRICE.CHANGES> = PRICE.CHANGES + 1
+
+   * Update modified fields
+   ITEM.REC<MODIFIED.BY> = USER.ID
+   ITEM.REC<MODIFIED.DATE> = SYSTEM.DATE
+   ITEM.REC<MODIFIED.TIME> = SYSTEM.TIME
+   RETURN
+
+**************************************************************************
+* Schedule Price Change
+**************************************************************************
+SCHEDULE.PRICE.CHANGE:
+   OPEN 'PRICE.SCHEDULE' TO F.PRICE.SCHEDULE ELSE
+      EXECUTE 'CREATE.FILE PRICE.SCHEDULE 1 101'
+      OPEN 'PRICE.SCHEDULE' TO F.PRICE.SCHEDULE ELSE RETURN
+   END
+
+   SCHEDULE.ID = ITEM.ID : '*' : EFFECTIVE.DATE
+
+   SCHEDULE.REC = ''
+   SCHEDULE.REC<1> = ITEM.ID
+   SCHEDULE.REC<2> = CURRENT.PRICE
+   SCHEDULE.REC<3> = NEW.PRICE
+   SCHEDULE.REC<4> = EFFECTIVE.DATE
+   SCHEDULE.REC<5> = 'PENDING'
+   SCHEDULE.REC<6> = CHANGE.REASON
+   SCHEDULE.REC<7> = USER.ID
+   SCHEDULE.REC<8> = SYSTEM.DATE
+   SCHEDULE.REC<9> = SYSTEM.TIME
+
+   WRITE SCHEDULE.REC TO F.PRICE.SCHEDULE, SCHEDULE.ID
+   RETURN
+
+**************************************************************************
+* Create Price History
+**************************************************************************
+CREATE.PRICE.HISTORY:
+   OPEN 'PRICE.HISTORY' TO F.PRICE.HIST ELSE
+      EXECUTE 'CREATE.FILE PRICE.HISTORY 1 101'
+      OPEN 'PRICE.HISTORY' TO F.PRICE.HIST ELSE RETURN
+   END
+
+   HISTORY.ID = ITEM.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+
+   HISTORY.REC = ''
+   HISTORY.REC<1> = ITEM.ID
+   HISTORY.REC<2> = CURRENT.PRICE
+   HISTORY.REC<3> = NEW.PRICE
+   HISTORY.REC<4> = PRICE.DIFF
+   HISTORY.REC<5> = PRICE.CHANGE.PCT
+   HISTORY.REC<6> = CHANGE.REASON
+   HISTORY.REC<7> = EFFECTIVE.DATE
+   HISTORY.REC<8> = USER.ID
+   HISTORY.REC<9> = SYSTEM.DATE
+   HISTORY.REC<10> = SYSTEM.TIME
+   HISTORY.REC<11> = 'APPLIED'
+
+   WRITE HISTORY.REC TO F.PRICE.HIST, HISTORY.ID
+   RETURN
+
+**************************************************************************
+* Create Price Audit
+**************************************************************************
+CREATE.PRICE.AUDIT:
+   OPEN 'PRICE.AUDIT' TO F.PRICE.AUDIT ELSE
+      EXECUTE 'CREATE.FILE PRICE.AUDIT 1 101'
+      OPEN 'PRICE.AUDIT' TO F.PRICE.AUDIT ELSE RETURN
+   END
+
+   AUDIT.ID = ITEM.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+
+   AUDIT.REC = ''
+   AUDIT.REC<1> = ITEM.ID
+   AUDIT.REC<2> = ITEM.REC<ITEM.NAME>
+   AUDIT.REC<3> = CURRENT.PRICE
+   AUDIT.REC<4> = NEW.PRICE
+   AUDIT.REC<5> = PRICE.CHANGE.PCT
+   AUDIT.REC<6> = CHANGE.REASON
+   AUDIT.REC<7> = USER.ID
+   AUDIT.REC<8> = SYSTEM.DATE
+   AUDIT.REC<9> = SYSTEM.TIME
+   AUDIT.REC<10> = EFFECTIVE.DATE
+   AUDIT.REC<11> = STORE.ID
+
+   WRITE AUDIT.REC TO F.PRICE.AUDIT, AUDIT.ID
+   RETURN
+
+**************************************************************************
+* Send Price Change Notifications
+**************************************************************************
+SEND.PRICE.CHANGE.NOTIFICATIONS:
+   * Only send notifications for significant changes
+   IF ABS(PRICE.CHANGE.PCT) < 10 THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   * Notify store managers
+   OPEN 'SYSTEM.PARAMS' TO F.PARAMS ELSE RETURN
+
+   READ PARAM.REC FROM F.PARAMS, 'EMAIL.ADDRESSES' ELSE RETURN
+
+   MANAGER.EMAIL = PARAM.REC<2>  ; Store manager email
+   IF MANAGER.EMAIL = '' THEN RETURN
+
+   EMAIL.ID = 'PRICE.CHANGE*' : ITEM.ID : '*' : SYSTEM.DATE
+
+   EMAIL.REC = ''
+   EMAIL.REC<1> = MANAGER.EMAIL
+   EMAIL.REC<2> = 'Price Change Notification: ' : ITEM.REC<ITEM.NAME>
+
+   IF PRICE.DIFF > 0 THEN
+      CHANGE.TYPE = 'increased'
+   END ELSE
+      CHANGE.TYPE = 'decreased'
+   END
+
+   EMAIL.REC<3> = 'Price has been ' : CHANGE.TYPE : ' for item: ' : ITEM.REC<ITEM.NAME> : AM : AM
+   EMAIL.REC<3> := 'Item ID: ' : ITEM.ID : AM
+   EMAIL.REC<3> := 'Old Price: $' : CURRENT.PRICE : AM
+   EMAIL.REC<3> := 'New Price: $' : NEW.PRICE : AM
+   EMAIL.REC<3> := 'Change: ' : PRICE.CHANGE.PCT : '%' : AM : AM
+   EMAIL.REC<3> := 'Reason: ' : CHANGE.REASON : AM
+   EMAIL.REC<3> := 'Effective Date: ' : OCONV(EFFECTIVE.DATE, 'D4/') : AM : AM
+   EMAIL.REC<3> := 'Changed By: ' : USER.ID
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

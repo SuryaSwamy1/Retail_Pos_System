@@ -1,0 +1,385 @@
+SUBROUTINE EMP.CREATE(EMP.REC, EMP.ID.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: EMP.CREATE
+* Purpose: Create New Employee Record
+* Parameters:
+*   EMP.REC (IN) - Employee record with all fields populated
+*   EMP.ID.OUT (OUT) - Generated employee ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+EMP.ID.OUT = ''
+
+* Validate required fields
+GOSUB VALIDATE.EMPLOYEE
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check for duplicate SSN
+GOSUB CHECK.DUPLICATE.SSN
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Generate employee ID
+GOSUB GENERATE.EMP.ID
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Encrypt sensitive data
+GOSUB ENCRYPT.SENSITIVE.DATA
+
+* Set audit fields
+EMP.REC<EMP.CREATED.BY> = USER.ID
+EMP.REC<EMP.CREATED.DATE> = SYSTEM.DATE
+EMP.REC<EMP.CREATED.TIME> = SYSTEM.TIME
+EMP.REC<EMP.MODIFIED.BY> = USER.ID
+EMP.REC<EMP.MODIFIED.DATE> = SYSTEM.DATE
+EMP.REC<EMP.MODIFIED.TIME> = SYSTEM.TIME
+
+* Set default status
+IF EMP.REC<EMP.STATUS> = '' THEN
+   EMP.REC<EMP.STATUS> = STATUS.ACTIVE
+END
+
+* Initialize numeric fields
+IF EMP.REC<PAY.RATE> = '' THEN EMP.REC<PAY.RATE> = 0
+IF EMP.REC<COMMISSION.RATE> = '' THEN EMP.REC<COMMISSION.RATE> = 0
+IF EMP.REC<PTO.BALANCE> = '' THEN EMP.REC<PTO.BALANCE> = 0
+IF EMP.REC<SICK.BALANCE> = '' THEN EMP.REC<SICK.BALANCE> = 0
+IF EMP.REC<YTD.HOURS> = '' THEN EMP.REC<YTD.HOURS> = 0
+IF EMP.REC<YTD.GROSS.PAY> = '' THEN EMP.REC<YTD.GROSS.PAY> = 0
+IF EMP.REC<YTD.COMMISSION> = '' THEN EMP.REC<YTD.COMMISSION> = 0
+
+* Create user account
+GOSUB CREATE.USER.ACCOUNT
+
+* Write employee record
+WRITE EMP.REC TO F.EMPLOYEES, EMP.ID.OUT ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write employee record'
+   RETURN
+END
+
+* Create onboarding checklist
+GOSUB CREATE.ONBOARDING.CHECKLIST
+
+* Send welcome email
+GOSUB SEND.WELCOME.EMAIL
+
+LOG.MSG = 'Employee created: ' : EMP.ID.OUT : ' - '
+LOG.MSG := EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate Employee
+**************************************************************************
+VALIDATE.EMPLOYEE:
+   * Check required fields
+   IF EMP.REC<FIRST.NAME> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'First name is required'
+      RETURN
+   END
+
+   IF EMP.REC<LAST.NAME> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Last name is required'
+      RETURN
+   END
+
+   IF EMP.REC<SSN> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'SSN is required'
+      RETURN
+   END
+
+   * Validate SSN format (XXX-XX-XXXX)
+   SSN.CLEAN = CONVERT('-', '', EMP.REC<SSN>)
+   IF LEN(SSN.CLEAN) # 9 OR NOT(NUM(SSN.CLEAN)) THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid SSN format'
+      RETURN
+   END
+
+   * Check hire date
+   IF EMP.REC<HIRE.DATE> = '' THEN
+      EMP.REC<HIRE.DATE> = SYSTEM.DATE
+   END
+
+   * Validate position
+   IF EMP.REC<POSITION> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Position is required'
+      RETURN
+   END
+
+   * Validate department
+   IF EMP.REC<DEPARTMENT> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Department is required'
+      RETURN
+   END
+
+   VALID.DEPTS = 'SALES':VM:'MANAGEMENT':VM:'WAREHOUSE':VM:'RECEIVING':VM:'IT'
+   LOCATE EMP.REC<DEPARTMENT> IN VALID.DEPTS<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid department'
+      RETURN
+   END
+
+   * Validate pay type
+   IF EMP.REC<PAY.TYPE> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Pay type is required'
+      RETURN
+   END
+
+   VALID.PAY.TYPES = 'HOURLY':VM:'SALARY':VM:'COMMISSION'
+   LOCATE EMP.REC<PAY.TYPE> IN VALID.PAY.TYPES<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid pay type'
+      RETURN
+   END
+
+   * Validate pay rate
+   IF EMP.REC<PAY.RATE> # '' THEN
+      IF NOT(NUM(EMP.REC<PAY.RATE>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Pay rate must be numeric'
+         RETURN
+      END
+      IF EMP.REC<PAY.RATE> <= 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Pay rate must be greater than zero'
+         RETURN
+      END
+   END
+
+   * Validate email if provided
+   IF EMP.REC<EMP.EMAIL> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.EMAIL', EMP.REC<EMP.EMAIL>, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid email address'
+         RETURN
+      END
+   END
+
+   * Validate phone if provided
+   IF EMP.REC<PHONE.MOBILE> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.PHONE', EMP.REC<PHONE.MOBILE>, FMT.PHONE, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid mobile phone number'
+         RETURN
+      END
+      EMP.REC<PHONE.MOBILE> = FMT.PHONE
+   END
+
+   * Validate primary store
+   IF EMP.REC<PRIMARY.STORE> # '' THEN
+      READ STORE.REC FROM F.STORES, EMP.REC<PRIMARY.STORE> ELSE
+         ERROR.CODE = ERR.RECORD.NOT.FOUND
+         ERROR.MSG = 'Primary store not found'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Check Duplicate SSN
+**************************************************************************
+CHECK.DUPLICATE.SSN:
+   * Encrypt SSN for comparison
+   CALL UTILS.COMMON('ENCRYPT.STRING', EMP.REC<SSN>, ENC.SSN)
+
+   * Search for existing SSN
+   SELECT.CMD = 'SELECT EMPLOYEES'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT EXISTING.EMP.ID ELSE EXIT
+
+      READ EXISTING.REC FROM F.EMPLOYEES, EXISTING.EMP.ID ELSE CONTINUE
+
+      IF EXISTING.REC<SSN> = ENC.SSN THEN
+         ERROR.CODE = ERR.DUPLICATE.KEY
+         ERROR.MSG = 'SSN already exists in system'
+         RETURN
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Generate Employee ID
+**************************************************************************
+GENERATE.EMP.ID:
+   * Format: EMP-YYYYMMDD-XXX
+   DATE.STR = OCONV(SYSTEM.DATE, 'D4-YMD')
+   DATE.STR = CONVERT('-', '', DATE.STR)
+
+   SEQ.KEY = 'EMP-SEQ*' : SYSTEM.DATE
+
+   OPEN 'EMP.SEQUENCES' TO F.EMP.SEQ ELSE
+      EXECUTE 'CREATE.FILE EMP.SEQUENCES 1 1'
+      OPEN 'EMP.SEQUENCES' TO F.EMP.SEQ ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open employee sequence file'
+         RETURN
+      END
+   END
+
+   READU SEQ.REC FROM F.EMP.SEQ, SEQ.KEY ELSE
+      SEQ.NUM = 1
+   END
+   SEQ.NUM = SEQ.REC<1>
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.EMP.SEQ, SEQ.KEY
+
+   SEQ.STR = OCONV(SEQ.NUM, 'R(0)#3')
+   EMP.ID.OUT = 'EMP-' : DATE.STR : '-' : SEQ.STR
+   EMP.REC<EMP.ID> = EMP.ID.OUT
+   RETURN
+
+**************************************************************************
+* Encrypt Sensitive Data
+**************************************************************************
+ENCRYPT.SENSITIVE.DATA:
+   * Encrypt SSN
+   IF EMP.REC<SSN> # '' THEN
+      CALL UTILS.COMMON('ENCRYPT.STRING', EMP.REC<SSN>, ENC.SSN)
+      EMP.REC<SSN> = ENC.SSN
+   END
+
+   * Encrypt bank routing
+   IF EMP.REC<BANK.ROUTING> # '' THEN
+      CALL UTILS.COMMON('ENCRYPT.STRING', EMP.REC<BANK.ROUTING>, ENC.ROUTING)
+      EMP.REC<BANK.ROUTING> = ENC.ROUTING
+   END
+
+   * Encrypt bank account
+   IF EMP.REC<BANK.ACCOUNT> # '' THEN
+      CALL UTILS.COMMON('ENCRYPT.STRING', EMP.REC<BANK.ACCOUNT>, ENC.ACCOUNT)
+      EMP.REC<BANK.ACCOUNT> = ENC.ACCOUNT
+   END
+
+   * Encrypt PIN code
+   IF EMP.REC<PIN.CODE> # '' THEN
+      CALL UTILS.COMMON('ENCRYPT.STRING', EMP.REC<PIN.CODE>, ENC.PIN)
+      EMP.REC<PIN.CODE> = ENC.PIN
+   END
+   RETURN
+
+**************************************************************************
+* Create User Account
+**************************************************************************
+CREATE.USER.ACCOUNT:
+   * Generate user ID from name
+   FIRST.INIT = EMP.REC<FIRST.NAME>[1,1]
+   LAST.NAME.VAL = EMP.REC<LAST.NAME>
+   USER.ID.BASE = FIRST.INIT : LAST.NAME.VAL
+   USER.ID.BASE = OCONV(USER.ID.BASE, 'MCL')  ; Lowercase
+   USER.ID.BASE = CONVERT(' ', '', USER.ID.BASE)  ; Remove spaces
+
+   * Check for duplicates
+   USER.ID.VAL = USER.ID.BASE
+   SUFFIX = 1
+
+   OPEN 'USERS' TO F.USERS ELSE
+      EXECUTE 'CREATE.FILE USERS 1 101'
+      OPEN 'USERS' TO F.USERS ELSE
+         RETURN
+      END
+   END
+
+   LOOP
+      READ USER.REC FROM F.USERS, USER.ID.VAL ELSE EXIT
+      * User ID exists, try with suffix
+      SUFFIX += 1
+      USER.ID.VAL = USER.ID.BASE : SUFFIX
+   REPEAT
+
+   * Create user record
+   USER.REC = ''
+   USER.REC<1> = USER.ID.VAL
+   USER.REC<2> = EMP.ID.OUT
+   USER.REC<3> = 'ACTIVE'
+   USER.REC<4> = 5  ; Default access level
+   USER.REC<5> = ''  ; Password (to be set)
+   USER.REC<6> = SYSTEM.DATE  ; Created date
+   USER.REC<7> = ''  ; Last login
+   USER.REC<8> = EMP.REC<PRIMARY.STORE>
+
+   WRITE USER.REC TO F.USERS, USER.ID.VAL
+
+   * Store user ID in employee record
+   EMP.REC<USER.ID> = USER.ID.VAL
+   EMP.REC<USER.LEVEL> = 5
+   RETURN
+
+**************************************************************************
+* Create Onboarding Checklist
+**************************************************************************
+CREATE.ONBOARDING.CHECKLIST:
+   OPEN 'ONBOARDING' TO F.ONBOARD ELSE
+      EXECUTE 'CREATE.FILE ONBOARDING 1 101'
+      OPEN 'ONBOARDING' TO F.ONBOARD ELSE
+         RETURN
+      END
+   END
+
+   ONBOARD.ID = EMP.ID.OUT
+   ONBOARD.REC = ''
+   ONBOARD.REC<1> = EMP.ID.OUT
+   ONBOARD.REC<2> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   ONBOARD.REC<3> = SYSTEM.DATE
+
+   * Checklist items
+   ONBOARD.REC<10, 1> = 'Complete I-9 form'
+   ONBOARD.REC<10, 2> = 'Complete W-4 form'
+   ONBOARD.REC<10, 3> = 'Setup direct deposit'
+   ONBOARD.REC<10, 4> = 'Review employee handbook'
+   ONBOARD.REC<10, 5> = 'Complete safety training'
+   ONBOARD.REC<10, 6> = 'Setup system access'
+   ONBOARD.REC<10, 7> = 'Assign badge/PIN'
+   ONBOARD.REC<10, 8> = 'Review benefits package'
+
+   * Status for each item (PENDING, COMPLETE)
+   FOR I = 1 TO 8
+      ONBOARD.REC<11, I> = 'PENDING'
+   NEXT I
+
+   WRITE ONBOARD.REC TO F.ONBOARD, ONBOARD.ID
+   RETURN
+
+**************************************************************************
+* Send Welcome Email
+**************************************************************************
+SEND.WELCOME.EMAIL:
+   IF EMP.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'WELCOME*' : EMP.ID.OUT
+   EMAIL.REC = ''
+   EMAIL.REC<1> = EMP.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Welcome to the Team!'
+   EMAIL.REC<3> = 'Welcome ' : EMP.REC<FIRST.NAME> : ',' : AM
+   EMAIL.REC<3> := 'Your employee ID is: ' : EMP.ID.OUT : AM
+   EMAIL.REC<3> := 'Your user ID is: ' : EMP.REC<USER.ID> : AM
+   EMAIL.REC<3> := 'Start date: ' : OCONV(EMP.REC<HIRE.DATE>, 'D4/') : AM
+   EMAIL.REC<3> := 'Please complete your onboarding checklist.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

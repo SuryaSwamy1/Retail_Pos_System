@@ -1,0 +1,449 @@
+SUBROUTINE POS.VOID(TRANS.ID, VOID.REASON, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: POS.VOID
+* Purpose: Void a POS Transaction
+* Parameters:
+*   TRANS.ID (IN) - Transaction ID to void
+*   VOID.REASON (IN) - Reason for voiding
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate transaction ID
+IF TRANS.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Transaction ID is required'
+   RETURN
+END
+
+* Read transaction
+READU TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Transaction not found'
+   RETURN
+END
+
+* Check if already voided
+IF TRANS.REC<STATUS> = 'VOIDED' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Transaction is already voided'
+   RELEASE F.POS.TRANS, TRANS.ID
+   RETURN
+END
+
+* Check void authorization
+GOSUB CHECK.VOID.AUTHORIZATION
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.POS.TRANS, TRANS.ID
+   RETURN
+END
+
+* Check time limit for void
+GOSUB CHECK.VOID.TIME.LIMIT
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.POS.TRANS, TRANS.ID
+   RETURN
+END
+
+* Reverse inventory
+GOSUB REVERSE.INVENTORY
+
+* Reverse payments
+GOSUB REVERSE.PAYMENTS
+
+* Reverse loyalty points
+GOSUB REVERSE.LOYALTY
+
+* Update transaction status
+GOSUB UPDATE.TRANSACTION.STATUS
+
+* Update customer history
+GOSUB UPDATE.CUSTOMER.VOID.HISTORY
+
+* Create void audit record
+GOSUB CREATE.VOID.AUDIT
+
+* Update statistics
+GOSUB UPDATE.VOID.STATISTICS
+
+LOG.MSG = 'Transaction voided: ' : TRANS.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Check Void Authorization
+**************************************************************************
+CHECK.VOID.AUTHORIZATION:
+   * Require manager approval for voids
+   IF USER.LEVEL < 7 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Manager authorization required to void transactions'
+      RETURN
+   END
+
+   * Validate reason
+   IF VOID.REASON = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Void reason is required'
+      RETURN
+   END
+
+   VALID.REASONS = 'CASHIER.ERROR':VM:'CUSTOMER.REQUEST':VM:'DUPLICATE'
+   VALID.REASONS := VM:'FRAUD':VM:'SYSTEM.ERROR':VM:'OTHER'
+
+   LOCATE VOID.REASON IN VALID.REASONS<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid void reason'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Check Void Time Limit
+**************************************************************************
+CHECK.VOID.TIME.LIMIT:
+   * Allow voids within same business day
+   TRANS.DATE = TRANS.REC<TRANS.DATE>
+
+   IF TRANS.DATE < SYSTEM.DATE THEN
+      * Transaction from previous day - require higher authority
+      IF USER.LEVEL < 9 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Cannot void transactions from previous days'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Reverse Inventory
+**************************************************************************
+REVERSE.INVENTORY:
+   STORE.ID = TRANS.REC<STORE.ID>
+
+   * Find store index
+   STORE.INDEX = 0
+   GOSUB FIND.STORE.INDEX
+
+   IF STORE.INDEX = 0 THEN RETURN
+
+   ITEM.IDS = TRANS.REC<ITEM.IDS>
+   ITEM.QTYS = TRANS.REC<ITEM.QTYS>
+
+   IF ITEM.IDS = '' THEN RETURN
+
+   ITEM.COUNT = DCOUNT(ITEM.IDS, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = ITEM.IDS<1, I>
+      ITEM.QTY = ITEM.QTYS<1, I>
+
+      IF ITEM.QTY = '' THEN ITEM.QTY = 0
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Restore quantity
+      CURRENT.QTY = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+      IF CURRENT.QTY = '' THEN CURRENT.QTY = 0
+
+      ITEM.REC<QTY.ON.HAND, STORE.INDEX> = CURRENT.QTY + ITEM.QTY
+
+      WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Find Store Index
+**************************************************************************
+FIND.STORE.INDEX:
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT ST.ID ELSE EXIT
+      CURRENT.INDEX += 1
+      IF ST.ID = STORE.ID THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Reverse Payments
+**************************************************************************
+REVERSE.PAYMENTS:
+   PAYMENT.TYPE = TRANS.REC<PAYMENT.TYPE>
+   PAYMENT.AMT = TRANS.REC<TOTAL>
+
+   BEGIN CASE
+      CASE PAYMENT.TYPE = 'CASH'
+         * Cash payment - no reversal needed (refund at register)
+
+      CASE PAYMENT.TYPE = 'CREDIT' OR PAYMENT.TYPE = 'DEBIT'
+         * Reverse card transaction
+         GOSUB REVERSE.CARD.PAYMENT
+
+      CASE PAYMENT.TYPE = 'GIFT.CARD'
+         * Restore gift card balance
+         GOSUB REVERSE.GIFT.CARD.PAYMENT
+
+      CASE PAYMENT.TYPE = 'LOYALTY'
+         * Restore loyalty points
+         GOSUB REVERSE.LOYALTY.PAYMENT
+
+      CASE PAYMENT.TYPE = 'CHECK'
+         * Mark check transaction void
+         GOSUB REVERSE.CHECK.PAYMENT
+   END CASE
+   RETURN
+
+**************************************************************************
+* Reverse Card Payment
+**************************************************************************
+REVERSE.CARD.PAYMENT:
+   * Simulate card reversal
+   CARD.NUM = TRANS.REC<CARD.NUMBER>
+   AUTH.CODE = TRANS.REC<AUTH.CODE>
+
+   * In production, integrate with payment processor
+   REVERSAL.STATUS = 'APPROVED'
+   REVERSAL.CODE = 'VOID' : RND(999999)
+
+   TRANS.REC<VOID.REVERSAL.STATUS> = REVERSAL.STATUS
+   TRANS.REC<VOID.REVERSAL.CODE> = REVERSAL.CODE
+   RETURN
+
+**************************************************************************
+* Reverse Gift Card Payment
+**************************************************************************
+REVERSE.GIFT.CARD.PAYMENT:
+   GC.NUM = TRANS.REC<GIFT.CARD.NUMBER>
+   IF GC.NUM = '' THEN RETURN
+
+   OPEN 'GIFT.CARDS' TO F.GIFT.CARDS ELSE RETURN
+
+   READU GC.REC FROM F.GIFT.CARDS, GC.NUM ELSE RETURN
+
+   * Restore balance
+   CURRENT.BAL = GC.REC<3>
+   IF CURRENT.BAL = '' THEN CURRENT.BAL = 0
+
+   GC.REC<3> = CURRENT.BAL + PAYMENT.AMT
+
+   WRITE GC.REC TO F.GIFT.CARDS, GC.NUM
+   RETURN
+
+**************************************************************************
+* Reverse Loyalty Payment
+**************************************************************************
+REVERSE.LOYALTY.PAYMENT:
+   CUST.ID = TRANS.REC<CUSTOMER.ID>
+   IF CUST.ID = '' THEN RETURN
+
+   POINTS.USED = TRANS.REC<LOYALTY.POINTS.USED>
+   IF POINTS.USED = '' OR POINTS.USED <= 0 THEN RETURN
+
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+
+   * Restore points
+   CURRENT.POINTS = CUST.REC<LOYALTY.POINTS>
+   IF CURRENT.POINTS = '' THEN CURRENT.POINTS = 0
+
+   CUST.REC<LOYALTY.POINTS> = CURRENT.POINTS + POINTS.USED
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+   RETURN
+
+**************************************************************************
+* Reverse Check Payment
+**************************************************************************
+REVERSE.CHECK.PAYMENT:
+   * Mark check void in system
+   CHECK.NUM = TRANS.REC<CHECK.NUMBER>
+   IF CHECK.NUM = '' THEN RETURN
+
+   OPEN 'CHECK.PAYMENTS' TO F.CHECKS ELSE
+      EXECUTE 'CREATE.FILE CHECK.PAYMENTS 1 101'
+      OPEN 'CHECK.PAYMENTS' TO F.CHECKS ELSE RETURN
+   END
+
+   CHECK.ID = TRANS.ID : '*' : CHECK.NUM
+
+   READU CHECK.REC FROM F.CHECKS, CHECK.ID ELSE
+      CHECK.REC = ''
+   END
+
+   CHECK.REC<1> = CHECK.NUM
+   CHECK.REC<2> = PAYMENT.AMT
+   CHECK.REC<3> = 'VOIDED'
+   CHECK.REC<4> = SYSTEM.DATE
+   CHECK.REC<5> = TRANS.ID
+
+   WRITE CHECK.REC TO F.CHECKS, CHECK.ID
+   RETURN
+
+**************************************************************************
+* Reverse Loyalty
+**************************************************************************
+REVERSE.LOYALTY:
+   CUST.ID = TRANS.REC<CUSTOMER.ID>
+   IF CUST.ID = '' THEN RETURN
+
+   POINTS.EARNED = TRANS.REC<LOYALTY.POINTS.EARNED>
+   IF POINTS.EARNED = '' OR POINTS.EARNED <= 0 THEN RETURN
+
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+
+   LOYAL.ID = CUST.REC<LOYALTY.ID>
+   IF LOYAL.ID = '' THEN
+      RELEASE F.CUSTOMERS, CUST.ID
+      RETURN
+   END
+
+   * Deduct earned points
+   CURRENT.POINTS = CUST.REC<LOYALTY.POINTS>
+   IF CURRENT.POINTS = '' THEN CURRENT.POINTS = 0
+
+   CUST.REC<LOYALTY.POINTS> = CURRENT.POINTS - POINTS.EARNED
+   IF CUST.REC<LOYALTY.POINTS> < 0 THEN
+      CUST.REC<LOYALTY.POINTS> = 0
+   END
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+
+   * Create loyalty reversal transaction
+   GOSUB CREATE.LOYALTY.VOID.TRANS
+   RETURN
+
+**************************************************************************
+* Create Loyalty Void Trans
+**************************************************************************
+CREATE.LOYALTY.VOID.TRANS:
+   OPEN 'LOYALTY.TRANS' TO F.LOYAL.TRANS ELSE RETURN
+
+   LT.ID = LOYAL.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME : '*VOID'
+   LT.REC = ''
+   LT.REC<1> = LOYAL.ID
+   LT.REC<2> = CUST.ID
+   LT.REC<3> = SYSTEM.DATE
+   LT.REC<4> = SYSTEM.TIME
+   LT.REC<5> = 'VOID'
+   LT.REC<6> = POINTS.EARNED
+   LT.REC<7> = TRANS.ID
+   LT.REC<8> = 'TRANSACTION VOID'
+   LT.REC<14> = 'COMPLETED'
+
+   WRITE LT.REC TO F.LOYAL.TRANS, LT.ID
+   RETURN
+
+**************************************************************************
+* Update Transaction Status
+**************************************************************************
+UPDATE.TRANSACTION.STATUS:
+   TRANS.REC<STATUS> = 'VOIDED'
+   TRANS.REC<VOID.DATE> = SYSTEM.DATE
+   TRANS.REC<VOID.TIME> = SYSTEM.TIME
+   TRANS.REC<VOID.BY> = USER.ID
+   TRANS.REC<VOID.REASON> = VOID.REASON
+
+   WRITE TRANS.REC TO F.POS.TRANS, TRANS.ID
+   RETURN
+
+**************************************************************************
+* Update Customer Void History
+**************************************************************************
+UPDATE.CUSTOMER.VOID.HISTORY:
+   CUST.ID = TRANS.REC<CUSTOMER.ID>
+   IF CUST.ID = '' THEN RETURN
+
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+
+   * Deduct from purchase totals
+   TRANS.TOTAL = TRANS.REC<TOTAL>
+   IF TRANS.TOTAL = '' THEN TRANS.TOTAL = 0
+
+   TOTAL.PURCHASES = CUST.REC<TOTAL.PURCHASES.COUNT>
+   IF TOTAL.PURCHASES = '' THEN TOTAL.PURCHASES = 0
+
+   TOTAL.AMT = CUST.REC<TOTAL.PURCHASES.AMT>
+   IF TOTAL.AMT = '' THEN TOTAL.AMT = 0
+
+   CUST.REC<TOTAL.PURCHASES.COUNT> = TOTAL.PURCHASES - 1
+   IF CUST.REC<TOTAL.PURCHASES.COUNT> < 0 THEN
+      CUST.REC<TOTAL.PURCHASES.COUNT> = 0
+   END
+
+   CUST.REC<TOTAL.PURCHASES.AMT> = TOTAL.AMT - TRANS.TOTAL
+   IF CUST.REC<TOTAL.PURCHASES.AMT> < 0 THEN
+      CUST.REC<TOTAL.PURCHASES.AMT> = 0
+   END
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+   RETURN
+
+**************************************************************************
+* Create Void Audit
+**************************************************************************
+CREATE.VOID.AUDIT:
+   OPEN 'VOID.AUDIT' TO F.VOID.AUDIT ELSE
+      EXECUTE 'CREATE.FILE VOID.AUDIT 1 101'
+      OPEN 'VOID.AUDIT' TO F.VOID.AUDIT ELSE RETURN
+   END
+
+   AUDIT.ID = TRANS.ID : '*VOID*' : SYSTEM.DATE
+   AUDIT.REC = ''
+   AUDIT.REC<1> = TRANS.ID
+   AUDIT.REC<2> = TRANS.REC<TRANS.DATE>
+   AUDIT.REC<3> = TRANS.REC<TOTAL>
+   AUDIT.REC<4> = VOID.REASON
+   AUDIT.REC<5> = USER.ID
+   AUDIT.REC<6> = SYSTEM.DATE
+   AUDIT.REC<7> = SYSTEM.TIME
+   AUDIT.REC<8> = TRANS.REC<STORE.ID>
+   AUDIT.REC<9> = TRANS.REC<CASHIER.ID>
+   AUDIT.REC<10> = TRANS.REC<CUSTOMER.ID>
+
+   WRITE AUDIT.REC TO F.VOID.AUDIT, AUDIT.ID
+   RETURN
+
+**************************************************************************
+* Update Void Statistics
+**************************************************************************
+UPDATE.VOID.STATISTICS:
+   OPEN 'VOID.STATS' TO F.VOID.STATS ELSE
+      EXECUTE 'CREATE.FILE VOID.STATS 1 101'
+      OPEN 'VOID.STATS' TO F.VOID.STATS ELSE RETURN
+   END
+
+   STAT.ID = OCONV(SYSTEM.DATE, 'D4-YM')
+
+   READU STAT.REC FROM F.VOID.STATS, STAT.ID ELSE
+      STAT.REC = ''
+      STAT.REC<1> = STAT.ID
+      STAT.REC<2> = 0  ; Void count
+      STAT.REC<3> = 0  ; Void amount
+   END
+
+   COUNT = STAT.REC<2>
+   IF COUNT = '' THEN COUNT = 0
+   STAT.REC<2> = COUNT + 1
+
+   TRANS.TOTAL = TRANS.REC<TOTAL>
+   IF TRANS.TOTAL = '' THEN TRANS.TOTAL = 0
+
+   AMT = STAT.REC<3>
+   IF AMT = '' THEN AMT = 0
+   STAT.REC<3> = AMT + TRANS.TOTAL
+
+   WRITE STAT.REC TO F.VOID.STATS, STAT.ID
+   RETURN
+
+END

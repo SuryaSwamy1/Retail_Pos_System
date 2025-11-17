@@ -1,0 +1,496 @@
+SUBROUTINE BATCH.PURGE(PURGE.DAYS, DRY.RUN, PURGE.SUMMARY, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: BATCH.PURGE
+* Purpose: Archive and Purge Old Transaction Data
+* Parameters:
+*   PURGE.DAYS (IN) - Archive data older than this many days
+*   DRY.RUN (IN) - 'Y' = Test mode, 'N' = Execute purge
+*   PURGE.SUMMARY (OUT) - Summary of purge operation
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+PURGE.SUMMARY = ''
+
+* Validate parameters
+IF PURGE.DAYS = '' OR NOT(NUM(PURGE.DAYS)) THEN
+   PURGE.DAYS = 365  ; Default to 1 year
+END
+
+IF PURGE.DAYS < 90 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Purge days must be at least 90'
+   RETURN
+END
+
+IF DRY.RUN = '' THEN DRY.RUN = 'Y'
+
+* Calculate cutoff date
+CUTOFF.DATE = SYSTEM.DATE - PURGE.DAYS
+
+* Initialize counters
+GOSUB INITIALIZE.COUNTERS
+
+* Open archive files
+GOSUB OPEN.ARCHIVE.FILES
+
+* Purge transactions
+GOSUB PURGE.TRANSACTIONS
+
+* Purge receipts
+GOSUB PURGE.RECEIPTS
+
+* Purge loyalty transactions
+GOSUB PURGE.LOYALTY.TRANS
+
+* Purge void audit records
+GOSUB PURGE.VOID.AUDIT
+
+* Purge return audit records
+GOSUB PURGE.RETURN.AUDIT
+
+* Purge exchange audit records
+GOSUB PURGE.EXCHANGE.AUDIT
+
+* Purge PO approvals
+GOSUB PURGE.PO.APPROVALS
+
+* Purge email queue
+GOSUB PURGE.EMAIL.QUEUE
+
+* Update purge statistics
+GOSUB UPDATE.PURGE.STATISTICS
+
+* Generate summary
+GOSUB GENERATE.PURGE.SUMMARY
+
+LOG.MSG = 'Batch purge completed: '
+IF DRY.RUN = 'Y' THEN LOG.MSG := '(DRY RUN) '
+LOG.MSG := 'Cutoff=' : OCONV(CUTOFF.DATE, 'D4/')
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Initialize Counters
+**************************************************************************
+INITIALIZE.COUNTERS:
+   TRANS.PURGED = 0
+   TRANS.ARCHIVED = 0
+   RECEIPTS.PURGED = 0
+   RECEIPTS.ARCHIVED = 0
+   LOYAL.TRANS.PURGED = 0
+   LOYAL.TRANS.ARCHIVED = 0
+   VOID.AUDIT.PURGED = 0
+   RETURN.AUDIT.PURGED = 0
+   EXCHANGE.AUDIT.PURGED = 0
+   PO.APPROVALS.PURGED = 0
+   EMAIL.PURGED = 0
+   TOTAL.RECORDS.PURGED = 0
+   TOTAL.RECORDS.ARCHIVED = 0
+   RETURN
+
+**************************************************************************
+* Open Archive Files
+**************************************************************************
+OPEN.ARCHIVE.FILES:
+   * Open or create archive files
+   OPEN 'POS.TRANS.ARCHIVE' TO F.TRANS.ARCHIVE ELSE
+      EXECUTE 'CREATE.FILE POS.TRANS.ARCHIVE 1 101'
+      OPEN 'POS.TRANS.ARCHIVE' TO F.TRANS.ARCHIVE ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open transaction archive file'
+         RETURN
+      END
+   END
+
+   OPEN 'RECEIPTS.ARCHIVE' TO F.RECEIPTS.ARCHIVE ELSE
+      EXECUTE 'CREATE.FILE RECEIPTS.ARCHIVE 1 101'
+      OPEN 'RECEIPTS.ARCHIVE' TO F.RECEIPTS.ARCHIVE ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open receipts archive file'
+         RETURN
+      END
+   END
+
+   OPEN 'LOYALTY.TRANS.ARCHIVE' TO F.LOYAL.TRANS.ARCHIVE ELSE
+      EXECUTE 'CREATE.FILE LOYALTY.TRANS.ARCHIVE 1 101'
+      OPEN 'LOYALTY.TRANS.ARCHIVE' TO F.LOYAL.TRANS.ARCHIVE ELSE RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Purge Transactions
+**************************************************************************
+PURGE.TRANSACTIONS:
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE < "' : CUTOFF.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Skip if transaction is voided (keep for audit)
+      IF TRANS.REC<STATUS> = 'VOIDED' THEN CONTINUE
+
+      * Archive transaction
+      IF DRY.RUN = 'N' THEN
+         WRITE TRANS.REC TO F.TRANS.ARCHIVE, TRANS.ID
+      END
+      TRANS.ARCHIVED += 1
+
+      * Delete from production
+      IF DRY.RUN = 'N' THEN
+         DELETE F.POS.TRANS, TRANS.ID
+      END
+      TRANS.PURGED += 1
+      TOTAL.RECORDS.PURGED += 1
+      TOTAL.RECORDS.ARCHIVED += 1
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Purge Receipts
+**************************************************************************
+PURGE.RECEIPTS:
+   OPEN 'RECEIPTS' TO F.RECEIPTS ELSE RETURN
+
+   SELECT.CMD = 'SELECT RECEIPTS WITH RECEIPT.DATE < "' : CUTOFF.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT RECEIPT.ID ELSE EXIT
+
+      READ RECEIPT.REC FROM F.RECEIPTS, RECEIPT.ID ELSE CONTINUE
+
+      * Archive receipt
+      IF DRY.RUN = 'N' THEN
+         WRITE RECEIPT.REC TO F.RECEIPTS.ARCHIVE, RECEIPT.ID
+      END
+      RECEIPTS.ARCHIVED += 1
+
+      * Delete from production
+      IF DRY.RUN = 'N' THEN
+         DELETE F.RECEIPTS, RECEIPT.ID
+      END
+      RECEIPTS.PURGED += 1
+      TOTAL.RECORDS.PURGED += 1
+      TOTAL.RECORDS.ARCHIVED += 1
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Purge Loyalty Trans
+**************************************************************************
+PURGE.LOYALTY.TRANS:
+   OPEN 'LOYALTY.TRANS' TO F.LOYAL.TRANS ELSE RETURN
+
+   SELECT.CMD = 'SELECT LOYALTY.TRANS'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT LT.ID ELSE EXIT
+
+      READ LT.REC FROM F.LOYAL.TRANS, LT.ID ELSE CONTINUE
+
+      * Check transaction date
+      TRANS.DATE = LT.REC<3>
+      IF TRANS.DATE = '' THEN CONTINUE
+
+      IF TRANS.DATE < CUTOFF.DATE THEN
+         * Archive loyalty transaction
+         IF DRY.RUN = 'N' THEN
+            WRITE LT.REC TO F.LOYAL.TRANS.ARCHIVE, LT.ID
+         END
+         LOYAL.TRANS.ARCHIVED += 1
+
+         * Delete from production
+         IF DRY.RUN = 'N' THEN
+            DELETE F.LOYAL.TRANS, LT.ID
+         END
+         LOYAL.TRANS.PURGED += 1
+         TOTAL.RECORDS.PURGED += 1
+         TOTAL.RECORDS.ARCHIVED += 1
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Purge Void Audit
+**************************************************************************
+PURGE.VOID.AUDIT:
+   OPEN 'VOID.AUDIT' TO F.VOID.AUDIT ELSE RETURN
+
+   SELECT.CMD = 'SELECT VOID.AUDIT'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT AUDIT.ID ELSE EXIT
+
+      READ AUDIT.REC FROM F.VOID.AUDIT, AUDIT.ID ELSE CONTINUE
+
+      * Check void date
+      VOID.DATE = AUDIT.REC<6>
+      IF VOID.DATE = '' THEN CONTINUE
+
+      IF VOID.DATE < CUTOFF.DATE THEN
+         * Delete void audit (no archive needed)
+         IF DRY.RUN = 'N' THEN
+            DELETE F.VOID.AUDIT, AUDIT.ID
+         END
+         VOID.AUDIT.PURGED += 1
+         TOTAL.RECORDS.PURGED += 1
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Purge Return Audit
+**************************************************************************
+PURGE.RETURN.AUDIT:
+   OPEN 'RETURN.AUDIT' TO F.RETURN.AUDIT ELSE RETURN
+
+   SELECT.CMD = 'SELECT RETURN.AUDIT'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT AUDIT.ID ELSE EXIT
+
+      READ AUDIT.REC FROM F.RETURN.AUDIT, AUDIT.ID ELSE CONTINUE
+
+      * Check return date
+      RETURN.DATE = AUDIT.REC<6>
+      IF RETURN.DATE = '' THEN CONTINUE
+
+      IF RETURN.DATE < CUTOFF.DATE THEN
+         * Delete return audit (no archive needed)
+         IF DRY.RUN = 'N' THEN
+            DELETE F.RETURN.AUDIT, AUDIT.ID
+         END
+         RETURN.AUDIT.PURGED += 1
+         TOTAL.RECORDS.PURGED += 1
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Purge Exchange Audit
+**************************************************************************
+PURGE.EXCHANGE.AUDIT:
+   OPEN 'EXCHANGE.AUDIT' TO F.EXCHANGE.AUDIT ELSE RETURN
+
+   SELECT.CMD = 'SELECT EXCHANGE.AUDIT'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT AUDIT.ID ELSE EXIT
+
+      READ AUDIT.REC FROM F.EXCHANGE.AUDIT, AUDIT.ID ELSE CONTINUE
+
+      * Check exchange date
+      EXCHANGE.DATE = AUDIT.REC<10>
+      IF EXCHANGE.DATE = '' THEN CONTINUE
+
+      IF EXCHANGE.DATE < CUTOFF.DATE THEN
+         * Delete exchange audit (no archive needed)
+         IF DRY.RUN = 'N' THEN
+            DELETE F.EXCHANGE.AUDIT, AUDIT.ID
+         END
+         EXCHANGE.AUDIT.PURGED += 1
+         TOTAL.RECORDS.PURGED += 1
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Purge PO Approvals
+**************************************************************************
+PURGE.PO.APPROVALS:
+   OPEN 'PO.APPROVALS' TO F.PO.APPROVALS ELSE RETURN
+
+   SELECT.CMD = 'SELECT PO.APPROVALS'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT APPROVAL.ID ELSE EXIT
+
+      READ APPROVAL.REC FROM F.PO.APPROVALS, APPROVAL.ID ELSE CONTINUE
+
+      * Check approval date
+      APPROVAL.DATE = APPROVAL.REC<3>
+      IF APPROVAL.DATE = '' THEN CONTINUE
+
+      IF APPROVAL.DATE < CUTOFF.DATE THEN
+         * Delete approval record (no archive needed)
+         IF DRY.RUN = 'N' THEN
+            DELETE F.PO.APPROVALS, APPROVAL.ID
+         END
+         PO.APPROVALS.PURGED += 1
+         TOTAL.RECORDS.PURGED += 1
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Purge Email Queue
+**************************************************************************
+PURGE.EMAIL.QUEUE:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   SELECT.CMD = 'SELECT EMAIL.QUEUE'
+   EXECUTE SELECT.CMD
+
+   PURGE.EMAIL.DATE = SYSTEM.DATE - 7  ; Purge emails older than 7 days
+
+   LOOP
+      READNEXT EMAIL.ID ELSE EXIT
+
+      READ EMAIL.REC FROM F.EMAIL.QUEUE, EMAIL.ID ELSE CONTINUE
+
+      * Check email status
+      EMAIL.STATUS = EMAIL.REC<4>
+
+      * Only purge sent/failed emails
+      IF EMAIL.STATUS # 'SENT' AND EMAIL.STATUS # 'FAILED' THEN CONTINUE
+
+      * Check if old enough
+      * Parse date from email ID if available
+      * Email IDs typically contain date: PREFIX*DATE*TIME
+
+      IF INDEX(EMAIL.ID, '*', 1) > 0 THEN
+         DATE.PART = FIELD(EMAIL.ID, '*', 2)
+         IF NUM(DATE.PART) THEN
+            EMAIL.DATE = DATE.PART
+            IF EMAIL.DATE < PURGE.EMAIL.DATE THEN
+               IF DRY.RUN = 'N' THEN
+                  DELETE F.EMAIL.QUEUE, EMAIL.ID
+               END
+               EMAIL.PURGED += 1
+               TOTAL.RECORDS.PURGED += 1
+            END
+         END
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Update Purge Statistics
+**************************************************************************
+UPDATE.PURGE.STATISTICS:
+   IF DRY.RUN = 'Y' THEN RETURN
+
+   OPEN 'PURGE.STATISTICS' TO F.PURGE.STATS ELSE
+      EXECUTE 'CREATE.FILE PURGE.STATISTICS 1 101'
+      OPEN 'PURGE.STATISTICS' TO F.PURGE.STATS ELSE RETURN
+   END
+
+   STAT.ID = 'PURGE*' : OCONV(SYSTEM.DATE, 'D4-YMD')
+
+   STAT.REC = ''
+   STAT.REC<1> = SYSTEM.DATE
+   STAT.REC<2> = SYSTEM.TIME
+   STAT.REC<3> = CUTOFF.DATE
+   STAT.REC<4> = PURGE.DAYS
+   STAT.REC<5> = TOTAL.RECORDS.PURGED
+   STAT.REC<6> = TOTAL.RECORDS.ARCHIVED
+   STAT.REC<7> = TRANS.PURGED
+   STAT.REC<8> = RECEIPTS.PURGED
+   STAT.REC<9> = LOYAL.TRANS.PURGED
+   STAT.REC<10> = VOID.AUDIT.PURGED
+   STAT.REC<11> = RETURN.AUDIT.PURGED
+   STAT.REC<12> = EXCHANGE.AUDIT.PURGED
+   STAT.REC<13> = PO.APPROVALS.PURGED
+   STAT.REC<14> = EMAIL.PURGED
+
+   WRITE STAT.REC TO F.PURGE.STATS, STAT.ID
+   RETURN
+
+**************************************************************************
+* Generate Purge Summary
+**************************************************************************
+GENERATE.PURGE.SUMMARY:
+   PURGE.SUMMARY = ''
+
+   IF DRY.RUN = 'Y' THEN
+      PURGE.SUMMARY<1> = '*** DRY RUN MODE - NO DATA DELETED ***'
+      PURGE.SUMMARY<2> = ''
+   END
+
+   LINE.NUM = DCOUNT(PURGE.SUMMARY, AM) + 1
+
+   PURGE.SUMMARY<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = '        DATA PURGE SUMMARY               '
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = ''
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Purge Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Cutoff Date: ' : OCONV(CUTOFF.DATE, 'D4/')
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Purge Days: ' : PURGE.DAYS
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = ''
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'RECORDS PURGED BY TYPE'
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Transactions: ' : TRANS.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Receipts: ' : RECEIPTS.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Loyalty Transactions: ' : LOYAL.TRANS.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Void Audit Records: ' : VOID.AUDIT.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Return Audit Records: ' : RETURN.AUDIT.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Exchange Audit Records: ' : EXCHANGE.AUDIT.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'PO Approvals: ' : PO.APPROVALS.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Email Queue: ' : EMAIL.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = ''
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'TOTALS'
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Total Records Purged: ' : TOTAL.RECORDS.PURGED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = 'Total Records Archived: ' : TOTAL.RECORDS.ARCHIVED
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = ''
+   LINE.NUM += 1
+
+   IF DRY.RUN = 'Y' THEN
+      PURGE.SUMMARY<LINE.NUM> = '*** DRY RUN COMPLETED ***'
+      LINE.NUM += 1
+      PURGE.SUMMARY<LINE.NUM> = 'Run with DRY.RUN=''N'' to execute purge'
+      LINE.NUM += 1
+      PURGE.SUMMARY<LINE.NUM> = ''
+      LINE.NUM += 1
+   END
+
+   PURGE.SUMMARY<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = '           END OF SUMMARY                '
+   LINE.NUM += 1
+   PURGE.SUMMARY<LINE.NUM> = '========================================='
+
+   RETURN
+
+END

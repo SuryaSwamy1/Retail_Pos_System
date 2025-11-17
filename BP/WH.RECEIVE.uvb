@@ -1,0 +1,349 @@
+SUBROUTINE WH.RECEIVE(RECEIPT.ID, RECEIPT.ITEMS, PUTAWAY.LOCS, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: WH.RECEIVE
+* Purpose: Warehouse Receiving Process
+* Parameters:
+*   RECEIPT.ID (IN) - Receipt ID from PO.RECEIVE
+*   RECEIPT.ITEMS (IN) - Items to process for putaway
+*   PUTAWAY.LOCS (IN) - Location assignments (optional)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate receipt ID
+IF RECEIPT.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Receipt ID is required'
+   RETURN
+END
+
+* Read receipt record
+READ RECEIPT.REC FROM F.RECEIPTS, RECEIPT.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Receipt not found: ' : RECEIPT.ID
+   RETURN
+END
+
+* Verify receipt is not already processed
+IF RECEIPT.REC<9> = 'PUTAWAY' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Receipt already processed for putaway'
+   RETURN
+END
+
+* Get store/warehouse location
+STORE.ID = RECEIPT.REC<8>
+
+* Process each item for putaway
+GOSUB PROCESS.PUTAWAY.ITEMS
+
+* Create warehouse receiving document
+GOSUB CREATE.WH.RECEIVING.DOC
+
+* Update receipt status
+GOSUB UPDATE.RECEIPT.STATUS
+
+* Generate receiving labels
+GOSUB GENERATE.RECEIVING.LABELS
+
+* Update warehouse inventory locations
+GOSUB UPDATE.WH.LOCATIONS
+
+LOG.MSG = 'Warehouse receiving completed for receipt: ' : RECEIPT.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Process Putaway Items
+**************************************************************************
+PROCESS.PUTAWAY.ITEMS:
+   ITEM.COUNT = DCOUNT(RECEIPT.REC<10>, VM)
+
+   * Open warehouse locations file
+   OPEN 'WH.LOCATIONS' TO F.WH.LOCS ELSE
+      EXECUTE 'CREATE.FILE WH.LOCATIONS 1 101'
+      OPEN 'WH.LOCATIONS' TO F.WH.LOCS ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open warehouse locations file'
+         RETURN
+      END
+   END
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = RECEIPT.REC<10, I>
+      QTY.RECEIVED = RECEIPT.REC<15, I>
+      LOT.NUM = RECEIPT.REC<18, I>
+      EXPIRY = RECEIPT.REC<19, I>
+
+      * Determine putaway location
+      IF PUTAWAY.LOCS # '' THEN
+         LOCATION = PUTAWAY.LOCS<1, I>
+      END ELSE
+         * Auto-assign location
+         GOSUB AUTO.ASSIGN.LOCATION
+      END
+
+      * Create putaway task
+      GOSUB CREATE.PUTAWAY.TASK
+
+      * Update location inventory
+      GOSUB UPDATE.LOCATION.INVENTORY
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Auto Assign Location
+**************************************************************************
+AUTO.ASSIGN.LOCATION:
+   * Read item to determine storage requirements
+   READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+      LOCATION = 'RECEIVING'
+      RETURN
+   END
+
+   * Check if perishable - assign to cold storage
+   IF ITEM.REC<PERISHABLE> = 'Y' THEN
+      LOCATION = 'COLD-' : STORE.ID : '-01'
+      RETURN
+   END
+
+   * Get item category for zone assignment
+   CATEGORY = ITEM.REC<CATEGORY>
+
+   * Assign based on category
+   BEGIN CASE
+      CASE CATEGORY = 'ELECTRONICS'
+         LOCATION = 'ELECT-' : STORE.ID : '-01'
+      CASE CATEGORY = 'APPAREL'
+         LOCATION = 'APPR-' : STORE.ID : '-01'
+      CASE CATEGORY = 'GROCERY'
+         LOCATION = 'GROC-' : STORE.ID : '-01'
+      CASE 1
+         LOCATION = 'GENRL-' : STORE.ID : '-01'
+   END CASE
+
+   * Check if location has capacity
+   GOSUB CHECK.LOCATION.CAPACITY
+
+   IF NOT(HAS.CAPACITY) THEN
+      * Find next available location
+      LOCATION = 'OVERFLOW-' : STORE.ID : '-01'
+   END
+   RETURN
+
+**************************************************************************
+* Check Location Capacity
+**************************************************************************
+CHECK.LOCATION.CAPACITY:
+   HAS.CAPACITY = TRUE
+
+   READ LOC.REC FROM F.WH.LOCS, LOCATION ELSE
+      * Location doesn't exist, assume has capacity
+      RETURN
+   END
+
+   CURRENT.QTY = LOC.REC<5>  ; Current quantity
+   MAX.CAPACITY = LOC.REC<6>  ; Max capacity
+
+   IF CURRENT.QTY = '' THEN CURRENT.QTY = 0
+   IF MAX.CAPACITY = '' THEN MAX.CAPACITY = 999999
+
+   IF CURRENT.QTY + QTY.RECEIVED > MAX.CAPACITY THEN
+      HAS.CAPACITY = FALSE
+   END
+   RETURN
+
+**************************************************************************
+* Create Putaway Task
+**************************************************************************
+CREATE.PUTAWAY.TASK:
+   OPEN 'PUTAWAY.TASKS' TO F.PUTAWAY ELSE
+      EXECUTE 'CREATE.FILE PUTAWAY.TASKS 1 101'
+      OPEN 'PUTAWAY.TASKS' TO F.PUTAWAY ELSE
+         RETURN
+      END
+   END
+
+   TASK.ID = RECEIPT.ID : '*' : ITEM.ID : '*' : I
+   TASK.REC = ''
+   TASK.REC<1> = TASK.ID
+   TASK.REC<2> = RECEIPT.ID
+   TASK.REC<3> = ITEM.ID
+   TASK.REC<4> = RECEIPT.REC<11, I>  ; SKU
+   TASK.REC<5> = RECEIPT.REC<12, I>  ; Description
+   TASK.REC<6> = QTY.RECEIVED
+   TASK.REC<7> = 'RECEIVING'  ; From location
+   TASK.REC<8> = LOCATION  ; To location
+   TASK.REC<9> = LOT.NUM
+   TASK.REC<10> = EXPIRY
+   TASK.REC<11> = 'PENDING'  ; Status
+   TASK.REC<12> = SYSTEM.DATE
+   TASK.REC<13> = ''  ; Assigned to
+   TASK.REC<14> = ''  ; Completed by
+   TASK.REC<15> = ''  ; Completed date
+
+   WRITE TASK.REC TO F.PUTAWAY, TASK.ID
+   RETURN
+
+**************************************************************************
+* Update Location Inventory
+**************************************************************************
+UPDATE.LOCATION.INVENTORY:
+   READU LOC.REC FROM F.WH.LOCS, LOCATION ELSE
+      * Create new location record
+      LOC.REC = ''
+      LOC.REC<1> = LOCATION
+      LOC.REC<2> = STORE.ID
+      LOC.REC<3> = 'ACTIVE'
+      LOC.REC<4> = ''  ; Zone
+      LOC.REC<5> = 0  ; Current qty
+      LOC.REC<6> = 999999  ; Max capacity
+   END
+
+   * Add item to location
+   ITEM.LIST = LOC.REC<10>  ; Item IDs
+   QTY.LIST = LOC.REC<11>  ; Quantities
+
+   * Find or add item
+   LOCATE ITEM.ID IN ITEM.LIST<1> USING VM SETTING POS ELSE
+      ITEM.CNT = DCOUNT(ITEM.LIST, VM)
+      IF ITEM.CNT = 0 OR ITEM.LIST = '' THEN
+         POS = 1
+      END ELSE
+         POS = ITEM.CNT + 1
+      END
+      ITEM.LIST<1, POS> = ITEM.ID
+      QTY.LIST<1, POS> = 0
+   END
+
+   * Update quantity
+   OLD.QTY = QTY.LIST<1, POS>
+   IF OLD.QTY = '' THEN OLD.QTY = 0
+   QTY.LIST<1, POS> = OLD.QTY + QTY.RECEIVED
+
+   * Update total location quantity
+   TOTAL.QTY = LOC.REC<5>
+   IF TOTAL.QTY = '' THEN TOTAL.QTY = 0
+   LOC.REC<5> = TOTAL.QTY + QTY.RECEIVED
+
+   LOC.REC<10> = ITEM.LIST
+   LOC.REC<11> = QTY.LIST
+
+   WRITE LOC.REC TO F.WH.LOCS, LOCATION
+   RETURN
+
+**************************************************************************
+* Create Warehouse Receiving Document
+**************************************************************************
+CREATE.WH.RECEIVING.DOC:
+   OPEN 'WH.RECEIVING' TO F.WH.RCV ELSE
+      EXECUTE 'CREATE.FILE WH.RECEIVING 1 101'
+      OPEN 'WH.RECEIVING' TO F.WH.RCV ELSE
+         RETURN
+      END
+   END
+
+   WH.RCV.ID = 'WHR-' : RECEIPT.ID
+   WH.RCV.REC = ''
+   WH.RCV.REC<1> = WH.RCV.ID
+   WH.RCV.REC<2> = RECEIPT.ID
+   WH.RCV.REC<3> = RECEIPT.REC<2>  ; PO Number
+   WH.RCV.REC<4> = STORE.ID
+   WH.RCV.REC<5> = SYSTEM.DATE
+   WH.RCV.REC<6> = SYSTEM.TIME
+   WH.RCV.REC<7> = USER.ID
+   WH.RCV.REC<8> = ITEM.COUNT
+   WH.RCV.REC<9> = 'PROCESSING'
+   WH.RCV.REC<10> = RECEIPT.REC<10>  ; Item IDs
+   WH.RCV.REC<11> = RECEIPT.REC<15>  ; Quantities
+   WH.RCV.REC<12> = PUTAWAY.LOCS  ; Assigned locations
+
+   WRITE WH.RCV.REC TO F.WH.RCV, WH.RCV.ID
+   RETURN
+
+**************************************************************************
+* Update Receipt Status
+**************************************************************************
+UPDATE.RECEIPT.STATUS:
+   READU RECEIPT.REC FROM F.RECEIPTS, RECEIPT.ID ELSE
+      RETURN
+   END
+
+   RECEIPT.REC<9> = 'PUTAWAY'
+   RECEIPT.REC<25> = SYSTEM.DATE  ; Putaway start date
+
+   WRITE RECEIPT.REC TO F.RECEIPTS, RECEIPT.ID
+   RETURN
+
+**************************************************************************
+* Generate Receiving Labels
+**************************************************************************
+GENERATE.RECEIVING.LABELS:
+   OPEN 'LABEL.QUEUE' TO F.LABELS ELSE
+      EXECUTE 'CREATE.FILE LABEL.QUEUE 1 101'
+      OPEN 'LABEL.QUEUE' TO F.LABELS ELSE
+         RETURN
+      END
+   END
+
+   FOR I = 1 TO ITEM.COUNT
+      LABEL.ID = RECEIPT.ID : '*LABEL*' : I
+      LABEL.REC = ''
+      LABEL.REC<1> = RECEIPT.REC<10, I>  ; Item ID
+      LABEL.REC<2> = RECEIPT.REC<11, I>  ; SKU
+      LABEL.REC<3> = RECEIPT.REC<12, I>  ; Description
+      LABEL.REC<4> = RECEIPT.REC<15, I>  ; Quantity
+      LABEL.REC<5> = RECEIPT.REC<18, I>  ; Lot
+      LABEL.REC<6> = RECEIPT.REC<19, I>  ; Expiry
+      LABEL.REC<7> = PUTAWAY.LOCS<1, I>  ; Location
+      LABEL.REC<8> = RECEIPT.ID
+      LABEL.REC<9> = SYSTEM.DATE
+
+      WRITE LABEL.REC TO F.LABELS, LABEL.ID
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Update Warehouse Locations
+**************************************************************************
+UPDATE.WH.LOCATIONS:
+   * Update master location directory
+   READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+      RETURN
+   END
+
+   * Update primary location for item
+   STORE.INDEX = 0
+   GOSUB FIND.STORE.INDEX
+
+   IF STORE.INDEX > 0 THEN
+      ITEM.REC<LOCATION, STORE.INDEX> = LOCATION
+      WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+   END
+   RETURN
+
+**************************************************************************
+* Find Store Index
+**************************************************************************
+FIND.STORE.INDEX:
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT ST.ID ELSE EXIT
+      CURRENT.INDEX += 1
+      IF ST.ID = STORE.ID THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+END

@@ -1,0 +1,54 @@
+* LOYALTY.TRANS Dictionary Definitions
+* MultiValue Database Schema for Loyalty Program Transactions
+
+* Field Definitions
+FIELD~TRANS.ID~1~Transaction ID~Primary Key
+FIELD~LOYALTY.ID~2~Loyalty Member ID~
+FIELD~CUSTOMER.ID~3~Customer ID~
+FIELD~TRANS.TYPE~4~Transaction Type~EARN, REDEEM, ADJUST, BONUS, EXPIRE, TRANSFER
+FIELD~TRANS.DATE~5~Transaction Date~
+FIELD~TRANS.TIME~6~Transaction Time~
+FIELD~STORE.ID~7~Store ID~
+FIELD~POS.TRANS.ID~8~Related POS Transaction ID~
+FIELD~POINTS.EARNED~9~Points Earned~
+FIELD~POINTS.REDEEMED~10~Points Redeemed~
+FIELD~POINTS.ADJUSTED~11~Points Adjusted~
+FIELD~POINTS.BALANCE~12~Points Balance After Transaction~
+FIELD~PURCHASE.AMOUNT~13~Purchase Amount~
+FIELD~EARN.RATE~14~Points Earn Rate~
+FIELD~REDEEM.VALUE~15~Redemption Dollar Value~
+FIELD~REASON.CODE~16~Reason Code~
+FIELD~REASON.DESC~17~Reason Description~
+FIELD~TIER.BEFORE~18~Tier Before Transaction~
+FIELD~TIER.AFTER~19~Tier After Transaction~
+FIELD~TIER.UPGRADE~20~Tier Upgrade Flag~Y/N
+FIELD~BONUS.CODE~21~Bonus Promotion Code~
+FIELD~BONUS.MULTIPLIER~22~Bonus Points Multiplier~
+FIELD~EXPIRY.DATE~23~Points Expiry Date~
+FIELD~EXPIRED.POINTS~24~Expired Points~
+FIELD~TRANSFER.TO~25~Transfer To Loyalty ID~
+FIELD~TRANSFER.FROM~26~Transfer From Loyalty ID~
+FIELD~CASHIER.ID~27~Cashier ID~
+FIELD~APPROVED.BY~28~Approved By User~For adjustments
+FIELD~STATUS~29~Transaction Status~PENDING, POSTED, REVERSED, EXPIRED
+FIELD~REVERSED.BY~30~Reversed By Transaction ID~
+FIELD~REVERSED.DATE~31~Reversal Date~
+FIELD~REVERSED.REASON~32~Reversal Reason~
+FIELD~POSTED.FLAG~33~Posted Flag~Y/N
+FIELD~POSTED.DATE~34~Posted Date~
+FIELD~NOTES~35~Notes~Multivalued
+FIELD~CREATED.BY~36~Created By User~
+FIELD~CREATED.DATE~37~Created Date~
+FIELD~CREATED.TIME~38~Created Time~
+
+* Index Definitions
+INDEX~LOYALTY.IDX~LOYALTY.ID~Loyalty ID Index
+INDEX~CUSTOMER.IDX~CUSTOMER.ID~Customer Index
+INDEX~DATE.IDX~TRANS.DATE~Date Index
+INDEX~TYPE.IDX~TRANS.TYPE~Type Index
+INDEX~POS.TRANS.IDX~POS.TRANS.ID~POS Transaction Index
+
+* Correlatives and Derived Fields
+CORR~NET.POINTS~POINTS.EARNED - POINTS.REDEEMED + POINTS.ADJUSTED - EXPIRED.POINTS
+CORR~TRANS.DATE.TIME~TRANS.DATE:" ":TRANS.TIME
+CORR~IS.REVERSED~IF REVERSED.DATE NOT = '' THEN 'Y' ELSE 'N'

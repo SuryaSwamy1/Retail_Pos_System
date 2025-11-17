@@ -1,0 +1,309 @@
+SUBROUTINE POS.START(STORE.ID.IN, REGISTER.ID.IN, CASHIER.ID.IN, TRANS.REC.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: POS.START
+* Purpose: Start a New Point-of-Sale Transaction
+* Parameters:
+*   STORE.ID.IN (IN) - Store ID
+*   REGISTER.ID.IN (IN) - Register ID
+*   CASHIER.ID.IN (IN) - Cashier/Employee ID
+*   TRANS.REC.OUT (OUT) - Initialized transaction record
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+TRANS.REC.OUT = ''
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate inputs
+IF STORE.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Store ID is required'
+   RETURN
+END
+
+IF REGISTER.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Register ID is required'
+   RETURN
+END
+
+IF CASHIER.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Cashier ID is required'
+   RETURN
+END
+
+* Verify store exists and is active
+GOSUB VERIFY.STORE
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Verify register exists and belongs to store
+GOSUB VERIFY.REGISTER
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Verify cashier exists and is authorized
+GOSUB VERIFY.CASHIER
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check if register is open (has opening cash amount)
+GOSUB CHECK.REGISTER.OPEN
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Initialize transaction record
+GOSUB INITIALIZE.TRANSACTION
+
+* Log transaction start
+LOG.MSG = 'POS transaction started at store ' : STORE.ID.IN
+LOG.MSG := ', register ' : REGISTER.ID.IN
+LOG.MSG := ' by cashier ' : CASHIER.ID.IN
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Verify Store
+**************************************************************************
+VERIFY.STORE:
+   READ STORE.REC FROM F.STORES, STORE.ID.IN ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Store not found: ' : STORE.ID.IN
+      RETURN
+   END
+
+   * Check store status
+   IF STORE.REC<5> # STATUS.ACTIVE THEN  ; Field 5 = STATUS
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Store is not active'
+      RETURN
+   END
+
+   * Store store name for transaction
+   STORE.NAME = STORE.REC<3>  ; Field 3 = STORE.NAME
+   RETURN
+
+**************************************************************************
+* Verify Register
+**************************************************************************
+VERIFY.REGISTER:
+   * Check if register belongs to store
+   REGISTER.LIST = STORE.REC<40>  ; Field 40 = REGISTER.IDS (multivalued)
+
+   IF REGISTER.LIST = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'No registers defined for store'
+      RETURN
+   END
+
+   LOCATE REGISTER.ID.IN IN REGISTER.LIST<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Register ' : REGISTER.ID.IN : ' not assigned to store ' : STORE.ID.IN
+      RETURN
+   END
+
+   * Verify register record exists
+   OPEN 'REGISTERS' TO F.REGISTERS ELSE
+      * Registers file doesn't exist, assume valid
+      RETURN
+   END
+
+   REG.KEY = STORE.ID.IN : '*' : REGISTER.ID.IN
+   READ REGISTER.REC FROM F.REGISTERS, REG.KEY ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Register record not found'
+      RETURN
+   END
+
+   * Check register status
+   IF REGISTER.REC<10> = STATUS.INACTIVE THEN  ; Field 10 = STATUS
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Register is inactive'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Verify Cashier
+**************************************************************************
+VERIFY.CASHIER:
+   * Read cashier/employee record
+   READ CASHIER.REC FROM F.EMPLOYEES, CASHIER.ID.IN ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Cashier not found: ' : CASHIER.ID.IN
+      RETURN
+   END
+
+   * Check employee status
+   IF CASHIER.REC<EMP.STATUS> # STATUS.ACTIVE THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Cashier is not active'
+      RETURN
+   END
+
+   * Verify cashier is assigned to this store
+   CASHIER.STORES = CASHIER.REC<STORES.ASSIGNED>
+   IF CASHIER.STORES # '' THEN
+      LOCATE STORE.ID.IN IN CASHIER.STORES<1> USING VM SETTING POS ELSE
+         * Check if primary store
+         IF CASHIER.REC<PRIMARY.STORE> # STORE.ID.IN THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Cashier not assigned to this store'
+            RETURN
+         END
+      END
+   END
+
+   * Store cashier name
+   CASHIER.NAME = CASHIER.REC<FIRST.NAME> : ' ' : CASHIER.REC<LAST.NAME>
+   RETURN
+
+**************************************************************************
+* Check Register Open
+**************************************************************************
+CHECK.REGISTER.OPEN:
+   * Check if register has been opened for the day
+   * This would typically check a REGISTER.SESSIONS file
+   OPEN 'REGISTER.SESSIONS' TO F.REG.SESSIONS ELSE
+      * File doesn't exist, assume register is open
+      RETURN
+   END
+
+   * Look for today's session
+   SESSION.KEY = STORE.ID.IN : '*' : REGISTER.ID.IN : '*' : SYSTEM.DATE
+   READ SESSION.REC FROM F.REG.SESSIONS, SESSION.KEY ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Register has not been opened. Please open register first.'
+      RETURN
+   END
+
+   * Check if register is currently closed
+   IF SESSION.REC<20> # '' THEN  ; Field 20 = CLOSE.TIME
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Register has been closed for the day'
+      RETURN
+   END
+
+   * Store session information
+   REGISTER.SESSION.ID = SESSION.KEY
+   OPENING.CASH = SESSION.REC<5>  ; Field 5 = OPENING.CASH
+   RETURN
+
+**************************************************************************
+* Initialize Transaction
+**************************************************************************
+INITIALIZE.TRANSACTION:
+   * Generate temporary transaction ID (will be finalized on complete)
+   TEMP.TRANS.ID = 'TEMP*' : STORE.ID.IN : '*' : REGISTER.ID.IN : '*' : SYSTEM.TIME
+
+   * Initialize all transaction fields
+   TRANS.REC.OUT<TRANS.ID> = TEMP.TRANS.ID
+   TRANS.REC.OUT<TRANS.TYPE> = TXN.SALE  ; Default to sale
+   TRANS.REC.OUT<TRANS.DATE> = SYSTEM.DATE
+   TRANS.REC.OUT<TRANS.TIME> = SYSTEM.TIME
+   TRANS.REC.OUT<STORE.ID> = STORE.ID.IN
+   TRANS.REC.OUT<REGISTER.ID> = REGISTER.ID.IN
+   TRANS.REC.OUT<CASHIER.ID> = CASHIER.ID.IN
+   TRANS.REC.OUT<SALES.REP.ID> = CASHIER.ID.IN  ; Default to cashier
+   TRANS.REC.OUT<CUSTOMER.ID> = ''  ; Will be set if customer provided
+
+   * Initialize item arrays (multivalued)
+   TRANS.REC.OUT<T.ITEM.ID> = ''
+   TRANS.REC.OUT<T.SKU> = ''
+   TRANS.REC.OUT<T.ITEM.DESC> = ''
+   TRANS.REC.OUT<T.QTY> = ''
+   TRANS.REC.OUT<T.UNIT.PRICE> = ''
+   TRANS.REC.OUT<T.EXTENDED.PRICE> = ''
+   TRANS.REC.OUT<T.COST> = ''
+   TRANS.REC.OUT<T.DISCOUNT.CODE> = ''
+   TRANS.REC.OUT<T.DISCOUNT.PCT> = ''
+   TRANS.REC.OUT<T.DISCOUNT.AMT> = ''
+   TRANS.REC.OUT<T.TAX.CODE> = ''
+   TRANS.REC.OUT<T.TAX.RATE> = ''
+   TRANS.REC.OUT<T.TAX.AMT> = ''
+   TRANS.REC.OUT<T.LINE.TOTAL> = ''
+   TRANS.REC.OUT<T.SERIAL.NUMBERS> = ''
+   TRANS.REC.OUT<T.LOT.NUMBERS> = ''
+   TRANS.REC.OUT<T.RETURN.REASON> = ''
+   TRANS.REC.OUT<ORIGINAL.TRANS> = ''
+
+   * Initialize totals
+   TRANS.REC.OUT<SUBTOTAL> = 0
+   TRANS.REC.OUT<TOTAL.DISCOUNT> = 0
+   TRANS.REC.OUT<TOTAL.TAX> = 0
+   TRANS.REC.OUT<TOTAL.AMOUNT> = 0
+
+   * Initialize payment arrays
+   TRANS.REC.OUT<PAYMENT.TYPE> = ''
+   TRANS.REC.OUT<PAYMENT.AMT> = ''
+   TRANS.REC.OUT<CARD.TYPE> = ''
+   TRANS.REC.OUT<CARD.NUMBER> = ''
+   TRANS.REC.OUT<AUTH.CODE> = ''
+   TRANS.REC.OUT<CHECK.NUMBER> = ''
+   TRANS.REC.OUT<GIFT.CARD.NUM> = ''
+   TRANS.REC.OUT<CHANGE.GIVEN> = 0
+
+   * Initialize loyalty fields
+   TRANS.REC.OUT<T.LOYALTY.ID> = ''
+   TRANS.REC.OUT<POINTS.EARNED> = 0
+   TRANS.REC.OUT<POINTS.REDEEMED> = 0
+
+   * Initialize promotion fields
+   TRANS.REC.OUT<T.PROMO.CODE> = ''
+   TRANS.REC.OUT<COUPON.CODE> = ''
+   TRANS.REC.OUT<COUPON.AMT> = ''
+
+   * Initialize flags
+   TRANS.REC.OUT<GIFT.RECEIPT> = 'N'
+   TRANS.REC.OUT<EMAIL.RECEIPT> = 'N'
+   TRANS.REC.OUT<RECEIPT.EMAIL> = ''
+
+   * Initialize commission fields
+   TRANS.REC.OUT<COMMISSION.AMT> = 0
+   TRANS.REC.OUT<COMMISSION.SPLIT> = ''
+
+   * Set status
+   TRANS.REC.OUT<TRANS.STATUS> = 'ACTIVE'  ; Active, not yet complete
+
+   * Initialize void fields
+   TRANS.REC.OUT<VOID.BY> = ''
+   TRANS.REC.OUT<VOID.DATE> = ''
+   TRANS.REC.OUT<VOID.TIME> = ''
+   TRANS.REC.OUT<VOID.REASON> = ''
+
+   * Initialize suspend fields
+   TRANS.REC.OUT<SUSPEND.ID> = ''
+
+   * Initialize shipping fields
+   TRANS.REC.OUT<SHIP.TO.NAME> = ''
+   TRANS.REC.OUT<SHIP.TO.ADDRESS> = ''
+   TRANS.REC.OUT<SHIP.METHOD> = ''
+   TRANS.REC.OUT<SHIP.COST> = 0
+   TRANS.REC.OUT<TRACKING.NUMBER> = ''
+
+   * Initialize notes
+   TRANS.REC.OUT<TRANS.NOTES> = ''
+
+   * Initialize posting fields
+   TRANS.REC.OUT<POSTED.FLAG> = 'N'
+   TRANS.REC.OUT<POSTED.DATE> = ''
+   TRANS.REC.OUT<BATCH.ID> = ''
+
+   * Set audit fields
+   TRANS.REC.OUT<TRANS.CREATED.BY> = USER.ID
+   TRANS.REC.OUT<TRANS.CREATED.DATE> = SYSTEM.DATE
+   TRANS.REC.OUT<TRANS.CREATED.TIME> = SYSTEM.TIME
+   TRANS.REC.OUT<TRANS.MODIFIED.BY> = USER.ID
+   TRANS.REC.OUT<TRANS.MODIFIED.DATE> = SYSTEM.DATE
+   TRANS.REC.OUT<TRANS.MODIFIED.TIME> = SYSTEM.TIME
+
+   * Store additional context (using high attribute numbers for temp data)
+   TRANS.REC.OUT<300> = STORE.NAME
+   TRANS.REC.OUT<301> = CASHIER.NAME
+   TRANS.REC.OUT<302> = REGISTER.SESSION.ID
+   TRANS.REC.OUT<303> = 0  ; Line item count
+   RETURN
+
+END

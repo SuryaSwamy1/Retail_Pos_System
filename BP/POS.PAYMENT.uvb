@@ -1,0 +1,420 @@
+SUBROUTINE POS.PAYMENT(TRANS.REC.IO, PAY.TYPE, PAY.AMT, PAY.DETAILS, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: POS.PAYMENT
+* Purpose: Process Payment for POS Transaction
+* Parameters:
+*   TRANS.REC.IO (IN/OUT) - Transaction record
+*   PAY.TYPE (IN) - Payment type (CASH, CREDIT, DEBIT, CHECK, GIFT, LOYALTY)
+*   PAY.AMT (IN) - Payment amount
+*   PAY.DETAILS (IN) - Payment details (card number, check number, etc.)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate inputs
+IF PAY.TYPE = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Payment type is required'
+   RETURN
+END
+
+IF PAY.AMT = '' OR NOT(NUM(PAY.AMT)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Payment amount must be numeric'
+   RETURN
+END
+
+IF PAY.AMT <= 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Payment amount must be greater than zero'
+   RETURN
+END
+
+* Validate payment type
+VALID.TYPES = PAY.CASH:VM:PAY.CREDIT:VM:PAY.DEBIT:VM:PAY.CHECK:VM:PAY.GIFT.CARD:VM:PAY.LOYALTY
+LOCATE PAY.TYPE IN VALID.TYPES<1> USING VM SETTING POS ELSE
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid payment type'
+   RETURN
+END
+
+* Get transaction total
+TRANS.TOTAL = TRANS.REC.IO<TOTAL.AMOUNT>
+IF TRANS.TOTAL = '' THEN TRANS.TOTAL = 0
+
+* Calculate amount already paid
+PAID.AMOUNT = 0
+PAY.COUNT = DCOUNT(TRANS.REC.IO<PAYMENT.AMT>, VM)
+FOR I = 1 TO PAY.COUNT
+   PAID = TRANS.REC.IO<PAYMENT.AMT, I>
+   IF PAID = '' THEN PAID = 0
+   PAID.AMOUNT += PAID
+NEXT I
+
+* Calculate remaining balance
+REMAINING.BAL = TRANS.TOTAL - PAID.AMOUNT
+
+* Process payment based on type
+BEGIN CASE
+   CASE PAY.TYPE = PAY.CASH
+      GOSUB PROCESS.CASH
+   CASE PAY.TYPE = PAY.CREDIT OR PAY.TYPE = PAY.DEBIT
+      GOSUB PROCESS.CARD
+   CASE PAY.TYPE = PAY.CHECK
+      GOSUB PROCESS.CHECK
+   CASE PAY.TYPE = PAY.GIFT.CARD
+      GOSUB PROCESS.GIFT.CARD
+   CASE PAY.TYPE = PAY.LOYALTY
+      GOSUB PROCESS.LOYALTY.REDEMPTION
+END CASE
+
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Add payment to transaction
+GOSUB ADD.PAYMENT.TO.TRANSACTION
+
+* Calculate change if overpaid
+GOSUB CALCULATE.CHANGE
+
+RETURN
+
+**************************************************************************
+* Process Cash Payment
+**************************************************************************
+PROCESS.CASH:
+   * No additional processing needed for cash
+   * In production, may integrate with cash drawer
+   AUTH.CODE.VAL = 'CASH-' : OCONV(DATE(), 'D4-') : '-' : OCONV(TIME(), 'MTS')
+   RETURN
+
+**************************************************************************
+* Process Card Payment
+**************************************************************************
+PROCESS.CARD:
+   * Parse payment details
+   * Format: CARD_TYPE|CARD_NUMBER|EXPIRY|CVV|NAME
+   CARD.TYPE.VAL = FIELD(PAY.DETAILS, '|', 1)
+   CARD.NUMBER = FIELD(PAY.DETAILS, '|', 2)
+   CARD.EXPIRY = FIELD(PAY.DETAILS, '|', 3)
+   CARD.CVV = FIELD(PAY.DETAILS, '|', 4)
+   CARD.NAME = FIELD(PAY.DETAILS, '|', 5)
+
+   * Validate card type
+   VALID.CARDS = 'VISA':VM:'MC':VM:'AMEX':VM:'DISC'
+   LOCATE CARD.TYPE.VAL IN VALID.CARDS<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid card type'
+      RETURN
+   END
+
+   * Validate card number (basic Luhn check)
+   GOSUB VALIDATE.CARD.NUMBER
+   IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+   * Process authorization
+   GOSUB AUTHORIZE.CARD
+   IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+   * Mask card number for storage
+   CARD.LEN = LEN(CARD.NUMBER)
+   IF CARD.LEN > 4 THEN
+      MASKED.CARD = STR('*', CARD.LEN - 4) : CARD.NUMBER[CARD.LEN - 3, 4]
+   END ELSE
+      MASKED.CARD = CARD.NUMBER
+   END
+
+   CARD.NUMBER = MASKED.CARD
+   RETURN
+
+**************************************************************************
+* Validate Card Number (Luhn Algorithm)
+**************************************************************************
+VALIDATE.CARD.NUMBER:
+   * Remove spaces and dashes
+   CLEAN.CARD = CONVERT(' -', '', CARD.NUMBER)
+
+   * Check if all digits
+   IF NOT(NUM(CLEAN.CARD)) THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Card number must contain only digits'
+      RETURN
+   END
+
+   * Luhn algorithm
+   SUM = 0
+   CARD.LEN = LEN(CLEAN.CARD)
+   ALTERNATE = FALSE
+
+   FOR I = CARD.LEN TO 1 STEP -1
+      DIGIT = CLEAN.CARD[I, 1]
+      DIGIT = NUM(DIGIT)
+
+      IF ALTERNATE THEN
+         DIGIT = DIGIT * 2
+         IF DIGIT > 9 THEN
+            DIGIT = DIGIT - 9
+         END
+      END
+
+      SUM += DIGIT
+      ALTERNATE = NOT(ALTERNATE)
+   NEXT I
+
+   IF MOD(SUM, 10) # 0 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid card number'
+      RETURN
+   END
+
+   CARD.NUMBER = CLEAN.CARD
+   RETURN
+
+**************************************************************************
+* Authorize Card
+**************************************************************************
+AUTHORIZE.CARD:
+   * In production, integrate with payment gateway
+   * For demo, simulate authorization
+
+   * Generate authorization code
+   AUTH.CODE.VAL = 'AUTH-' : RND(999999)
+   AUTH.CODE.VAL = OCONV(AUTH.CODE.VAL, 'R(0)#6')
+
+   * Simulate authorization delay
+   * In production: CALL PAYMENT.GATEWAY(...)
+
+   * Log authorization
+   LOG.MSG = 'Card authorized: ' : CARD.TYPE.VAL
+   LOG.MSG := ', Amount: ' : PAY.AMT
+   LOG.MSG := ', Auth: ' : AUTH.CODE.VAL
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+   * Random authorization failure (5% for testing)
+   TEST.AUTH = RND(100)
+   IF TEST.AUTH < 5 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Card authorization declined'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Process Check Payment
+**************************************************************************
+PROCESS.CHECK:
+   * Parse check details
+   * Format: CHECK_NUMBER|ROUTING|ACCOUNT|NAME
+   CHECK.NUM = FIELD(PAY.DETAILS, '|', 1)
+   CHECK.ROUTING = FIELD(PAY.DETAILS, '|', 2)
+   CHECK.ACCOUNT = FIELD(PAY.DETAILS, '|', 3)
+   CHECK.NAME = FIELD(PAY.DETAILS, '|', 4)
+
+   IF CHECK.NUM = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Check number is required'
+      RETURN
+   END
+
+   * Validate routing number (9 digits)
+   IF LEN(CHECK.ROUTING) # 9 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid routing number'
+      RETURN
+   END
+
+   * In production, integrate with check verification service
+   AUTH.CODE.VAL = 'CHECK-' : CHECK.NUM
+
+   * Log check payment
+   LOG.MSG = 'Check payment processed: ' : CHECK.NUM
+   LOG.MSG := ', Amount: ' : PAY.AMT
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Process Gift Card
+**************************************************************************
+PROCESS.GIFT.CARD:
+   * Parse gift card details
+   * Format: CARD_NUMBER|PIN
+   GIFT.CARD.NUMBER = FIELD(PAY.DETAILS, '|', 1)
+   GIFT.CARD.PIN = FIELD(PAY.DETAILS, '|', 2)
+
+   IF GIFT.CARD.NUMBER = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Gift card number is required'
+      RETURN
+   END
+
+   * Read gift card record
+   OPEN 'GIFT.CARDS' TO F.GIFT.CARDS ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Gift cards file not available'
+      RETURN
+   END
+
+   READU GIFT.REC FROM F.GIFT.CARDS, GIFT.CARD.NUMBER LOCKED
+      ERROR.CODE = ERR.RECORD.LOCKED
+      ERROR.MSG = 'Gift card is locked'
+      RETURN
+   END ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Gift card not found'
+      RETURN
+   END
+
+   * Verify PIN if required
+   IF GIFT.REC<5> # '' THEN  ; PIN field
+      CALL UTILS.COMMON('DECRYPT.STRING', GIFT.REC<5>, DECRYPTED.PIN)
+      IF DECRYPTED.PIN # GIFT.CARD.PIN THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid gift card PIN'
+         RELEASE F.GIFT.CARDS, GIFT.CARD.NUMBER
+         RETURN
+      END
+   END
+
+   * Check balance
+   GIFT.BALANCE = GIFT.REC<3>  ; Balance field
+   IF GIFT.BALANCE = '' THEN GIFT.BALANCE = 0
+
+   IF GIFT.BALANCE < PAY.AMT THEN
+      ERROR.CODE = ERR.INSUFFICIENT.INVENTORY
+      ERROR.MSG = 'Insufficient gift card balance'
+      ERROR.MSG := ' (Balance: ' : GIFT.BALANCE : ')'
+      RELEASE F.GIFT.CARDS, GIFT.CARD.NUMBER
+      RETURN
+   END
+
+   * Deduct amount from gift card
+   GIFT.REC<3> = GIFT.BALANCE - PAY.AMT
+   GIFT.REC<10> = DATE()  ; Last use date
+   GIFT.REC<11> = TIME()  ; Last use time
+
+   WRITE GIFT.REC TO F.GIFT.CARDS, GIFT.CARD.NUMBER
+
+   AUTH.CODE.VAL = 'GIFT-' : GIFT.CARD.NUMBER
+   RETURN
+
+**************************************************************************
+* Process Loyalty Point Redemption
+**************************************************************************
+PROCESS.LOYALTY.REDEMPTION:
+   * Get loyalty ID from transaction
+   LOYALTY.ID.VAL = TRANS.REC.IO<T.LOYALTY.ID>
+   IF LOYALTY.ID.VAL = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Loyalty ID not set for transaction'
+      RETURN
+   END
+
+   * Get customer record
+   CUST.ID = TRANS.REC.IO<CUSTOMER.ID>
+   IF CUST.ID = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Customer not set for loyalty redemption'
+      RETURN
+   END
+
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID LOCKED
+      ERROR.CODE = ERR.RECORD.LOCKED
+      ERROR.MSG = 'Customer record is locked'
+      RETURN
+   END ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Customer not found'
+      RETURN
+   END
+
+   * Calculate points required (100 points = $1)
+   POINTS.REQUIRED = PAY.AMT * 100
+
+   * Check point balance
+   POINTS.BALANCE = CUST.REC<LOYALTY.POINTS>
+   IF POINTS.BALANCE = '' THEN POINTS.BALANCE = 0
+
+   IF POINTS.BALANCE < POINTS.REQUIRED THEN
+      ERROR.CODE = ERR.INSUFFICIENT.INVENTORY
+      ERROR.MSG = 'Insufficient loyalty points'
+      ERROR.MSG := ' (Balance: ' : POINTS.BALANCE : ', Required: ' : POINTS.REQUIRED : ')'
+      RELEASE F.CUSTOMERS, CUST.ID
+      RETURN
+   END
+
+   * Deduct points
+   CUST.REC<LOYALTY.POINTS> = POINTS.BALANCE - POINTS.REQUIRED
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+
+   * Update transaction
+   TRANS.REC.IO<POINTS.REDEEMED> = POINTS.REQUIRED
+
+   AUTH.CODE.VAL = 'LOYAL-' : LOYALTY.ID.VAL
+   RETURN
+
+**************************************************************************
+* Add Payment to Transaction
+**************************************************************************
+ADD.PAYMENT.TO.TRANSACTION:
+   * Get current payment count
+   PAY.COUNT = DCOUNT(TRANS.REC.IO<PAYMENT.TYPE>, VM)
+   IF PAY.COUNT = 0 OR TRANS.REC.IO<PAYMENT.TYPE> = '' THEN
+      PAY.INDEX = 1
+   END ELSE
+      PAY.INDEX = PAY.COUNT + 1
+   END
+
+   * Add payment
+   TRANS.REC.IO<PAYMENT.TYPE, PAY.INDEX> = PAY.TYPE
+   TRANS.REC.IO<PAYMENT.AMT, PAY.INDEX> = PAY.AMT
+
+   * Add type-specific details
+   BEGIN CASE
+      CASE PAY.TYPE = PAY.CREDIT OR PAY.TYPE = PAY.DEBIT
+         TRANS.REC.IO<CARD.TYPE, PAY.INDEX> = CARD.TYPE.VAL
+         TRANS.REC.IO<CARD.NUMBER, PAY.INDEX> = CARD.NUMBER
+         TRANS.REC.IO<AUTH.CODE, PAY.INDEX> = AUTH.CODE.VAL
+      CASE PAY.TYPE = PAY.CHECK
+         TRANS.REC.IO<CHECK.NUMBER, PAY.INDEX> = CHECK.NUM
+         TRANS.REC.IO<AUTH.CODE, PAY.INDEX> = AUTH.CODE.VAL
+      CASE PAY.TYPE = PAY.GIFT.CARD
+         TRANS.REC.IO<GIFT.CARD.NUM, PAY.INDEX> = GIFT.CARD.NUMBER
+         TRANS.REC.IO<AUTH.CODE, PAY.INDEX> = AUTH.CODE.VAL
+      CASE PAY.TYPE = PAY.CASH
+         TRANS.REC.IO<AUTH.CODE, PAY.INDEX> = AUTH.CODE.VAL
+   END CASE
+
+   * Log payment
+   LOG.MSG = 'Payment added: ' : PAY.TYPE
+   LOG.MSG := ', Amount: ' : PAY.AMT
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Calculate Change
+**************************************************************************
+CALCULATE.CHANGE:
+   * Recalculate total paid
+   TOTAL.PAID = 0
+   PAY.COUNT = DCOUNT(TRANS.REC.IO<PAYMENT.AMT>, VM)
+   FOR I = 1 TO PAY.COUNT
+      PAID = TRANS.REC.IO<PAYMENT.AMT, I>
+      IF PAID = '' THEN PAID = 0
+      TOTAL.PAID += PAID
+   NEXT I
+
+   * Calculate change
+   TRANS.TOTAL = TRANS.REC.IO<TOTAL.AMOUNT>
+   IF TRANS.TOTAL = '' THEN TRANS.TOTAL = 0
+
+   CHANGE.AMT = TOTAL.PAID - TRANS.TOTAL
+   IF CHANGE.AMT < 0 THEN CHANGE.AMT = 0
+
+   TRANS.REC.IO<CHANGE.GIVEN> = CHANGE.AMT
+   RETURN
+
+END

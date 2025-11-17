@@ -1,0 +1,569 @@
+SUBROUTINE LOYAL.REDEEM(LOYAL.ID, POINTS.TO.REDEEM, TRANS.ID, REDEEM.TYPE, REDEEM.VALUE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: LOYAL.REDEEM
+* Purpose: Redeem Loyalty Points for Rewards
+* Parameters:
+*   LOYAL.ID (IN) - Loyalty ID
+*   POINTS.TO.REDEEM (IN) - Number of points to redeem
+*   TRANS.ID (IN) - Transaction ID (if redeeming at POS)
+*   REDEEM.TYPE (IN) - Type of redemption:
+*                      DISCOUNT, GIFT.CARD, PRODUCT, CHARITY
+*   REDEEM.VALUE (OUT) - Dollar value of redemption
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+REDEEM.VALUE = 0
+
+* Validate loyalty ID
+IF LOYAL.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Loyalty ID is required'
+   RETURN
+END
+
+* Find customer by loyalty ID
+GOSUB FIND.CUSTOMER.BY.LOYALTY.ID
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Verify loyalty account is active
+IF CUST.REC<LOYALTY.STATUS> # 'ACTIVE' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Loyalty account is not active'
+   RETURN
+END
+
+* Validate points to redeem
+IF POINTS.TO.REDEEM = '' OR POINTS.TO.REDEEM <= 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid points amount'
+   RETURN
+END
+
+* Check minimum redemption
+MIN.REDEEM = 100
+IF POINTS.TO.REDEEM < MIN.REDEEM THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Minimum redemption is ' : MIN.REDEEM : ' points'
+   RETURN
+END
+
+* Check if customer has enough points
+CURRENT.POINTS = CUST.REC<LOYALTY.POINTS>
+IF CURRENT.POINTS = '' THEN CURRENT.POINTS = 0
+
+IF POINTS.TO.REDEEM > CURRENT.POINTS THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Insufficient points (have ' : CURRENT.POINTS : ', need ' : POINTS.TO.REDEEM : ')'
+   RETURN
+END
+
+* Check for expired points
+GOSUB CHECK.EXPIRED.POINTS
+
+* Validate redeem type
+IF REDEEM.TYPE = '' THEN REDEEM.TYPE = 'DISCOUNT'
+
+VALID.REDEEM.TYPES = 'DISCOUNT':VM:'GIFT.CARD':VM:'PRODUCT':VM:'CHARITY'
+LOCATE REDEEM.TYPE IN VALID.REDEEM.TYPES<1> USING VM SETTING POS ELSE
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid redemption type: ' : REDEEM.TYPE
+   RETURN
+END
+
+* Calculate redemption value
+GOSUB CALCULATE.REDEMPTION.VALUE
+IF REDEEM.VALUE <= 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid redemption value'
+   RETURN
+END
+
+* Deduct points from customer
+GOSUB DEDUCT.POINTS
+
+* Create redemption transaction
+GOSUB CREATE.REDEMPTION.TRANSACTION
+
+* Process redemption based on type
+GOSUB PROCESS.REDEMPTION
+
+* Update loyalty account
+GOSUB UPDATE.LOYALTY.ACCOUNT
+
+* Send redemption confirmation
+GOSUB SEND.REDEMPTION.CONFIRMATION
+
+LOG.MSG = 'Loyalty points redeemed: ' : LOYAL.ID : ' - ' : POINTS.TO.REDEEM : ' points'
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Find Customer by Loyalty ID
+**************************************************************************
+FIND.CUSTOMER.BY.LOYALTY.ID:
+   SELECT.CMD = 'SELECT CUSTOMERS WITH LOYALTY.ID = "' : LOYAL.ID : '"'
+   EXECUTE SELECT.CMD
+
+   READNEXT CUST.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Loyalty ID not found'
+      RETURN
+   END
+
+   READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Customer record not found'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Check Expired Points
+**************************************************************************
+CHECK.EXPIRED.POINTS:
+   * Find and expire old points
+
+   OPEN 'LOYALTY.TRANS' TO F.LOYAL.TRANS ELSE RETURN
+
+   SELECT.CMD = 'SELECT LOYALTY.TRANS WITH LOYALTY.ID = "' : LOYAL.ID : '"'
+   SELECT.CMD := ' AND WITH TYPE = "EARN"'
+   SELECT.CMD := ' AND WITH STATUS = "ACTIVE"'
+   EXECUTE SELECT.CMD
+
+   EXPIRED.TOTAL = 0
+
+   LOOP
+      READNEXT LT.ID ELSE EXIT
+
+      READU LT.REC FROM F.LOYAL.TRANS, LT.ID ELSE CONTINUE
+
+      EXPIRY.DATE = LT.REC<13>
+      IF EXPIRY.DATE # '' AND EXPIRY.DATE < SYSTEM.DATE THEN
+         * Points have expired
+         POINTS.EXPIRED = LT.REC<6>
+         LT.REC<14> = 'EXPIRED'
+         WRITE LT.REC TO F.LOYAL.TRANS, LT.ID
+
+         EXPIRED.TOTAL += POINTS.EXPIRED
+      END
+   REPEAT
+
+   * Deduct expired points from customer balance
+   IF EXPIRED.TOTAL > 0 THEN
+      READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+
+      CURRENT.POINTS = CUST.REC<LOYALTY.POINTS>
+      IF CURRENT.POINTS = '' THEN CURRENT.POINTS = 0
+
+      CURRENT.POINTS -= EXPIRED.TOTAL
+      IF CURRENT.POINTS < 0 THEN CURRENT.POINTS = 0
+
+      CUST.REC<LOYALTY.POINTS> = CURRENT.POINTS
+      WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+
+      * Create expiration transaction
+      GOSUB CREATE.EXPIRATION.TRANSACTION
+   END
+   RETURN
+
+**************************************************************************
+* Create Expiration Transaction
+**************************************************************************
+CREATE.EXPIRATION.TRANSACTION:
+   EXP.ID = LOYAL.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME : '*EXP'
+   EXP.REC = ''
+   EXP.REC<1> = LOYAL.ID
+   EXP.REC<2> = CUST.ID
+   EXP.REC<3> = SYSTEM.DATE
+   EXP.REC<4> = SYSTEM.TIME
+   EXP.REC<5> = 'EXPIRE'
+   EXP.REC<6> = EXPIRED.TOTAL
+   EXP.REC<7> = ''
+   EXP.REC<8> = 'POINTS EXPIRED'
+   EXP.REC<9> = 0
+   EXP.REC<10> = CURRENT.POINTS + EXPIRED.TOTAL
+   EXP.REC<11> = CURRENT.POINTS
+   EXP.REC<12> = CUST.REC<LOYALTY.TIER>
+   EXP.REC<13> = ''
+   EXP.REC<14> = 'EXPIRED'
+
+   WRITE EXP.REC TO F.LOYAL.TRANS, EXP.ID
+   RETURN
+
+**************************************************************************
+* Calculate Redemption Value
+**************************************************************************
+CALCULATE.REDEMPTION.VALUE:
+   * Base conversion: 100 points = $1
+   BASE.VALUE = POINTS.TO.REDEEM / 100
+
+   * Apply tier bonus
+   TIER.LEVEL = CUST.REC<LOYALTY.TIER>
+
+   TIER.BONUS = 0
+   BEGIN CASE
+      CASE TIER.LEVEL = 'BRONZE'
+         TIER.BONUS = 0  ; No bonus
+
+      CASE TIER.LEVEL = 'SILVER'
+         TIER.BONUS = 0.05  ; 5% bonus value
+
+      CASE TIER.LEVEL = 'GOLD'
+         TIER.BONUS = 0.10  ; 10% bonus value
+
+      CASE TIER.LEVEL = 'PLATINUM'
+         TIER.BONUS = 0.15  ; 15% bonus value
+   END CASE
+
+   REDEEM.VALUE = BASE.VALUE * (1 + TIER.BONUS)
+
+   * Round to 2 decimals
+   CALL UTILS.COMMON('ROUND.AMOUNT', REDEEM.VALUE, 2, REDEEM.VALUE)
+
+   * Apply redemption type adjustments
+   BEGIN CASE
+      CASE REDEEM.TYPE = 'DISCOUNT'
+         * No adjustment for discount redemption
+
+      CASE REDEEM.TYPE = 'GIFT.CARD'
+         * 10% bonus when converting to gift card
+         REDEEM.VALUE = REDEEM.VALUE * 1.10
+
+      CASE REDEEM.TYPE = 'PRODUCT'
+         * Product redemptions at standard value
+
+      CASE REDEEM.TYPE = 'CHARITY'
+         * Company matches charitable donations
+         REDEEM.VALUE = REDEEM.VALUE * 2
+   END CASE
+
+   * Round final value
+   CALL UTILS.COMMON('ROUND.AMOUNT', REDEEM.VALUE, 2, REDEEM.VALUE)
+   RETURN
+
+**************************************************************************
+* Deduct Points
+**************************************************************************
+DEDUCT.POINTS:
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Cannot lock customer record'
+      RETURN
+   END
+
+   POINTS.BEFORE = CUST.REC<LOYALTY.POINTS>
+   IF POINTS.BEFORE = '' THEN POINTS.BEFORE = 0
+
+   POINTS.AFTER = POINTS.BEFORE - POINTS.TO.REDEEM
+   IF POINTS.AFTER < 0 THEN POINTS.AFTER = 0
+
+   CUST.REC<LOYALTY.POINTS> = POINTS.AFTER
+   CUST.REC<LOYALTY.LAST.REDEEM.DATE> = SYSTEM.DATE
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+   RETURN
+
+**************************************************************************
+* Create Redemption Transaction
+**************************************************************************
+CREATE.REDEMPTION.TRANSACTION:
+   OPEN 'LOYALTY.TRANS' TO F.LOYAL.TRANS ELSE RETURN
+
+   REDEEM.ID = LOYAL.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME : '*R'
+   REDEEM.REC = ''
+   REDEEM.REC<1> = LOYAL.ID
+   REDEEM.REC<2> = CUST.ID
+   REDEEM.REC<3> = SYSTEM.DATE
+   REDEEM.REC<4> = SYSTEM.TIME
+   REDEEM.REC<5> = 'REDEEM'
+   REDEEM.REC<6> = POINTS.TO.REDEEM
+   REDEEM.REC<7> = TRANS.ID
+   REDEEM.REC<8> = REDEEM.TYPE
+   REDEEM.REC<9> = REDEEM.VALUE
+   REDEEM.REC<10> = POINTS.BEFORE
+   REDEEM.REC<11> = POINTS.AFTER
+   REDEEM.REC<12> = CUST.REC<LOYALTY.TIER>
+   REDEEM.REC<13> = ''
+   REDEEM.REC<14> = 'COMPLETED'
+
+   WRITE REDEEM.REC TO F.LOYAL.TRANS, REDEEM.ID
+
+   REDEEM.TRANS.ID = REDEEM.ID
+   RETURN
+
+**************************************************************************
+* Process Redemption
+**************************************************************************
+PROCESS.REDEMPTION:
+   BEGIN CASE
+      CASE REDEEM.TYPE = 'DISCOUNT'
+         GOSUB PROCESS.DISCOUNT.REDEMPTION
+
+      CASE REDEEM.TYPE = 'GIFT.CARD'
+         GOSUB PROCESS.GIFT.CARD.REDEMPTION
+
+      CASE REDEEM.TYPE = 'PRODUCT'
+         GOSUB PROCESS.PRODUCT.REDEMPTION
+
+      CASE REDEEM.TYPE = 'CHARITY'
+         GOSUB PROCESS.CHARITY.REDEMPTION
+   END CASE
+   RETURN
+
+**************************************************************************
+* Process Discount Redemption
+**************************************************************************
+PROCESS.DISCOUNT.REDEMPTION:
+   * Create discount coupon for use at POS
+
+   OPEN 'COUPONS' TO F.COUPONS ELSE
+      EXECUTE 'CREATE.FILE COUPONS 1 101'
+      OPEN 'COUPONS' TO F.COUPONS ELSE
+         RETURN
+      END
+   END
+
+   * Generate coupon code
+   COUPON.CODE = 'LP' : LOYAL.ID[1,6] : OCONV(SYSTEM.DATE, 'D4-YMD')[3,6]
+
+   COUPON.REC = ''
+   COUPON.REC<1> = COUPON.CODE
+   COUPON.REC<2> = 'LOYALTY REDEMPTION'
+   COUPON.REC<3> = 'DOLLAR'
+   COUPON.REC<4> = REDEEM.VALUE
+   COUPON.REC<5> = SYSTEM.DATE
+   COUPON.REC<6> = SYSTEM.DATE + 30  ; Valid for 30 days
+   COUPON.REC<7> = 1  ; Single use
+   COUPON.REC<8> = 0  ; Times used
+   COUPON.REC<9> = CUST.ID  ; Restricted to customer
+   COUPON.REC<10> = 'ACTIVE'
+   COUPON.REC<11> = LOYAL.ID
+   COUPON.REC<12> = REDEEM.TRANS.ID
+
+   WRITE COUPON.REC TO F.COUPONS, COUPON.CODE
+
+   REDEMPTION.RESULT = 'Coupon Code: ' : COUPON.CODE
+   RETURN
+
+**************************************************************************
+* Process Gift Card Redemption
+**************************************************************************
+PROCESS.GIFT.CARD.REDEMPTION:
+   * Issue a gift card
+
+   OPEN 'GIFT.CARDS' TO F.GIFT.CARDS ELSE
+      EXECUTE 'CREATE.FILE GIFT.CARDS 1 101'
+      OPEN 'GIFT.CARDS' TO F.GIFT.CARDS ELSE
+         RETURN
+      END
+   END
+
+   * Generate gift card number
+   GOSUB GENERATE.GIFT.CARD.NUMBER
+
+   GC.REC = ''
+   GC.REC<1> = GIFT.CARD.NUM
+   GC.REC<2> = REDEEM.VALUE  ; Initial balance
+   GC.REC<3> = REDEEM.VALUE  ; Current balance
+   GC.REC<4> = SYSTEM.DATE
+   GC.REC<5> = SYSTEM.DATE + 365  ; Valid for 1 year
+   GC.REC<6> = 'ACTIVE'
+   GC.REC<7> = CUST.ID
+   GC.REC<8> = LOYAL.ID
+   GC.REC<9> = 'LOYALTY REDEMPTION'
+   GC.REC<10> = REDEEM.TRANS.ID
+
+   WRITE GC.REC TO F.GIFT.CARDS, GIFT.CARD.NUM
+
+   REDEMPTION.RESULT = 'Gift Card: ' : GIFT.CARD.NUM : ' - Value: $' : REDEEM.VALUE
+   RETURN
+
+**************************************************************************
+* Generate Gift Card Number
+**************************************************************************
+GENERATE.GIFT.CARD.NUMBER:
+   * Format: 16-digit number with Luhn check
+
+   OPEN 'GC.SEQUENCES' TO F.GC.SEQ ELSE
+      EXECUTE 'CREATE.FILE GC.SEQUENCES 1 1'
+      OPEN 'GC.SEQUENCES' TO F.GC.SEQ ELSE
+         GIFT.CARD.NUM = ''
+         RETURN
+      END
+   END
+
+   SEQ.KEY = 'GC-SEQ'
+   READU SEQ.REC FROM F.GC.SEQ, SEQ.KEY ELSE
+      SEQ.NUM = 1000000
+   END
+   SEQ.NUM = SEQ.REC<1>
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.GC.SEQ, SEQ.KEY
+
+   * Build 15-digit number
+   PREFIX = '6000'  ; Gift card prefix
+   SEQ.PART = OCONV(SEQ.NUM, 'R(0)#11')
+   GC.NUM.BASE = PREFIX : SEQ.PART
+
+   * Calculate Luhn check digit
+   SUM = 0
+   FOR I = 1 TO LEN(GC.NUM.BASE)
+      DIGIT = GC.NUM.BASE[I,1]
+      POSITION.FROM.RIGHT = LEN(GC.NUM.BASE) - I + 1
+
+      IF MOD(POSITION.FROM.RIGHT, 2) = 0 THEN
+         DIGIT = DIGIT * 2
+         IF DIGIT > 9 THEN DIGIT = DIGIT - 9
+      END
+
+      SUM += DIGIT
+   NEXT I
+
+   CHECK.DIGIT = MOD(10 - MOD(SUM, 10), 10)
+   GIFT.CARD.NUM = GC.NUM.BASE : CHECK.DIGIT
+   RETURN
+
+**************************************************************************
+* Process Product Redemption
+**************************************************************************
+PROCESS.PRODUCT.REDEMPTION:
+   * Create product voucher for catalog item
+
+   OPEN 'PRODUCT.VOUCHERS' TO F.VOUCHERS ELSE
+      EXECUTE 'CREATE.FILE PRODUCT.VOUCHERS 1 101'
+      OPEN 'PRODUCT.VOUCHERS' TO F.VOUCHERS ELSE
+         RETURN
+      END
+   END
+
+   VOUCHER.ID = 'PV*' : LOYAL.ID : '*' : SYSTEM.DATE
+   VOUCHER.REC = ''
+   VOUCHER.REC<1> = VOUCHER.ID
+   VOUCHER.REC<2> = LOYAL.ID
+   VOUCHER.REC<3> = CUST.ID
+   VOUCHER.REC<4> = REDEEM.VALUE
+   VOUCHER.REC<5> = SYSTEM.DATE
+   VOUCHER.REC<6> = SYSTEM.DATE + 90  ; Valid 90 days
+   VOUCHER.REC<7> = 'ACTIVE'
+   VOUCHER.REC<8> = POINTS.TO.REDEEM
+   VOUCHER.REC<9> = REDEEM.TRANS.ID
+
+   WRITE VOUCHER.REC TO F.VOUCHERS, VOUCHER.ID
+
+   REDEMPTION.RESULT = 'Product Voucher: ' : VOUCHER.ID
+   RETURN
+
+**************************************************************************
+* Process Charity Redemption
+**************************************************************************
+PROCESS.CHARITY.REDEMPTION:
+   * Record charitable donation (company matches)
+
+   OPEN 'CHARITY.DONATIONS' TO F.CHARITY ELSE
+      EXECUTE 'CREATE.FILE CHARITY.DONATIONS 1 101'
+      OPEN 'CHARITY.DONATIONS' TO F.CHARITY ELSE
+         RETURN
+      END
+   END
+
+   DONATION.ID = 'CHAR*' : LOYAL.ID : '*' : SYSTEM.DATE
+   DONATION.REC = ''
+   DONATION.REC<1> = DONATION.ID
+   DONATION.REC<2> = LOYAL.ID
+   DONATION.REC<3> = CUST.ID
+   DONATION.REC<4> = CUST.REC<CUST.NAME>
+   DONATION.REC<5> = REDEEM.VALUE / 2  ; Customer portion
+   DONATION.REC<6> = REDEEM.VALUE / 2  ; Company match
+   DONATION.REC<7> = REDEEM.VALUE  ; Total donation
+   DONATION.REC<8> = SYSTEM.DATE
+   DONATION.REC<9> = ''  ; Charity name (to be assigned)
+   DONATION.REC<10> = 'PENDING'
+   DONATION.REC<11> = POINTS.TO.REDEEM
+   DONATION.REC<12> = REDEEM.TRANS.ID
+
+   WRITE DONATION.REC TO F.CHARITY, DONATION.ID
+
+   REDEMPTION.RESULT = 'Charitable Donation: $' : REDEEM.VALUE : ' (company matched)'
+   RETURN
+
+**************************************************************************
+* Update Loyalty Account
+**************************************************************************
+UPDATE.LOYALTY.ACCOUNT:
+   OPEN 'LOYALTY.ACCOUNTS' TO F.LOYAL.ACCT ELSE RETURN
+
+   READU ACCT.REC FROM F.LOYAL.ACCT, LOYAL.ID ELSE RETURN
+
+   ACCT.REC<5> = POINTS.AFTER
+
+   * Update YTD redeemed
+   YTD.REDEEMED = ACCT.REC<8>
+   IF YTD.REDEEMED = '' THEN YTD.REDEEMED = 0
+   ACCT.REC<8> = YTD.REDEEMED + POINTS.TO.REDEEM
+
+   * Update total saved
+   TOTAL.SAVED = ACCT.REC<15>
+   IF TOTAL.SAVED = '' THEN TOTAL.SAVED = 0
+   ACCT.REC<15> = TOTAL.SAVED + REDEEM.VALUE
+
+   WRITE ACCT.REC TO F.LOYAL.ACCT, LOYAL.ID
+   RETURN
+
+**************************************************************************
+* Send Redemption Confirmation
+**************************************************************************
+SEND.REDEMPTION.CONFIRMATION:
+   IF CUST.REC<CUST.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   EMAIL.ID = 'REDEEM*' : LOYAL.ID : '*' : SYSTEM.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = CUST.REC<CUST.EMAIL>
+   EMAIL.REC<2> = 'Loyalty Points Redemption Confirmation'
+   EMAIL.REC<3> = 'Dear ' : CUST.REC<CUST.NAME> : ',' : AM : AM
+   EMAIL.REC<3> := 'You successfully redeemed ' : POINTS.TO.REDEEM : ' loyalty points!' : AM : AM
+
+   * Format redemption value
+   CALL UTILS.COMMON('FORMAT.AMOUNT', REDEEM.VALUE, FMT.VALUE)
+
+   EMAIL.REC<3> := 'Redemption Details:' : AM
+   EMAIL.REC<3> := 'Type: ' : REDEEM.TYPE : AM
+   EMAIL.REC<3> := 'Value: $' : FMT.VALUE : AM
+
+   IF REDEMPTION.RESULT # '' THEN
+      EMAIL.REC<3> := AM : REDEMPTION.RESULT : AM
+   END
+
+   EMAIL.REC<3> := AM : 'Remaining Point Balance: ' : POINTS.AFTER : ' points' : AM : AM
+
+   BEGIN CASE
+      CASE REDEEM.TYPE = 'DISCOUNT'
+         EMAIL.REC<3> := 'Your discount coupon code is valid for 30 days.' : AM
+
+      CASE REDEEM.TYPE = 'GIFT.CARD'
+         EMAIL.REC<3> := 'Your gift card is valid for 1 year.' : AM
+
+      CASE REDEEM.TYPE = 'PRODUCT'
+         EMAIL.REC<3> := 'Your product voucher is valid for 90 days.' : AM
+
+      CASE REDEEM.TYPE = 'CHARITY'
+         EMAIL.REC<3> := 'Thank you for your charitable contribution!' : AM
+         EMAIL.REC<3> := 'We matched your donation dollar-for-dollar.' : AM
+   END CASE
+
+   EMAIL.REC<3> := AM : 'Thank you for being a loyal customer!'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

@@ -1,0 +1,864 @@
+SUBROUTINE POS.EXCHANGE(ORIGINAL.TRANS.ID, RETURN.ITEMS, NEW.ITEMS, EXCHANGE.REC, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: POS.EXCHANGE
+* Purpose: Process Product Exchange (Return + New Sale)
+* Parameters:
+*   ORIGINAL.TRANS.ID (IN) - Original transaction ID
+*   RETURN.ITEMS (IN) - Items being returned (ID^QTY^REASON:VM:...)
+*   NEW.ITEMS (IN) - New items being purchased (ID^QTY:VM:...)
+*   EXCHANGE.REC (OUT) - Exchange transaction record
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+EXCHANGE.REC = ''
+
+* Validate original transaction
+GOSUB VALIDATE.ORIGINAL.TRANS
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Validate return items
+GOSUB VALIDATE.RETURN.ITEMS
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Validate new items
+GOSUB VALIDATE.NEW.ITEMS
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check exchange policy
+GOSUB CHECK.EXCHANGE.POLICY
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Calculate return credit
+GOSUB CALCULATE.RETURN.CREDIT
+
+* Calculate new purchase total
+GOSUB CALCULATE.NEW.PURCHASE
+
+* Calculate balance due
+GOSUB CALCULATE.BALANCE
+
+* Process return portion
+GOSUB PROCESS.RETURN.PORTION
+
+* Process new sale portion
+GOSUB PROCESS.NEW.SALE.PORTION
+
+* Update inventory for returns
+GOSUB UPDATE.RETURN.INVENTORY
+
+* Update inventory for new sales
+GOSUB UPDATE.NEW.SALE.INVENTORY
+
+* Handle payment/refund
+GOSUB HANDLE.EXCHANGE.PAYMENT
+
+* Update customer history
+GOSUB UPDATE.CUSTOMER.EXCHANGE.HISTORY
+
+* Create exchange audit record
+GOSUB CREATE.EXCHANGE.AUDIT
+
+* Generate exchange receipt
+GOSUB GENERATE.EXCHANGE.RECEIPT
+
+* Update statistics
+GOSUB UPDATE.EXCHANGE.STATISTICS
+
+LOG.MSG = 'Exchange processed: Original=' : ORIGINAL.TRANS.ID : ', New=' : NEW.TRANS.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate Original Trans
+**************************************************************************
+VALIDATE.ORIGINAL.TRANS:
+   IF ORIGINAL.TRANS.ID = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Original transaction ID is required'
+      RETURN
+   END
+
+   READ ORIGINAL.TRANS FROM F.POS.TRANS, ORIGINAL.TRANS.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Original transaction not found'
+      RETURN
+   END
+
+   * Check if already voided
+   IF ORIGINAL.TRANS<STATUS> = 'VOIDED' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Cannot exchange items from voided transaction'
+      RETURN
+   END
+
+   * Get original transaction data
+   ORIG.TRANS.DATE = ORIGINAL.TRANS<TRANS.DATE>
+   ORIG.ITEM.IDS = ORIGINAL.TRANS<ITEM.IDS>
+   ORIG.ITEM.QTYS = ORIGINAL.TRANS<ITEM.QTYS>
+   ORIG.ITEM.PRICES = ORIGINAL.TRANS<ITEM.PRICES>
+   ORIG.PAYMENT.TYPE = ORIGINAL.TRANS<PAYMENT.TYPE>
+   ORIG.CUSTOMER.ID = ORIGINAL.TRANS<CUSTOMER.ID>
+   RETURN
+
+**************************************************************************
+* Validate Return Items
+**************************************************************************
+VALIDATE.RETURN.ITEMS:
+   IF RETURN.ITEMS = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'At least one item must be returned'
+      RETURN
+   END
+
+   RETURN.COUNT = DCOUNT(RETURN.ITEMS, VM)
+
+   * Parse and validate each return item
+   FOR I = 1 TO RETURN.COUNT
+      RETURN.SPEC = RETURN.ITEMS<1, I>
+
+      * Parse: ITEM.ID^QTY^REASON
+      ITEM.ID = FIELD(RETURN.SPEC, '^', 1)
+      RETURN.QTY = FIELD(RETURN.SPEC, '^', 2)
+      RETURN.REASON = FIELD(RETURN.SPEC, '^', 3)
+
+      IF ITEM.ID = '' OR RETURN.QTY = '' THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid return item specification'
+         RETURN
+      END
+
+      IF NOT(NUM(RETURN.QTY)) OR RETURN.QTY <= 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Return quantity must be positive number'
+         RETURN
+      END
+
+      * Verify item was in original transaction
+      LOCATE ITEM.ID IN ORIG.ITEM.IDS<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Item ' : ITEM.ID : ' not found in original transaction'
+         RETURN
+      END
+
+      * Check quantity doesn't exceed original
+      ORIG.QTY = ORIG.ITEM.QTYS<1, POS>
+      IF RETURN.QTY > ORIG.QTY THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Return quantity exceeds original quantity for ' : ITEM.ID
+         RETURN
+      END
+
+      * Validate return reason
+      VALID.REASONS = 'WRONG.SIZE':VM:'WRONG.COLOR':VM:'DEFECTIVE'
+      VALID.REASONS := VM:'NOT.AS.EXPECTED':VM:'CHANGED.MIND':VM:'OTHER'
+
+      LOCATE RETURN.REASON IN VALID.REASONS<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid return reason: ' : RETURN.REASON
+         RETURN
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Validate New Items
+**************************************************************************
+VALIDATE.NEW.ITEMS:
+   IF NEW.ITEMS = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'At least one new item must be selected'
+      RETURN
+   END
+
+   NEW.COUNT = DCOUNT(NEW.ITEMS, VM)
+
+   * Parse and validate each new item
+   FOR I = 1 TO NEW.COUNT
+      NEW.SPEC = NEW.ITEMS<1, I>
+
+      * Parse: ITEM.ID^QTY
+      ITEM.ID = FIELD(NEW.SPEC, '^', 1)
+      NEW.QTY = FIELD(NEW.SPEC, '^', 2)
+
+      IF ITEM.ID = '' OR NEW.QTY = '' THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid new item specification'
+         RETURN
+      END
+
+      IF NOT(NUM(NEW.QTY)) OR NEW.QTY <= 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'New item quantity must be positive number'
+         RETURN
+      END
+
+      * Verify item exists in inventory
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+         ERROR.CODE = ERR.RECORD.NOT.FOUND
+         ERROR.MSG = 'Item not found: ' : ITEM.ID
+         RETURN
+      END
+
+      * Check item is active
+      IF ITEM.REC<ITEM.STATUS> # 'ACTIVE' THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Item is not active: ' : ITEM.ID
+         RETURN
+      END
+
+      * Check stock availability
+      STORE.ID = ORIGINAL.TRANS<STORE.ID>
+      GOSUB FIND.STORE.INDEX.FOR.NEW
+      IF STORE.INDEX = 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Store not found'
+         RETURN
+      END
+
+      AVAIL.QTY = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+      IF AVAIL.QTY = '' THEN AVAIL.QTY = 0
+
+      IF AVAIL.QTY < NEW.QTY THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Insufficient stock for item: ' : ITEM.ID
+         RETURN
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Find Store Index For New
+**************************************************************************
+FIND.STORE.INDEX.FOR.NEW:
+   STORE.ID = ORIGINAL.TRANS<STORE.ID>
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT ST.ID ELSE EXIT
+      CURRENT.INDEX += 1
+      IF ST.ID = STORE.ID THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Check Exchange Policy
+**************************************************************************
+CHECK.EXCHANGE.POLICY:
+   * Exchange allowed within 30 days
+   DAYS.SINCE.PURCHASE = SYSTEM.DATE - ORIG.TRANS.DATE
+
+   IF DAYS.SINCE.PURCHASE > 30 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Exchange period has expired (30 days)'
+      RETURN
+   END
+
+   * Check for previous returns on this transaction
+   RETURN.LIMIT = 3
+   RETURN.KEY = ORIGINAL.TRANS.ID : '*RETURNS'
+
+   OPEN 'RETURN.HISTORY' TO F.RETURN.HIST ELSE RETURN
+
+   READ RETURN.HIST.REC FROM F.RETURN.HIST, RETURN.KEY ELSE
+      * No previous returns
+      RETURN
+   END
+
+   RETURN.COUNT.HIST = RETURN.HIST.REC<1>
+   IF RETURN.COUNT.HIST = '' THEN RETURN.COUNT.HIST = 0
+
+   IF RETURN.COUNT.HIST >= RETURN.LIMIT THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Maximum returns/exchanges exceeded for this transaction'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Return Credit
+**************************************************************************
+CALCULATE.RETURN.CREDIT:
+   RETURN.SUBTOTAL = 0
+   RETURN.COUNT = DCOUNT(RETURN.ITEMS, VM)
+
+   FOR I = 1 TO RETURN.COUNT
+      RETURN.SPEC = RETURN.ITEMS<1, I>
+
+      ITEM.ID = FIELD(RETURN.SPEC, '^', 1)
+      RETURN.QTY = FIELD(RETURN.SPEC, '^', 2)
+
+      * Find item in original transaction
+      LOCATE ITEM.ID IN ORIG.ITEM.IDS<1> USING VM SETTING POS THEN
+         ORIG.PRICE = ORIG.ITEM.PRICES<1, POS>
+         IF ORIG.PRICE = '' THEN ORIG.PRICE = 0
+
+         RETURN.SUBTOTAL += (ORIG.PRICE * RETURN.QTY)
+      END
+   NEXT I
+
+   * Calculate proportional tax
+   ORIG.SUBTOTAL = ORIGINAL.TRANS<SUBTOTAL>
+   ORIG.TAX = ORIGINAL.TRANS<TAX>
+
+   IF ORIG.SUBTOTAL > 0 THEN
+      TAX.RATE = ORIG.TAX / ORIG.SUBTOTAL
+      RETURN.TAX = RETURN.SUBTOTAL * TAX.RATE
+   END ELSE
+      RETURN.TAX = 0
+   END
+
+   RETURN.TOTAL = RETURN.SUBTOTAL + RETURN.TAX
+   RETURN
+
+**************************************************************************
+* Calculate New Purchase
+**************************************************************************
+CALCULATE.NEW.PURCHASE:
+   NEW.SUBTOTAL = 0
+   NEW.COUNT = DCOUNT(NEW.ITEMS, VM)
+
+   FOR I = 1 TO NEW.COUNT
+      NEW.SPEC = NEW.ITEMS<1, I>
+
+      ITEM.ID = FIELD(NEW.SPEC, '^', 1)
+      NEW.QTY = FIELD(NEW.SPEC, '^', 2)
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      ITEM.PRICE = ITEM.REC<SELLING.PRICE>
+      IF ITEM.PRICE = '' THEN ITEM.PRICE = 0
+
+      NEW.SUBTOTAL += (ITEM.PRICE * NEW.QTY)
+   NEXT I
+
+   * Calculate tax on new items
+   TAX.RATE = 0.08  ; 8% sales tax
+   NEW.TAX = NEW.SUBTOTAL * TAX.RATE
+
+   NEW.TOTAL = NEW.SUBTOTAL + NEW.TAX
+   RETURN
+
+**************************************************************************
+* Calculate Balance
+**************************************************************************
+CALCULATE.BALANCE:
+   * Balance = New Total - Return Credit
+   BALANCE.DUE = NEW.TOTAL - RETURN.TOTAL
+
+   IF BALANCE.DUE > 0 THEN
+      EXCHANGE.TYPE = 'CUSTOMER.PAYS'
+   END ELSE IF BALANCE.DUE < 0 THEN
+      EXCHANGE.TYPE = 'CUSTOMER.REFUND'
+      BALANCE.DUE = ABS(BALANCE.DUE)
+   END ELSE
+      EXCHANGE.TYPE = 'EVEN.EXCHANGE'
+   END
+   RETURN
+
+**************************************************************************
+* Process Return Portion
+**************************************************************************
+PROCESS.RETURN.PORTION:
+   * Create return transaction record
+   RETURN.TRANS.ID = 'RET-' : OCONV(SYSTEM.DATE, 'D4-YMD') : '-' : RND(99999)
+
+   RETURN.TRANS.REC = ''
+   RETURN.TRANS.REC<TRANS.ID> = RETURN.TRANS.ID
+   RETURN.TRANS.REC<TRANS.TYPE> = 'RETURN'
+   RETURN.TRANS.REC<TRANS.DATE> = SYSTEM.DATE
+   RETURN.TRANS.REC<TRANS.TIME> = SYSTEM.TIME
+   RETURN.TRANS.REC<STORE.ID> = ORIGINAL.TRANS<STORE.ID>
+   RETURN.TRANS.REC<CASHIER.ID> = USER.ID
+   RETURN.TRANS.REC<CUSTOMER.ID> = ORIG.CUSTOMER.ID
+   RETURN.TRANS.REC<ORIGINAL.TRANS.ID> = ORIGINAL.TRANS.ID
+
+   * Build return items lists
+   RETURN.ITEM.IDS = ''
+   RETURN.ITEM.QTYS = ''
+   RETURN.ITEM.PRICES = ''
+   RETURN.REASONS = ''
+
+   RETURN.COUNT = DCOUNT(RETURN.ITEMS, VM)
+
+   FOR I = 1 TO RETURN.COUNT
+      RETURN.SPEC = RETURN.ITEMS<1, I>
+
+      ITEM.ID = FIELD(RETURN.SPEC, '^', 1)
+      RETURN.QTY = FIELD(RETURN.SPEC, '^', 2)
+      RETURN.REASON = FIELD(RETURN.SPEC, '^', 3)
+
+      * Get original price
+      LOCATE ITEM.ID IN ORIG.ITEM.IDS<1> USING VM SETTING POS THEN
+         ORIG.PRICE = ORIG.ITEM.PRICES<1, POS>
+      END ELSE
+         ORIG.PRICE = 0
+      END
+
+      RETURN.ITEM.IDS<1, I> = ITEM.ID
+      RETURN.ITEM.QTYS<1, I> = RETURN.QTY
+      RETURN.ITEM.PRICES<1, I> = ORIG.PRICE
+      RETURN.REASONS<1, I> = RETURN.REASON
+   NEXT I
+
+   RETURN.TRANS.REC<ITEM.IDS> = RETURN.ITEM.IDS
+   RETURN.TRANS.REC<ITEM.QTYS> = RETURN.ITEM.QTYS
+   RETURN.TRANS.REC<ITEM.PRICES> = RETURN.ITEM.PRICES
+   RETURN.TRANS.REC<RETURN.REASONS> = RETURN.REASONS
+
+   RETURN.TRANS.REC<SUBTOTAL> = RETURN.SUBTOTAL
+   RETURN.TRANS.REC<TAX> = RETURN.TAX
+   RETURN.TRANS.REC<TOTAL> = RETURN.TOTAL
+   RETURN.TRANS.REC<STATUS> = 'COMPLETED'
+
+   WRITE RETURN.TRANS.REC TO F.POS.TRANS, RETURN.TRANS.ID
+   RETURN
+
+**************************************************************************
+* Process New Sale Portion
+**************************************************************************
+PROCESS.NEW.SALE.PORTION:
+   * Create new sale transaction record
+   NEW.TRANS.ID = 'EXC-' : OCONV(SYSTEM.DATE, 'D4-YMD') : '-' : RND(99999)
+
+   NEW.TRANS.REC = ''
+   NEW.TRANS.REC<TRANS.ID> = NEW.TRANS.ID
+   NEW.TRANS.REC<TRANS.TYPE> = 'EXCHANGE'
+   NEW.TRANS.REC<TRANS.DATE> = SYSTEM.DATE
+   NEW.TRANS.REC<TRANS.TIME> = SYSTEM.TIME
+   NEW.TRANS.REC<STORE.ID> = ORIGINAL.TRANS<STORE.ID>
+   NEW.TRANS.REC<CASHIER.ID> = USER.ID
+   NEW.TRANS.REC<CUSTOMER.ID> = ORIG.CUSTOMER.ID
+   NEW.TRANS.REC<ORIGINAL.TRANS.ID> = ORIGINAL.TRANS.ID
+   NEW.TRANS.REC<RETURN.TRANS.ID> = RETURN.TRANS.ID
+
+   * Build new items lists
+   NEW.ITEM.IDS = ''
+   NEW.ITEM.QTYS = ''
+   NEW.ITEM.PRICES = ''
+
+   NEW.COUNT = DCOUNT(NEW.ITEMS, VM)
+
+   FOR I = 1 TO NEW.COUNT
+      NEW.SPEC = NEW.ITEMS<1, I>
+
+      ITEM.ID = FIELD(NEW.SPEC, '^', 1)
+      NEW.QTY = FIELD(NEW.SPEC, '^', 2)
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      ITEM.PRICE = ITEM.REC<SELLING.PRICE>
+      IF ITEM.PRICE = '' THEN ITEM.PRICE = 0
+
+      NEW.ITEM.IDS<1, I> = ITEM.ID
+      NEW.ITEM.QTYS<1, I> = NEW.QTY
+      NEW.ITEM.PRICES<1, I> = ITEM.PRICE
+   NEXT I
+
+   NEW.TRANS.REC<ITEM.IDS> = NEW.ITEM.IDS
+   NEW.TRANS.REC<ITEM.QTYS> = NEW.ITEM.QTYS
+   NEW.TRANS.REC<ITEM.PRICES> = NEW.ITEM.PRICES
+
+   NEW.TRANS.REC<SUBTOTAL> = NEW.SUBTOTAL
+   NEW.TRANS.REC<TAX> = NEW.TAX
+   NEW.TRANS.REC<TOTAL> = NEW.TOTAL
+   NEW.TRANS.REC<STATUS> = 'COMPLETED'
+
+   WRITE NEW.TRANS.REC TO F.POS.TRANS, NEW.TRANS.ID
+   RETURN
+
+**************************************************************************
+* Update Return Inventory
+**************************************************************************
+UPDATE.RETURN.INVENTORY:
+   STORE.ID = ORIGINAL.TRANS<STORE.ID>
+
+   * Find store index
+   STORE.INDEX = 0
+   GOSUB FIND.STORE.INDEX
+
+   IF STORE.INDEX = 0 THEN RETURN
+
+   RETURN.COUNT = DCOUNT(RETURN.ITEMS, VM)
+
+   FOR I = 1 TO RETURN.COUNT
+      RETURN.SPEC = RETURN.ITEMS<1, I>
+
+      ITEM.ID = FIELD(RETURN.SPEC, '^', 1)
+      RETURN.QTY = FIELD(RETURN.SPEC, '^', 2)
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Restore quantity
+      CURRENT.QTY = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+      IF CURRENT.QTY = '' THEN CURRENT.QTY = 0
+
+      ITEM.REC<QTY.ON.HAND, STORE.INDEX> = CURRENT.QTY + RETURN.QTY
+
+      WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Find Store Index
+**************************************************************************
+FIND.STORE.INDEX:
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT ST.ID ELSE EXIT
+      CURRENT.INDEX += 1
+      IF ST.ID = STORE.ID THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Update New Sale Inventory
+**************************************************************************
+UPDATE.NEW.SALE.INVENTORY:
+   STORE.ID = ORIGINAL.TRANS<STORE.ID>
+
+   * Find store index
+   STORE.INDEX = 0
+   GOSUB FIND.STORE.INDEX
+
+   IF STORE.INDEX = 0 THEN RETURN
+
+   NEW.COUNT = DCOUNT(NEW.ITEMS, VM)
+
+   FOR I = 1 TO NEW.COUNT
+      NEW.SPEC = NEW.ITEMS<1, I>
+
+      ITEM.ID = FIELD(NEW.SPEC, '^', 1)
+      NEW.QTY = FIELD(NEW.SPEC, '^', 2)
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Deduct quantity
+      CURRENT.QTY = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+      IF CURRENT.QTY = '' THEN CURRENT.QTY = 0
+
+      ITEM.REC<QTY.ON.HAND, STORE.INDEX> = CURRENT.QTY - NEW.QTY
+
+      * Update sales statistics
+      SALES.30DAY = ITEM.REC<SALES.30DAY>
+      IF SALES.30DAY = '' THEN SALES.30DAY = 0
+      ITEM.REC<SALES.30DAY> = SALES.30DAY + NEW.QTY
+
+      WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Handle Exchange Payment
+**************************************************************************
+HANDLE.EXCHANGE.PAYMENT:
+   BEGIN CASE
+      CASE EXCHANGE.TYPE = 'EVEN.EXCHANGE'
+         * No payment needed
+         PAYMENT.STATUS = 'EVEN'
+
+      CASE EXCHANGE.TYPE = 'CUSTOMER.PAYS'
+         * Customer owes additional amount
+         * Use original payment method if possible
+         PAYMENT.AMT = BALANCE.DUE
+         PAYMENT.METHOD = ORIG.PAYMENT.TYPE
+
+         GOSUB PROCESS.ADDITIONAL.PAYMENT
+
+      CASE EXCHANGE.TYPE = 'CUSTOMER.REFUND'
+         * Refund excess to customer
+         REFUND.AMT = BALANCE.DUE
+         REFUND.METHOD = ORIG.PAYMENT.TYPE
+
+         GOSUB PROCESS.REFUND
+   END CASE
+   RETURN
+
+**************************************************************************
+* Process Additional Payment
+**************************************************************************
+PROCESS.ADDITIONAL.PAYMENT:
+   * Process payment for balance due
+   BEGIN CASE
+      CASE PAYMENT.METHOD = 'CASH'
+         PAYMENT.STATUS = 'PAID'
+
+      CASE PAYMENT.METHOD = 'CREDIT' OR PAYMENT.METHOD = 'DEBIT'
+         * Simulate card authorization
+         AUTH.CODE = 'EXC' : RND(999999)
+         PAYMENT.STATUS = 'APPROVED'
+         NEW.TRANS.REC<AUTH.CODE> = AUTH.CODE
+
+      CASE PAYMENT.METHOD = 'GIFT.CARD'
+         * Deduct from gift card
+         PAYMENT.STATUS = 'PAID'
+
+      CASE 1
+         PAYMENT.STATUS = 'PENDING'
+   END CASE
+
+   NEW.TRANS.REC<PAYMENT.TYPE> = PAYMENT.METHOD
+   NEW.TRANS.REC<PAYMENT.AMT> = PAYMENT.AMT
+   NEW.TRANS.REC<PAYMENT.STATUS> = PAYMENT.STATUS
+   RETURN
+
+**************************************************************************
+* Process Refund
+**************************************************************************
+PROCESS.REFUND:
+   * Process refund for excess amount
+   BEGIN CASE
+      CASE REFUND.METHOD = 'CASH'
+         REFUND.STATUS = 'REFUNDED'
+
+      CASE REFUND.METHOD = 'CREDIT' OR REFUND.METHOD = 'DEBIT'
+         * Reverse to original card
+         REVERSAL.CODE = 'REV' : RND(999999)
+         REFUND.STATUS = 'REVERSED'
+         RETURN.TRANS.REC<REVERSAL.CODE> = REVERSAL.CODE
+
+      CASE REFUND.METHOD = 'GIFT.CARD'
+         * Issue store credit
+         GOSUB ISSUE.STORE.CREDIT
+         REFUND.STATUS = 'STORE.CREDIT'
+
+      CASE 1
+         REFUND.STATUS = 'PENDING'
+   END CASE
+
+   RETURN.TRANS.REC<REFUND.TYPE> = REFUND.METHOD
+   RETURN.TRANS.REC<REFUND.AMT> = REFUND.AMT
+   RETURN.TRANS.REC<REFUND.STATUS> = REFUND.STATUS
+   RETURN
+
+**************************************************************************
+* Issue Store Credit
+**************************************************************************
+ISSUE.STORE.CREDIT:
+   OPEN 'STORE.CREDITS' TO F.CREDITS ELSE
+      EXECUTE 'CREATE.FILE STORE.CREDITS 1 101'
+      OPEN 'STORE.CREDITS' TO F.CREDITS ELSE RETURN
+   END
+
+   CREDIT.ID = 'SC-' : OCONV(SYSTEM.DATE, 'D4-YMD') : '-' : RND(99999)
+   CREDIT.REC = ''
+   CREDIT.REC<1> = CREDIT.ID
+   CREDIT.REC<2> = ORIG.CUSTOMER.ID
+   CREDIT.REC<3> = REFUND.AMT
+   CREDIT.REC<4> = REFUND.AMT  ; Remaining balance
+   CREDIT.REC<5> = SYSTEM.DATE
+   CREDIT.REC<6> = RETURN.TRANS.ID
+   CREDIT.REC<7> = 'ACTIVE'
+
+   WRITE CREDIT.REC TO F.CREDITS, CREDIT.ID
+
+   RETURN.TRANS.REC<STORE.CREDIT.ID> = CREDIT.ID
+   RETURN
+
+**************************************************************************
+* Update Customer Exchange History
+**************************************************************************
+UPDATE.CUSTOMER.EXCHANGE.HISTORY:
+   IF ORIG.CUSTOMER.ID = '' THEN RETURN
+
+   READU CUST.REC FROM F.CUSTOMERS, ORIG.CUSTOMER.ID ELSE RETURN
+
+   * Track exchange count
+   EXCHANGE.COUNT = CUST.REC<EXCHANGE.COUNT>
+   IF EXCHANGE.COUNT = '' THEN EXCHANGE.COUNT = 0
+   CUST.REC<EXCHANGE.COUNT> = EXCHANGE.COUNT + 1
+
+   * Update last exchange date
+   CUST.REC<LAST.EXCHANGE.DATE> = SYSTEM.DATE
+
+   WRITE CUST.REC TO F.CUSTOMERS, ORIG.CUSTOMER.ID
+   RETURN
+
+**************************************************************************
+* Create Exchange Audit
+**************************************************************************
+CREATE.EXCHANGE.AUDIT:
+   OPEN 'EXCHANGE.AUDIT' TO F.EXCHANGE.AUDIT ELSE
+      EXECUTE 'CREATE.FILE EXCHANGE.AUDIT 1 101'
+      OPEN 'EXCHANGE.AUDIT' TO F.EXCHANGE.AUDIT ELSE RETURN
+   END
+
+   AUDIT.ID = 'EXCA-' : ORIGINAL.TRANS.ID : '*' : SYSTEM.DATE
+   AUDIT.REC = ''
+   AUDIT.REC<1> = ORIGINAL.TRANS.ID
+   AUDIT.REC<2> = RETURN.TRANS.ID
+   AUDIT.REC<3> = NEW.TRANS.ID
+   AUDIT.REC<4> = ORIG.CUSTOMER.ID
+   AUDIT.REC<5> = RETURN.TOTAL
+   AUDIT.REC<6> = NEW.TOTAL
+   AUDIT.REC<7> = BALANCE.DUE
+   AUDIT.REC<8> = EXCHANGE.TYPE
+   AUDIT.REC<9> = USER.ID
+   AUDIT.REC<10> = SYSTEM.DATE
+   AUDIT.REC<11> = SYSTEM.TIME
+   AUDIT.REC<12> = ORIGINAL.TRANS<STORE.ID>
+
+   WRITE AUDIT.REC TO F.EXCHANGE.AUDIT, AUDIT.ID
+   RETURN
+
+**************************************************************************
+* Generate Exchange Receipt
+**************************************************************************
+GENERATE.EXCHANGE.RECEIPT:
+   RECEIPT.TEXT = ''
+   RECEIPT.TEXT<1> = '========================================='
+   RECEIPT.TEXT<2> = '         PRODUCT EXCHANGE RECEIPT        '
+   RECEIPT.TEXT<3> = '========================================='
+   RECEIPT.TEXT<4> = ''
+   RECEIPT.TEXT<5> = 'Exchange Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   RECEIPT.TEXT<6> = 'Exchange Time: ' : OCONV(SYSTEM.TIME, 'MTS')
+   RECEIPT.TEXT<7> = 'Original Trans: ' : ORIGINAL.TRANS.ID
+   RECEIPT.TEXT<8> = 'Return Trans: ' : RETURN.TRANS.ID
+   RECEIPT.TEXT<9> = 'New Trans: ' : NEW.TRANS.ID
+   RECEIPT.TEXT<10> = ''
+   RECEIPT.TEXT<11> = 'ITEMS RETURNED:'
+   RECEIPT.TEXT<12> = '-----------------------------------------'
+
+   LINE.NUM = 13
+   RETURN.COUNT = DCOUNT(RETURN.ITEMS, VM)
+
+   FOR I = 1 TO RETURN.COUNT
+      RETURN.SPEC = RETURN.ITEMS<1, I>
+
+      ITEM.ID = FIELD(RETURN.SPEC, '^', 1)
+      RETURN.QTY = FIELD(RETURN.SPEC, '^', 2)
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      ITEM.NAME = ITEM.REC<ITEM.NAME>
+
+      LOCATE ITEM.ID IN ORIG.ITEM.IDS<1> USING VM SETTING POS THEN
+         ITEM.PRICE = ORIG.ITEM.PRICES<1, POS>
+      END ELSE
+         ITEM.PRICE = 0
+      END
+
+      ITEM.TOTAL = ITEM.PRICE * RETURN.QTY
+
+      RECEIPT.TEXT<LINE.NUM> = ITEM.NAME
+      LINE.NUM += 1
+      RECEIPT.TEXT<LINE.NUM> = '  Qty: ' : RETURN.QTY : ' @ $' : ITEM.PRICE : ' = $' : ITEM.TOTAL
+      LINE.NUM += 1
+   NEXT I
+
+   RECEIPT.TEXT<LINE.NUM> = ''
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = 'Return Subtotal: $' : RETURN.SUBTOTAL
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = 'Return Tax: $' : RETURN.TAX
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = 'Return Total: $' : RETURN.TOTAL
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = ''
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = 'NEW ITEMS PURCHASED:'
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+
+   NEW.COUNT = DCOUNT(NEW.ITEMS, VM)
+
+   FOR I = 1 TO NEW.COUNT
+      NEW.SPEC = NEW.ITEMS<1, I>
+
+      ITEM.ID = FIELD(NEW.SPEC, '^', 1)
+      NEW.QTY = FIELD(NEW.SPEC, '^', 2)
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      ITEM.NAME = ITEM.REC<ITEM.NAME>
+      ITEM.PRICE = ITEM.REC<SELLING.PRICE>
+      ITEM.TOTAL = ITEM.PRICE * NEW.QTY
+
+      RECEIPT.TEXT<LINE.NUM> = ITEM.NAME
+      LINE.NUM += 1
+      RECEIPT.TEXT<LINE.NUM> = '  Qty: ' : NEW.QTY : ' @ $' : ITEM.PRICE : ' = $' : ITEM.TOTAL
+      LINE.NUM += 1
+   NEXT I
+
+   RECEIPT.TEXT<LINE.NUM> = ''
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = 'New Purchase Subtotal: $' : NEW.SUBTOTAL
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = 'New Purchase Tax: $' : NEW.TAX
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = 'New Purchase Total: $' : NEW.TOTAL
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = ''
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+
+   BEGIN CASE
+      CASE EXCHANGE.TYPE = 'EVEN.EXCHANGE'
+         RECEIPT.TEXT<LINE.NUM> = 'EVEN EXCHANGE - NO BALANCE DUE'
+
+      CASE EXCHANGE.TYPE = 'CUSTOMER.PAYS'
+         RECEIPT.TEXT<LINE.NUM> = 'BALANCE DUE: $' : BALANCE.DUE
+
+      CASE EXCHANGE.TYPE = 'CUSTOMER.REFUND'
+         RECEIPT.TEXT<LINE.NUM> = 'REFUND AMOUNT: $' : BALANCE.DUE
+   END CASE
+
+   LINE.NUM += 1
+   RECEIPT.TEXT<LINE.NUM> = '========================================='
+
+   EXCHANGE.REC<RECEIPT> = RECEIPT.TEXT
+   RETURN
+
+**************************************************************************
+* Update Exchange Statistics
+**************************************************************************
+UPDATE.EXCHANGE.STATISTICS:
+   OPEN 'EXCHANGE.STATS' TO F.EXCH.STATS ELSE
+      EXECUTE 'CREATE.FILE EXCHANGE.STATS 1 101'
+      OPEN 'EXCHANGE.STATS' TO F.EXCH.STATS ELSE RETURN
+   END
+
+   STAT.ID = OCONV(SYSTEM.DATE, 'D4-YM')
+
+   READU STAT.REC FROM F.EXCH.STATS, STAT.ID ELSE
+      STAT.REC = ''
+      STAT.REC<1> = STAT.ID
+      STAT.REC<2> = 0  ; Exchange count
+      STAT.REC<3> = 0  ; Return amount
+      STAT.REC<4> = 0  ; New sale amount
+   END
+
+   COUNT = STAT.REC<2>
+   IF COUNT = '' THEN COUNT = 0
+   STAT.REC<2> = COUNT + 1
+
+   RET.AMT = STAT.REC<3>
+   IF RET.AMT = '' THEN RET.AMT = 0
+   STAT.REC<3> = RET.AMT + RETURN.TOTAL
+
+   NEW.AMT = STAT.REC<4>
+   IF NEW.AMT = '' THEN NEW.AMT = 0
+   STAT.REC<4> = NEW.AMT + NEW.TOTAL
+
+   WRITE STAT.REC TO F.EXCH.STATS, STAT.ID
+   RETURN
+
+END

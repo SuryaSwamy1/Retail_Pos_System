@@ -1,0 +1,504 @@
+SUBROUTINE RPT.SALES.DAILY(REPORT.DATE, STORE.ID.IN, OUTPUT.TYPE, REPORT.DATA, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: RPT.SALES.DAILY
+* Purpose: Generate Daily Sales Report
+* Parameters:
+*   REPORT.DATE (IN) - Date for report (blank = today)
+*   STORE.ID.IN (IN) - Store ID (blank = all stores)
+*   OUTPUT.TYPE (IN) - Output type (SCREEN, PRINT, FILE, EMAIL)
+*   REPORT.DATA (OUT) - Generated report data
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+REPORT.DATA = ''
+
+* Set defaults
+IF REPORT.DATE = '' THEN REPORT.DATE = SYSTEM.DATE
+IF OUTPUT.TYPE = '' THEN OUTPUT.TYPE = 'SCREEN'
+
+* Initialize report data structure
+GOSUB INITIALIZE.REPORT
+
+* Collect transaction data
+GOSUB COLLECT.TRANSACTION.DATA
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Calculate summary statistics
+GOSUB CALCULATE.SUMMARY.STATS
+
+* Generate report output
+GOSUB GENERATE.REPORT.OUTPUT
+
+* Output report
+GOSUB OUTPUT.REPORT
+
+RETURN
+
+**************************************************************************
+* Initialize Report
+**************************************************************************
+INITIALIZE.REPORT:
+   * Initialize counters
+   TOTAL.TRANSACTIONS = 0
+   TOTAL.SALES = 0
+   TOTAL.RETURNS = 0
+   TOTAL.VOIDS = 0
+   TOTAL.ITEMS.SOLD = 0
+   TOTAL.UNITS.SOLD = 0
+   TOTAL.DISCOUNTS = 0
+   TOTAL.TAX = 0
+   TOTAL.COST = 0
+   TOTAL.PROFIT = 0
+
+   * Payment type totals
+   CASH.TOTAL = 0
+   CREDIT.TOTAL = 0
+   DEBIT.TOTAL = 0
+   CHECK.TOTAL = 0
+   GIFT.CARD.TOTAL = 0
+
+   * Hourly sales tracking
+   DIM HOURLY.SALES(24)
+   DIM HOURLY.TRANS(24)
+   FOR I = 0 TO 23
+      HOURLY.SALES(I) = 0
+      HOURLY.TRANS(I) = 0
+   NEXT I
+
+   * Department sales
+   DEPT.SALES = ''
+   DEPT.COUNT = ''
+
+   * Cashier performance
+   CASHIER.SALES = ''
+   CASHIER.TRANS = ''
+   RETURN
+
+**************************************************************************
+* Collect Transaction Data
+**************************************************************************
+COLLECT.TRANSACTION.DATA:
+   * Build selection criteria
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE = "' : REPORT.DATE : '"'
+
+   IF STORE.ID.IN # '' THEN
+      SELECT.CMD := ' AND STORE.ID = "' : STORE.ID.IN : '"'
+   END
+
+   SELECT.CMD := ' AND STATUS # "' : STATUS.VOID : '"'
+
+   * Execute selection
+   EXECUTE SELECT.CMD
+
+   * Process each transaction
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Increment transaction count
+      TOTAL.TRANSACTIONS += 1
+
+      * Get transaction type
+      TRANS.TYPE = TRANS.REC<TRANS.TYPE>
+      TRANS.AMT = TRANS.REC<TOTAL.AMOUNT>
+      TRANS.TIME = TRANS.REC<TRANS.TIME>
+
+      IF TRANS.AMT = '' THEN TRANS.AMT = 0
+
+      * Categorize by transaction type
+      IF TRANS.TYPE = TXN.RETURN THEN
+         TOTAL.RETURNS += ABS(TRANS.AMT)
+      END ELSE
+         TOTAL.SALES += TRANS.AMT
+      END
+
+      * Count items and units
+      ITEM.COUNT = DCOUNT(TRANS.REC<T.ITEM.ID>, VM)
+      TOTAL.ITEMS.SOLD += ITEM.COUNT
+
+      FOR I = 1 TO ITEM.COUNT
+         QTY = TRANS.REC<T.QTY, I>
+         IF QTY = '' THEN QTY = 0
+         TOTAL.UNITS.SOLD += QTY
+      NEXT I
+
+      * Accumulate discounts and tax
+      DISC = TRANS.REC<TOTAL.DISCOUNT>
+      TAX = TRANS.REC<TOTAL.TAX>
+      IF DISC = '' THEN DISC = 0
+      IF TAX = '' THEN TAX = 0
+      TOTAL.DISCOUNTS += DISC
+      TOTAL.TAX += TAX
+
+      * Accumulate cost (if available)
+      IF TRANS.REC<304> # '' THEN
+         COST = TRANS.REC<304>
+         TOTAL.COST += COST
+      END
+
+      * Track payment types
+      PAY.COUNT = DCOUNT(TRANS.REC<PAYMENT.TYPE>, VM)
+      FOR I = 1 TO PAY.COUNT
+         PAY.TYPE = TRANS.REC<PAYMENT.TYPE, I>
+         PAY.AMT = TRANS.REC<PAYMENT.AMT, I>
+         IF PAY.AMT = '' THEN PAY.AMT = 0
+
+         BEGIN CASE
+            CASE PAY.TYPE = PAY.CASH
+               CASH.TOTAL += PAY.AMT
+            CASE PAY.TYPE = PAY.CREDIT
+               CREDIT.TOTAL += PAY.AMT
+            CASE PAY.TYPE = PAY.DEBIT
+               DEBIT.TOTAL += PAY.AMT
+            CASE PAY.TYPE = PAY.CHECK
+               CHECK.TOTAL += PAY.AMT
+            CASE PAY.TYPE = PAY.GIFT.CARD
+               GIFT.CARD.TOTAL += PAY.AMT
+         END CASE
+      NEXT I
+
+      * Track hourly sales
+      HOUR = INT(TRANS.TIME / 3600)
+      IF HOUR < 0 THEN HOUR = 0
+      IF HOUR > 23 THEN HOUR = 23
+      HOURLY.SALES(HOUR) += TRANS.AMT
+      HOURLY.TRANS(HOUR) += 1
+
+      * Track by cashier
+      CASHIER.ID = TRANS.REC<CASHIER.ID>
+      GOSUB UPDATE.CASHIER.STATS
+
+      * Track by department/category
+      GOSUB UPDATE.DEPT.STATS
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Update Cashier Statistics
+**************************************************************************
+UPDATE.CASHIER.STATS:
+   * Find or add cashier
+   LOCATE CASHIER.ID IN CASHIER.SALES<1, 1> USING VM SETTING POS ELSE
+      * Add new cashier
+      CASHIER.COUNT = DCOUNT(CASHIER.SALES, VM)
+      IF CASHIER.COUNT = 0 OR CASHIER.SALES = '' THEN
+         POS = 1
+      END ELSE
+         POS = CASHIER.COUNT + 1
+      END
+      CASHIER.SALES<1, POS> = CASHIER.ID
+      CASHIER.TRANS<1, POS> = 0
+      CASHIER.TRANS<2, POS> = 0
+   END
+
+   * Update stats
+   OLD.SALES = CASHIER.TRANS<1, POS>
+   OLD.COUNT = CASHIER.TRANS<2, POS>
+   IF OLD.SALES = '' THEN OLD.SALES = 0
+   IF OLD.COUNT = '' THEN OLD.COUNT = 0
+
+   CASHIER.TRANS<1, POS> = OLD.SALES + TRANS.AMT
+   CASHIER.TRANS<2, POS> = OLD.COUNT + 1
+   RETURN
+
+**************************************************************************
+* Update Department Statistics
+**************************************************************************
+UPDATE.DEPT.STATS:
+   * Aggregate by item category/department
+   ITEM.COUNT = DCOUNT(TRANS.REC<T.ITEM.ID>, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = TRANS.REC<T.ITEM.ID, I>
+      LINE.TOTAL = TRANS.REC<T.LINE.TOTAL, I>
+      IF LINE.TOTAL = '' THEN LINE.TOTAL = 0
+
+      * Read item to get category
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      ITEM.CAT = ITEM.REC<CATEGORY>
+      IF ITEM.CAT = '' THEN ITEM.CAT = 'UNCATEGORIZED'
+
+      * Find or add category
+      LOCATE ITEM.CAT IN DEPT.SALES<1, 1> USING VM SETTING CAT.POS ELSE
+         DEPT.CNT = DCOUNT(DEPT.SALES, VM)
+         IF DEPT.CNT = 0 OR DEPT.SALES = '' THEN
+            CAT.POS = 1
+         END ELSE
+            CAT.POS = DEPT.CNT + 1
+         END
+         DEPT.SALES<1, CAT.POS> = ITEM.CAT
+         DEPT.COUNT<1, CAT.POS> = 0
+      END
+
+      * Update category total
+      OLD.DEPT.SALES = DEPT.COUNT<1, CAT.POS>
+      IF OLD.DEPT.SALES = '' THEN OLD.DEPT.SALES = 0
+      DEPT.COUNT<1, CAT.POS> = OLD.DEPT.SALES + LINE.TOTAL
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Calculate Summary Statistics
+**************************************************************************
+CALCULATE.SUMMARY.STATS:
+   * Calculate gross profit
+   TOTAL.PROFIT = TOTAL.SALES - TOTAL.COST
+
+   * Calculate profit margin
+   IF TOTAL.SALES > 0 THEN
+      PROFIT.MARGIN = (TOTAL.PROFIT / TOTAL.SALES) * 100
+   END ELSE
+      PROFIT.MARGIN = 0
+   END
+
+   * Calculate average transaction
+   IF TOTAL.TRANSACTIONS > 0 THEN
+      AVG.TRANS = TOTAL.SALES / TOTAL.TRANSACTIONS
+      AVG.ITEMS = TOTAL.ITEMS.SOLD / TOTAL.TRANSACTIONS
+      AVG.UNITS = TOTAL.UNITS.SOLD / TOTAL.TRANSACTIONS
+   END ELSE
+      AVG.TRANS = 0
+      AVG.ITEMS = 0
+      AVG.UNITS = 0
+   END
+
+   * Calculate discount rate
+   IF TOTAL.SALES > 0 THEN
+      DISCOUNT.RATE = (TOTAL.DISCOUNTS / TOTAL.SALES) * 100
+   END ELSE
+      DISCOUNT.RATE = 0
+   END
+
+   * Calculate net sales
+   NET.SALES = TOTAL.SALES - TOTAL.RETURNS
+   RETURN
+
+**************************************************************************
+* Generate Report Output
+**************************************************************************
+GENERATE.REPORT.OUTPUT:
+   * Build report header
+   REPORT.DATA = ''
+   REPORT.DATA<-1> = '=========================================='
+   REPORT.DATA<-1> = '          DAILY SALES REPORT'
+   REPORT.DATA<-1> = '=========================================='
+   REPORT.DATA<-1> = 'Date: ' : OCONV(REPORT.DATE, 'D4/')
+
+   IF STORE.ID.IN # '' THEN
+      READ STORE.REC FROM F.STORES, STORE.ID.IN ELSE
+         STORE.NAME = STORE.ID.IN
+      END
+      STORE.NAME = STORE.REC<3>
+      REPORT.DATA<-1> = 'Store: ' : STORE.ID.IN : ' - ' : STORE.NAME
+   END ELSE
+      REPORT.DATA<-1> = 'Store: All Stores'
+   END
+
+   REPORT.DATA<-1> = 'Generated: ' : OCONV(SYSTEM.DATE, 'D4/') : ' ' : OCONV(SYSTEM.TIME, 'MTS')
+   REPORT.DATA<-1> = ''
+
+   * Sales Summary
+   REPORT.DATA<-1> = 'SALES SUMMARY'
+   REPORT.DATA<-1> = '------------------------------------------'
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.SALES, FMT.SALES)
+   REPORT.DATA<-1> = 'Gross Sales:          ' : FMT.SALES
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.RETURNS, FMT.RETURNS)
+   REPORT.DATA<-1> = 'Returns:              ' : FMT.RETURNS
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', NET.SALES, FMT.NET)
+   REPORT.DATA<-1> = 'Net Sales:            ' : FMT.NET
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.DISCOUNTS, FMT.DISC)
+   REPORT.DATA<-1> = 'Total Discounts:      ' : FMT.DISC
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.TAX, FMT.TAX)
+   REPORT.DATA<-1> = 'Total Tax:            ' : FMT.TAX
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.COST, FMT.COST)
+   REPORT.DATA<-1> = 'Total Cost:           ' : FMT.COST
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.PROFIT, FMT.PROFIT)
+   REPORT.DATA<-1> = 'Gross Profit:         ' : FMT.PROFIT
+
+   REPORT.DATA<-1> = 'Profit Margin:        ' : OCONV(PROFIT.MARGIN, 'MD2') : '%'
+   REPORT.DATA<-1> = ''
+
+   * Transaction Summary
+   REPORT.DATA<-1> = 'TRANSACTION SUMMARY'
+   REPORT.DATA<-1> = '------------------------------------------'
+   REPORT.DATA<-1> = 'Total Transactions:   ' : TOTAL.TRANSACTIONS
+   REPORT.DATA<-1> = 'Total Items:          ' : TOTAL.ITEMS.SOLD
+   REPORT.DATA<-1> = 'Total Units:          ' : TOTAL.UNITS.SOLD
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', AVG.TRANS, FMT.AVG)
+   REPORT.DATA<-1> = 'Avg Transaction:      ' : FMT.AVG
+   REPORT.DATA<-1> = 'Avg Items/Trans:      ' : OCONV(AVG.ITEMS, 'MD2')
+   REPORT.DATA<-1> = 'Avg Units/Trans:      ' : OCONV(AVG.UNITS, 'MD2')
+   REPORT.DATA<-1> = 'Discount Rate:        ' : OCONV(DISCOUNT.RATE, 'MD2') : '%'
+   REPORT.DATA<-1> = ''
+
+   * Payment Method Breakdown
+   REPORT.DATA<-1> = 'PAYMENT METHOD BREAKDOWN'
+   REPORT.DATA<-1> = '------------------------------------------'
+   CALL UTILS.COMMON('FORMAT.AMOUNT', CASH.TOTAL, FMT.CASH)
+   REPORT.DATA<-1> = 'Cash:                 ' : FMT.CASH
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', CREDIT.TOTAL, FMT.CREDIT)
+   REPORT.DATA<-1> = 'Credit Card:          ' : FMT.CREDIT
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', DEBIT.TOTAL, FMT.DEBIT)
+   REPORT.DATA<-1> = 'Debit Card:           ' : FMT.DEBIT
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', CHECK.TOTAL, FMT.CHECK)
+   REPORT.DATA<-1> = 'Check:                ' : FMT.CHECK
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', GIFT.CARD.TOTAL, FMT.GIFT)
+   REPORT.DATA<-1> = 'Gift Card:            ' : FMT.GIFT
+   REPORT.DATA<-1> = ''
+
+   * Top Selling Departments
+   REPORT.DATA<-1> = 'TOP SELLING DEPARTMENTS'
+   REPORT.DATA<-1> = '------------------------------------------'
+   DEPT.CNT = DCOUNT(DEPT.SALES, VM)
+   IF DEPT.CNT > 0 THEN
+      * Sort departments by sales
+      FOR I = 1 TO DEPT.CNT
+         FOR J = I + 1 TO DEPT.CNT
+            IF DEPT.COUNT<1, I> < DEPT.COUNT<1, J> THEN
+               * Swap
+               TEMP.NAME = DEPT.SALES<1, I>
+               TEMP.AMT = DEPT.COUNT<1, I>
+               DEPT.SALES<1, I> = DEPT.SALES<1, J>
+               DEPT.COUNT<1, I> = DEPT.COUNT<1, J>
+               DEPT.SALES<1, J> = TEMP.NAME
+               DEPT.COUNT<1, J> = TEMP.AMT
+            END
+         NEXT J
+      NEXT I
+
+      * Display top 10
+      MAX.DISPLAY = 10
+      IF DEPT.CNT < MAX.DISPLAY THEN MAX.DISPLAY = DEPT.CNT
+
+      FOR I = 1 TO MAX.DISPLAY
+         DEPT.NAME = DEPT.SALES<1, I>
+         DEPT.AMT = DEPT.COUNT<1, I>
+         CALL UTILS.COMMON('FORMAT.AMOUNT', DEPT.AMT, FMT.DEPT)
+         REPORT.DATA<-1> = DEPT.NAME[1,20] : STR(' ', 20 - LEN(DEPT.NAME[1,20])) : FMT.DEPT
+      NEXT I
+   END ELSE
+      REPORT.DATA<-1> = 'No department data available'
+   END
+   REPORT.DATA<-1> = ''
+
+   * Hourly Sales Distribution
+   REPORT.DATA<-1> = 'HOURLY SALES DISTRIBUTION'
+   REPORT.DATA<-1> = '------------------------------------------'
+   REPORT.DATA<-1> = 'Hour          Transactions      Sales'
+   REPORT.DATA<-1> = '------------------------------------------'
+
+   FOR I = 0 TO 23
+      IF HOURLY.TRANS(I) > 0 THEN
+         HOUR.STR = OCONV(I, 'R(0)#2') : ':00'
+         TRANS.STR = OCONV(HOURLY.TRANS(I), 'R#10')
+         CALL UTILS.COMMON('FORMAT.AMOUNT', HOURLY.SALES(I), SALES.STR)
+         REPORT.DATA<-1> = HOUR.STR : '       ' : TRANS.STR : '       ' : SALES.STR
+      END
+   NEXT I
+
+   REPORT.DATA<-1> = ''
+   REPORT.DATA<-1> = '=========================================='
+   REPORT.DATA<-1> = '           END OF REPORT'
+   REPORT.DATA<-1> = '=========================================='
+   RETURN
+
+**************************************************************************
+* Output Report
+**************************************************************************
+OUTPUT.REPORT:
+   BEGIN CASE
+      CASE OUTPUT.TYPE = 'SCREEN'
+         GOSUB OUTPUT.SCREEN
+      CASE OUTPUT.TYPE = 'PRINT'
+         GOSUB OUTPUT.PRINT
+      CASE OUTPUT.TYPE = 'FILE'
+         GOSUB OUTPUT.FILE
+      CASE OUTPUT.TYPE = 'EMAIL'
+         GOSUB OUTPUT.EMAIL
+   END CASE
+   RETURN
+
+**************************************************************************
+* Output to Screen
+**************************************************************************
+OUTPUT.SCREEN:
+   * Display report (in production would format for terminal)
+   LINE.COUNT = DCOUNT(REPORT.DATA, AM)
+   FOR I = 1 TO LINE.COUNT
+      CRT REPORT.DATA<I>
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Output to Printer
+**************************************************************************
+OUTPUT.PRINT:
+   * Queue for printing
+   OPEN 'PRINT.QUEUE' TO F.PRINT.QUEUE ELSE
+      RETURN
+   END
+
+   PRINT.ID = 'RPT*SALES*' : REPORT.DATE
+   WRITE REPORT.DATA TO F.PRINT.QUEUE, PRINT.ID
+   RETURN
+
+**************************************************************************
+* Output to File
+**************************************************************************
+OUTPUT.FILE:
+   * Write to reports directory
+   FILE.NAME = 'REPORTS/SALES_' : OCONV(REPORT.DATE, 'D4-YMD') : '.TXT'
+   OPENSEQ FILE.NAME TO F.REPORT.FILE THEN
+      * File exists
+   END ELSE
+      CREATE F.REPORT.FILE ELSE
+         RETURN
+      END
+   END
+
+   LINE.COUNT = DCOUNT(REPORT.DATA, AM)
+   FOR I = 1 TO LINE.COUNT
+      WRITESEQ REPORT.DATA<I> TO F.REPORT.FILE ELSE
+         * Error writing
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Output via Email
+**************************************************************************
+OUTPUT.EMAIL:
+   * Queue email
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'RPT*SALES*' : REPORT.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'reports@company.com'  ; From config
+   EMAIL.REC<2> = 'Daily Sales Report - ' : OCONV(REPORT.DATE, 'D4/')
+   EMAIL.REC<3> = REPORT.DATA
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

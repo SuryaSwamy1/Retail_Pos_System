@@ -1,0 +1,519 @@
+SUBROUTINE PO.CANCEL(PO.ID, CANCEL.REASON, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: PO.CANCEL
+* Purpose: Cancel Purchase Order
+* Parameters:
+*   PO.ID (IN) - Purchase Order ID to cancel
+*   CANCEL.REASON (IN) - Reason for cancellation
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate PO ID
+IF PO.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Purchase order ID is required'
+   RETURN
+END
+
+* Read PO record
+READU PO.REC FROM F.PURCHASE.ORDERS, PO.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Purchase order not found'
+   RETURN
+END
+
+* Check PO status
+GOSUB CHECK.PO.STATUS
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.ID
+   RETURN
+END
+
+* Validate cancel reason
+GOSUB VALIDATE.CANCEL.REASON
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.ID
+   RETURN
+END
+
+* Check cancellation authorization
+GOSUB CHECK.CANCEL.AUTH
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.ID
+   RETURN
+END
+
+* Check if partially received
+GOSUB CHECK.PARTIAL.RECEIPT
+
+* Update PO status
+GOSUB UPDATE.PO.STATUS
+
+* Release budget allocation
+GOSUB RELEASE.BUDGET.ALLOCATION
+
+* Update vendor statistics
+GOSUB UPDATE.VENDOR.CANCEL.STATISTICS
+
+* Create cancellation audit
+GOSUB CREATE.CANCELLATION.AUDIT
+
+* Send cancellation notifications
+GOSUB SEND.CANCELLATION.NOTIFICATIONS
+
+* Update department statistics
+GOSUB UPDATE.DEPARTMENT.STATISTICS
+
+LOG.MSG = 'Purchase order cancelled: ' : PO.ID : ' - Reason: ' : CANCEL.REASON
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'WARN')
+
+RETURN
+
+**************************************************************************
+* Check PO Status
+**************************************************************************
+CHECK.PO.STATUS:
+   CURRENT.STATUS = PO.REC<PO.STATUS>
+
+   BEGIN CASE
+      CASE CURRENT.STATUS = 'DRAFT'
+         * Can cancel draft
+         RETURN
+
+      CASE CURRENT.STATUS = 'PENDING'
+         * Can cancel pending
+         RETURN
+
+      CASE CURRENT.STATUS = 'APPROVED'
+         * Can cancel approved if not received
+         RETURN
+
+      CASE CURRENT.STATUS = 'CANCELLED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Purchase order is already cancelled'
+         RETURN
+
+      CASE CURRENT.STATUS = 'CLOSED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Cannot cancel closed purchase order'
+         RETURN
+
+      CASE CURRENT.STATUS = 'RECEIVING'
+         * Check if partially received
+         RETURN
+
+      CASE CURRENT.STATUS = 'RECEIVED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Cannot cancel fully received purchase order'
+         RETURN
+
+      CASE 1
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid purchase order status'
+         RETURN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Validate Cancel Reason
+**************************************************************************
+VALIDATE.CANCEL.REASON:
+   IF CANCEL.REASON = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Cancellation reason is required'
+      RETURN
+   END
+
+   * Valid cancellation reasons
+   VALID.REASONS = 'VENDOR.REQUEST':VM:'BUDGET.CUTS':VM:'DUPLICATE.ORDER'
+   VALID.REASONS := VM:'VENDOR.UNAVAILABLE':VM:'PRICING.CHANGE'
+   VALID.REASONS := VM:'ITEMS.DISCONTINUED':VM:'NO.LONGER.NEEDED'
+   VALID.REASONS := VM:'VENDOR.POOR.PERFORMANCE':VM:'OTHER'
+
+   LOCATE CANCEL.REASON IN VALID.REASONS<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid cancellation reason'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Check Cancel Auth
+**************************************************************************
+CHECK.CANCEL.AUTH:
+   CURRENT.STATUS = PO.REC<PO.STATUS>
+   PO.TOTAL = PO.REC<PO.TOTAL>
+   IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+   * Draft or pending orders can be cancelled by creator
+   IF CURRENT.STATUS = 'DRAFT' OR CURRENT.STATUS = 'PENDING' THEN
+      IF USER.ID = PO.REC<CREATED.BY> THEN
+         RETURN
+      END
+   END
+
+   * Approved orders require authorization based on amount
+   USER.LEVEL = 5  ; Default level
+
+   * Get user's security level
+   READ USER.REC FROM F.EMPLOYEES, USER.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'User record not found'
+      RETURN
+   END
+
+   USER.LEVEL = USER.REC<SECURITY.LEVEL>
+   IF USER.LEVEL = '' THEN USER.LEVEL = 1
+
+   * Cancellation authorization levels:
+   * Level 7+ = Up to $5,000
+   * Level 9+ = Up to $25,000
+   * Level 10+ = Unlimited
+
+   BEGIN CASE
+      CASE USER.LEVEL >= 10
+         * Unlimited cancellation authority
+         RETURN
+
+      CASE USER.LEVEL >= 9
+         IF PO.TOTAL > 25000 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Cancellation amount exceeds authorization limit'
+            RETURN
+         END
+
+      CASE USER.LEVEL >= 7
+         IF PO.TOTAL > 5000 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Cancellation amount exceeds authorization limit'
+            RETURN
+         END
+
+      CASE 1
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Insufficient authorization to cancel purchase order'
+         RETURN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Check Partial Receipt
+**************************************************************************
+CHECK.PARTIAL.RECEIPT:
+   HAS.RECEIPTS = 'N'
+
+   * Check for any receipts against this PO
+   SELECT.CMD = 'SELECT RECEIPTS WITH PO.NUM = "' : PO.ID : '"'
+   EXECUTE SELECT.CMD
+
+   RECEIPT.COUNT = 0
+
+   LOOP
+      READNEXT RECEIPT.ID ELSE EXIT
+      RECEIPT.COUNT += 1
+   REPEAT
+
+   IF RECEIPT.COUNT > 0 THEN
+      HAS.RECEIPTS = 'Y'
+
+      * Add note about partial receipt
+      CANCEL.REASON := ' (Partial receipts exist: ' : RECEIPT.COUNT : ')'
+   END
+   RETURN
+
+**************************************************************************
+* Update PO Status
+**************************************************************************
+UPDATE.PO.STATUS:
+   PO.REC<PO.STATUS> = 'CANCELLED'
+   PO.REC<CANCELLED.BY> = USER.ID
+   PO.REC<CANCELLED.DATE> = SYSTEM.DATE
+   PO.REC<CANCELLED.TIME> = SYSTEM.TIME
+   PO.REC<CANCEL.REASON> = CANCEL.REASON
+
+   WRITE PO.REC TO F.PURCHASE.ORDERS, PO.ID
+   RETURN
+
+**************************************************************************
+* Release Budget Allocation
+**************************************************************************
+RELEASE.BUDGET.ALLOCATION:
+   * Only release if PO was approved
+   IF PO.REC<APPROVED.DATE> = '' THEN RETURN
+
+   * Get PO department
+   DEPARTMENT = PO.REC<DEPARTMENT>
+   IF DEPARTMENT = '' THEN DEPARTMENT = 'GENERAL'
+
+   * Open budget file
+   OPEN 'BUDGETS' TO F.BUDGETS ELSE RETURN
+
+   * Get budget for approval month
+   APPROVAL.MONTH = OCONV(PO.REC<APPROVED.DATE>, 'D4-YM')
+   BUDGET.KEY = DEPARTMENT : '*' : APPROVAL.MONTH
+
+   READU BUDGET.REC FROM F.BUDGETS, BUDGET.KEY ELSE RETURN
+
+   * Release committed amount
+   COMMITTED.AMOUNT = BUDGET.REC<2>
+   IF COMMITTED.AMOUNT = '' THEN COMMITTED.AMOUNT = 0
+
+   PO.TOTAL = PO.REC<PO.TOTAL>
+   IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+   BUDGET.REC<2> = COMMITTED.AMOUNT - PO.TOTAL
+   IF BUDGET.REC<2> < 0 THEN BUDGET.REC<2> = 0
+
+   WRITE BUDGET.REC TO F.BUDGETS, BUDGET.KEY
+   RETURN
+
+**************************************************************************
+* Update Vendor Cancel Statistics
+**************************************************************************
+UPDATE.VENDOR.CANCEL.STATISTICS:
+   VENDOR.ID = PO.REC<VENDOR.ID>
+
+   READU VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE RETURN
+
+   * Track cancellations
+   CANCEL.COUNT = VENDOR.REC<CANCELLED.POS>
+   IF CANCEL.COUNT = '' THEN CANCEL.COUNT = 0
+   VENDOR.REC<CANCELLED.POS> = CANCEL.COUNT + 1
+
+   * Decrement YTD purchases if was approved
+   IF PO.REC<APPROVED.DATE> # '' THEN
+      YTD.PURCHASES = VENDOR.REC<YTD.PURCHASES>
+      IF YTD.PURCHASES = '' THEN YTD.PURCHASES = 0
+      IF YTD.PURCHASES > 0 THEN
+         VENDOR.REC<YTD.PURCHASES> = YTD.PURCHASES - 1
+      END
+
+      * Deduct from YTD purchase amount
+      YTD.AMT = VENDOR.REC<YTD.PURCHASE.AMT>
+      IF YTD.AMT = '' THEN YTD.AMT = 0
+
+      PO.TOTAL = PO.REC<PO.TOTAL>
+      IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+      VENDOR.REC<YTD.PURCHASE.AMT> = YTD.AMT - PO.TOTAL
+      IF VENDOR.REC<YTD.PURCHASE.AMT> < 0 THEN
+         VENDOR.REC<YTD.PURCHASE.AMT> = 0
+      END
+   END
+
+   WRITE VENDOR.REC TO F.VENDORS, VENDOR.ID
+   RETURN
+
+**************************************************************************
+* Create Cancellation Audit
+**************************************************************************
+CREATE.CANCELLATION.AUDIT:
+   OPEN 'PO.CANCELLATIONS' TO F.PO.CANCEL ELSE
+      EXECUTE 'CREATE.FILE PO.CANCELLATIONS 1 101'
+      OPEN 'PO.CANCELLATIONS' TO F.PO.CANCEL ELSE RETURN
+   END
+
+   CANCEL.ID = PO.ID : '*CANCEL*' : SYSTEM.DATE
+   CANCEL.REC = ''
+   CANCEL.REC<1> = PO.ID
+   CANCEL.REC<2> = PO.REC<PO.DATE>
+   CANCEL.REC<3> = PO.REC<VENDOR.ID>
+   CANCEL.REC<4> = PO.REC<PO.TOTAL>
+   CANCEL.REC<5> = PO.REC<PO.STATUS>
+   CANCEL.REC<6> = CANCEL.REASON
+   CANCEL.REC<7> = USER.ID
+   CANCEL.REC<8> = SYSTEM.DATE
+   CANCEL.REC<9> = SYSTEM.TIME
+   CANCEL.REC<10> = PO.REC<CREATED.BY>
+   CANCEL.REC<11> = PO.REC<APPROVED.BY>
+   CANCEL.REC<12> = HAS.RECEIPTS
+   CANCEL.REC<13> = PO.REC<DEPARTMENT>
+
+   WRITE CANCEL.REC TO F.PO.CANCEL, CANCEL.ID
+   RETURN
+
+**************************************************************************
+* Send Cancellation Notifications
+**************************************************************************
+SEND.CANCELLATION.NOTIFICATIONS:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   * Notify requester
+   REQUESTER.ID = PO.REC<CREATED.BY>
+   IF REQUESTER.ID # '' AND REQUESTER.ID # USER.ID THEN
+      READ REQUESTER.REC FROM F.EMPLOYEES, REQUESTER.ID ELSE
+         REQUESTER.EMAIL = ''
+      END
+      REQUESTER.EMAIL = REQUESTER.REC<EMAIL>
+
+      IF REQUESTER.EMAIL # '' THEN
+         GOSUB SEND.REQUESTER.CANCEL.EMAIL
+      END
+   END
+
+   * Notify approver if was approved
+   IF PO.REC<APPROVED.BY> # '' THEN
+      APPROVER.ID = PO.REC<APPROVED.BY>
+      IF APPROVER.ID # USER.ID THEN
+         READ APPROVER.REC FROM F.EMPLOYEES, APPROVER.ID ELSE
+            APPROVER.EMAIL = ''
+         END
+         APPROVER.EMAIL = APPROVER.REC<EMAIL>
+
+         IF APPROVER.EMAIL # '' THEN
+            GOSUB SEND.APPROVER.CANCEL.EMAIL
+         END
+      END
+   END
+
+   * Notify vendor if was approved
+   IF PO.REC<APPROVED.DATE> # '' THEN
+      VENDOR.ID = PO.REC<VENDOR.ID>
+      READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+         VENDOR.EMAIL = ''
+      END
+      VENDOR.EMAIL = VENDOR.REC<VENDOR.EMAIL>
+
+      IF VENDOR.EMAIL # '' THEN
+         GOSUB SEND.VENDOR.CANCEL.EMAIL
+      END
+   END
+
+   * Notify receiving if was approved
+   IF PO.REC<APPROVED.DATE> # '' THEN
+      GOSUB SEND.RECEIVING.CANCEL.EMAIL
+   END
+   RETURN
+
+**************************************************************************
+* Send Requester Cancel Email
+**************************************************************************
+SEND.REQUESTER.CANCEL.EMAIL:
+   EMAIL.ID = 'PO.CANCEL.REQ*' : PO.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = REQUESTER.EMAIL
+   EMAIL.REC<2> = 'Purchase Order Cancelled: ' : PO.ID
+   EMAIL.REC<3> = 'Your purchase order has been cancelled.' : AM : AM
+   EMAIL.REC<3> := 'PO Number: ' : PO.ID : AM
+   EMAIL.REC<3> := 'Vendor: ' : VENDOR.REC<VENDOR.NAME> : AM
+   EMAIL.REC<3> := 'Amount: $' : PO.REC<PO.TOTAL> : AM : AM
+   EMAIL.REC<3> := 'Cancellation Reason: ' : CANCEL.REASON : AM : AM
+   EMAIL.REC<3> := 'Cancelled By: ' : USER.ID : AM
+   EMAIL.REC<3> := 'Cancellation Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Approver Cancel Email
+**************************************************************************
+SEND.APPROVER.CANCEL.EMAIL:
+   EMAIL.ID = 'PO.CANCEL.APP*' : PO.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = APPROVER.EMAIL
+   EMAIL.REC<2> = 'Purchase Order Cancelled: ' : PO.ID
+   EMAIL.REC<3> = 'A purchase order you approved has been cancelled.' : AM : AM
+   EMAIL.REC<3> := 'PO Number: ' : PO.ID : AM
+   EMAIL.REC<3> := 'Vendor: ' : VENDOR.REC<VENDOR.NAME> : AM
+   EMAIL.REC<3> := 'Amount: $' : PO.REC<PO.TOTAL> : AM : AM
+   EMAIL.REC<3> := 'Cancellation Reason: ' : CANCEL.REASON : AM : AM
+   EMAIL.REC<3> := 'Cancelled By: ' : USER.ID : AM
+   EMAIL.REC<3> := 'Cancellation Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Vendor Cancel Email
+**************************************************************************
+SEND.VENDOR.CANCEL.EMAIL:
+   EMAIL.ID = 'PO.CANCEL.VEN*' : PO.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = VENDOR.EMAIL
+   EMAIL.REC<2> = 'Purchase Order Cancelled: ' : PO.ID
+   EMAIL.REC<3> = 'We have cancelled purchase order ' : PO.ID : '.' : AM : AM
+   EMAIL.REC<3> := 'PO Number: ' : PO.ID : AM
+   EMAIL.REC<3> := 'PO Date: ' : OCONV(PO.REC<PO.DATE>, 'D4/') : AM
+   EMAIL.REC<3> := 'Amount: $' : PO.REC<PO.TOTAL> : AM : AM
+   EMAIL.REC<3> := 'Reason: ' : CANCEL.REASON : AM : AM
+   EMAIL.REC<3> := 'Please do not ship this order. '
+   EMAIL.REC<3> := 'If already shipped, please coordinate return.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Receiving Cancel Email
+**************************************************************************
+SEND.RECEIVING.CANCEL.EMAIL:
+   OPEN 'SYSTEM.PARAMS' TO F.PARAMS ELSE RETURN
+
+   READ PARAM.REC FROM F.PARAMS, 'EMAIL.ADDRESSES' ELSE RETURN
+
+   RECEIVING.EMAIL = PARAM.REC<1>
+   IF RECEIVING.EMAIL = '' THEN RETURN
+
+   EMAIL.ID = 'PO.CANCEL.RCV*' : PO.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = RECEIVING.EMAIL
+   EMAIL.REC<2> = 'Purchase Order Cancelled - Receiving Notice: ' : PO.ID
+   EMAIL.REC<3> = 'A purchase order has been cancelled.' : AM : AM
+   EMAIL.REC<3> := 'PO Number: ' : PO.ID : AM
+   EMAIL.REC<3> := 'Vendor: ' : VENDOR.REC<VENDOR.NAME> : AM
+   EMAIL.REC<3> := 'Amount: $' : PO.REC<PO.TOTAL> : AM : AM
+   EMAIL.REC<3> := 'Reason: ' : CANCEL.REASON : AM : AM
+   EMAIL.REC<3> := 'Please do not receive items for this PO.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Update Department Statistics
+**************************************************************************
+UPDATE.DEPARTMENT.STATISTICS:
+   DEPARTMENT = PO.REC<DEPARTMENT>
+   IF DEPARTMENT = '' THEN DEPARTMENT = 'GENERAL'
+
+   OPEN 'DEPT.STATISTICS' TO F.DEPT.STATS ELSE
+      EXECUTE 'CREATE.FILE DEPT.STATISTICS 1 101'
+      OPEN 'DEPT.STATISTICS' TO F.DEPT.STATS ELSE RETURN
+   END
+
+   STAT.KEY = DEPARTMENT : '*' : OCONV(SYSTEM.DATE, 'D4-YM')
+
+   READU STAT.REC FROM F.DEPT.STATS, STAT.KEY ELSE
+      STAT.REC = ''
+      STAT.REC<1> = DEPARTMENT
+      STAT.REC<2> = 0  ; Total POs
+      STAT.REC<3> = 0  ; Cancelled POs
+      STAT.REC<4> = 0  ; Cancelled amount
+   END
+
+   * Increment cancelled count
+   CANCEL.COUNT = STAT.REC<3>
+   IF CANCEL.COUNT = '' THEN CANCEL.COUNT = 0
+   STAT.REC<3> = CANCEL.COUNT + 1
+
+   * Add to cancelled amount
+   CANCEL.AMT = STAT.REC<4>
+   IF CANCEL.AMT = '' THEN CANCEL.AMT = 0
+
+   PO.TOTAL = PO.REC<PO.TOTAL>
+   IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+   STAT.REC<4> = CANCEL.AMT + PO.TOTAL
+
+   WRITE STAT.REC TO F.DEPT.STATS, STAT.KEY
+   RETURN
+
+END

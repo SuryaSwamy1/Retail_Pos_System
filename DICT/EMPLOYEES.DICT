@@ -1,0 +1,105 @@
+* EMPLOYEES Dictionary Definitions
+* MultiValue Database Schema for Employee Master File
+
+* Field Definitions
+FIELD~EMP.ID~1~Employee ID~Primary Key
+FIELD~SSN~2~Social Security Number~Encrypted
+FIELD~FIRST.NAME~3~First Name~
+FIELD~MIDDLE.NAME~4~Middle Name~
+FIELD~LAST.NAME~5~Last Name~
+FIELD~FULL.NAME~6~Full Name~
+FIELD~PREFERRED.NAME~7~Preferred Name~
+FIELD~POSITION~8~Position/Title~
+FIELD~DEPARTMENT~9~Department~SALES, MANAGEMENT, WAREHOUSE, RECEIVING, IT
+FIELD~HIRE.DATE~10~Hire Date~
+FIELD~TERM.DATE~11~Termination Date~
+FIELD~STATUS~12~Employment Status~A=Active, T=Terminated, L=Leave, S=Suspended
+FIELD~EMPLOYMENT.TYPE~13~Employment Type~FT=FullTime, PT=PartTime, TMP=Temporary
+FIELD~PRIMARY.STORE~14~Primary Store ID~
+FIELD~STORES.ASSIGNED~15~Assigned Store IDs~Multivalued
+FIELD~SUPERVISOR.ID~16~Supervisor Employee ID~
+FIELD~PAY.TYPE~17~Pay Type~HOURLY, SALARY, COMMISSION
+FIELD~PAY.RATE~18~Pay Rate~Hourly or Annual
+FIELD~COMMISSION.RATE~19~Commission Rate Percentage~
+FIELD~COMMISSION.TIER~20~Commission Tier~1-5
+FIELD~OVERTIME.ELIGIBLE~21~Overtime Eligible~Y/N
+FIELD~ADDRESS.LINE1~22~Address Line 1~
+FIELD~ADDRESS.LINE2~23~Address Line 2~
+FIELD~CITY~24~City~
+FIELD~STATE~25~State~
+FIELD~ZIP~26~ZIP Code~
+FIELD~PHONE.HOME~27~Home Phone~
+FIELD~PHONE.MOBILE~28~Mobile Phone~
+FIELD~EMAIL~29~Email Address~
+FIELD~EMERGENCY.CONTACT~30~Emergency Contact Name~
+FIELD~EMERGENCY.PHONE~31~Emergency Contact Phone~
+FIELD~EMERGENCY.RELATION~32~Emergency Contact Relationship~
+FIELD~BIRTH.DATE~33~Birth Date~
+FIELD~GENDER~34~Gender~
+FIELD~ETHNICITY~35~Ethnicity~
+FIELD~VETERAN.STATUS~36~Veteran Status~
+FIELD~DISABILITY~37~Disability Status~
+FIELD~I9.STATUS~38~I-9 Status~VERIFIED, PENDING, EXPIRED
+FIELD~I9.DATE~39~I-9 Verification Date~
+FIELD~I9.EXPIRY~40~I-9 Expiry Date~
+FIELD~W4.STATUS~41~W-4 On File~Y/N
+FIELD~W4.DATE~42~W-4 Date~
+FIELD~DIRECT.DEPOSIT~43~Direct Deposit Flag~Y/N
+FIELD~BANK.NAME~44~Bank Name~
+FIELD~BANK.ROUTING~45~Bank Routing Number~Encrypted
+FIELD~BANK.ACCOUNT~46~Bank Account Number~Encrypted
+FIELD~WITHHOLDING.FEDERAL~47~Federal Withholding~
+FIELD~WITHHOLDING.STATE~48~State Withholding~
+FIELD~EXEMPTIONS~49~Tax Exemptions~
+FIELD~USER.ID~50~System User ID~
+FIELD~USER.LEVEL~51~System Access Level~1-10
+FIELD~PIN.CODE~52~Register PIN Code~Encrypted
+FIELD~BADGE.NUMBER~53~Badge Number~
+FIELD~CERTIFICATIONS~54~Certifications~Multivalued
+FIELD~CERT.DATES~55~Certification Dates~Multivalued
+FIELD~CERT.EXPIRY~56~Certification Expiry Dates~Multivalued
+FIELD~TRAINING.COURSES~57~Training Courses~Multivalued
+FIELD~TRAINING.DATES~58~Training Completion Dates~Multivalued
+FIELD~REVIEWS~59~Review Dates~Multivalued
+FIELD~REVIEW.SCORES~60~Review Scores~Multivalued
+FIELD~REVIEW.NOTES~61~Review Notes~Multivalued/Subvalued
+FIELD~WARNINGS~62~Warning Dates~Multivalued
+FIELD~WARNING.TYPES~63~Warning Types~Multivalued
+FIELD~WARNING.NOTES~64~Warning Notes~Multivalued/Subvalued
+FIELD~AWARDS~65~Award Dates~Multivalued
+FIELD~AWARD.TYPES~66~Award Types~Multivalued
+FIELD~AWARD.NOTES~67~Award Notes~Multivalued
+FIELD~PTO.ACCRUAL.RATE~68~PTO Accrual Rate~Hours per period
+FIELD~PTO.BALANCE~69~Current PTO Balance Hours~
+FIELD~SICK.BALANCE~70~Sick Leave Balance Hours~
+FIELD~YTD.HOURS~71~Year-to-Date Hours Worked~
+FIELD~YTD.GROSS.PAY~72~Year-to-Date Gross Pay~
+FIELD~YTD.COMMISSION~73~Year-to-Date Commission~
+FIELD~LAST.REVIEW.DATE~74~Last Review Date~
+FIELD~NEXT.REVIEW.DATE~75~Next Review Date~
+FIELD~NOTES~76~General Notes~Multivalued
+FIELD~CREATED.BY~77~Created By User~
+FIELD~CREATED.DATE~78~Created Date~
+FIELD~CREATED.TIME~79~Created Time~
+FIELD~MODIFIED.BY~80~Modified By User~
+FIELD~MODIFIED.DATE~81~Modified Date~
+FIELD~MODIFIED.TIME~82~Modified Time~
+
+* Index Definitions
+INDEX~NAME.IDX~LAST.NAME~Last Name Index
+INDEX~SSN.IDX~SSN~SSN Index
+INDEX~STORE.IDX~PRIMARY.STORE~Store Index
+INDEX~STATUS.IDX~STATUS~Status Index
+INDEX~DEPT.IDX~DEPARTMENT~Department Index
+INDEX~USER.IDX~USER.ID~User ID Index
+
+* Correlatives and Derived Fields
+CORR~FULL.NAME.CALC~FIRST.NAME:" ":LAST.NAME
+CORR~FULL.ADDRESS~ADDRESS.LINE1:" ":ADDRESS.LINE2:" ":CITY:", ":STATE:" ":ZIP
+CORR~YEARS.SERVICE~(DATE() - HIRE.DATE) / 365
+CORR~AGE~(DATE() - BIRTH.DATE) / 365
+CORR~ACTIVE.EMPLOYEE~IF STATUS = 'A' THEN 'Y' ELSE 'N'
+CORR~DAYS.SINCE.REVIEW~DATE() - LAST.REVIEW.DATE
+CORR~REVIEW.OVERDUE~IF DATE() > NEXT.REVIEW.DATE THEN 'Y' ELSE 'N'
+CORR~I9.EXPIRED~IF I9.EXPIRY < DATE() THEN 'Y' ELSE 'N'
+CORR~TOTAL.COMP.YTD~YTD.GROSS.PAY + YTD.COMMISSION

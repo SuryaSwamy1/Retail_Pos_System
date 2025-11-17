@@ -1,0 +1,235 @@
+SUBROUTINE DB.CONNECT(ERROR.FLAG)
+**************************************************************************
+* Program: DB.CONNECT
+* Purpose: Connect to MultiValue Database and Open All System Files
+* Parameters: ERROR.FLAG - Returns error flag (0=success, 1=failure)
+* Called By: All main programs at startup
+* Calls: ERROR.LOG
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize return flag
+ERROR.FLAG = FALSE
+
+* Initialize error logging
+GOSUB INIT.ERROR.LOG
+
+* Get database account name from environment
+ACCOUNT.NAME = ''
+EXECUTE 'WHO' CAPTURING ACCOUNT.INFO
+ACCOUNT.NAME = FIELD(ACCOUNT.INFO, ' ', 1)
+IF ACCOUNT.NAME = '' THEN
+   ACCOUNT.NAME = 'RETAIL'
+END
+
+* Open Customer Master File
+OPEN 'CUSTOMERS' TO F.CUSTOMERS ELSE
+   ERROR.MESSAGE = 'Failed to open CUSTOMERS file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Inventory Master File
+OPEN 'INVENTORY' TO F.INVENTORY ELSE
+   ERROR.MESSAGE = 'Failed to open INVENTORY file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Vendor Master File
+OPEN 'VENDORS' TO F.VENDORS ELSE
+   ERROR.MESSAGE = 'Failed to open VENDORS file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open POS Transaction File
+OPEN 'POS.TRANS' TO F.POS.TRANS ELSE
+   ERROR.MESSAGE = 'Failed to open POS.TRANS file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Purchase Orders File
+OPEN 'PURCHASE.ORDERS' TO F.PURCHASE.ORDERS ELSE
+   ERROR.MESSAGE = 'Failed to open PURCHASE.ORDERS file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Employee Master File
+OPEN 'EMPLOYEES' TO F.EMPLOYEES ELSE
+   ERROR.MESSAGE = 'Failed to open EMPLOYEES file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Store Master File
+OPEN 'STORES' TO F.STORES ELSE
+   ERROR.MESSAGE = 'Failed to open STORES file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Loyalty Transaction File
+OPEN 'LOYALTY.TRANS' TO F.LOYALTY.TRANS ELSE
+   ERROR.MESSAGE = 'Failed to open LOYALTY.TRANS file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Promotions File
+OPEN 'PROMOTIONS' TO F.PROMOTIONS ELSE
+   ERROR.MESSAGE = 'Failed to open PROMOTIONS file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Inventory Transaction File (history)
+OPEN 'INVENTORY.TRANS' TO F.INVENTORY.TRANS ELSE
+   ERROR.MESSAGE = 'Failed to open INVENTORY.TRANS file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Receipts File (receiving)
+OPEN 'RECEIPTS' TO F.RECEIPTS ELSE
+   ERROR.MESSAGE = 'Failed to open RECEIPTS file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open Invoices File (AP)
+OPEN 'INVOICES' TO F.INVOICES ELSE
+   ERROR.MESSAGE = 'Failed to open INVOICES file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Open System Configuration File
+OPEN 'SYSTEM.CONFIG' TO F.SYSTEM.CONFIG ELSE
+   ERROR.MESSAGE = 'Failed to open SYSTEM.CONFIG file'
+   GOSUB LOG.ERROR
+   ERROR.FLAG = TRUE
+   RETURN
+END
+
+* Initialize system variables
+GOSUB INIT.SYSTEM.VARS
+
+* Load system configuration
+GOSUB LOAD.CONFIG
+
+RETURN
+
+**************************************************************************
+* Initialize Error Logging
+**************************************************************************
+INIT.ERROR.LOG:
+   LOG.PATH = 'LOGS'
+   LOG.FILE.NAME = 'ERROR.LOG'
+   ERROR.LOG.FILE = LOG.PATH : '/' : LOG.FILE.NAME
+
+   * Open or create error log file
+   OPENSEQ ERROR.LOG.FILE TO F.ERROR.LOG ELSE
+      CREATE F.ERROR.LOG ELSE
+         CRT 'Warning: Cannot create error log file'
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Log Error Message
+**************************************************************************
+LOG.ERROR:
+   CURRENT.DATE = DATE()
+   CURRENT.TIME = TIME()
+
+   LOG.ENTRY = OCONV(CURRENT.DATE, 'D4/') : ' ' : OCONV(CURRENT.TIME, 'MTS') : ' - '
+   LOG.ENTRY := ERROR.MESSAGE
+
+   * Write to error log
+   WRITESEQ LOG.ENTRY TO F.ERROR.LOG ELSE
+      CRT 'Warning: Cannot write to error log'
+   END
+
+   * Display error
+   CRT 'ERROR: ' : ERROR.MESSAGE
+   RETURN
+
+**************************************************************************
+* Initialize System Variables
+**************************************************************************
+INIT.SYSTEM.VARS:
+   SYSTEM.DATE = DATE()
+   SYSTEM.TIME = TIME()
+
+   * Get user information
+   USER.ID = SYSTEM(19)  ; Get user ID
+   USER.NAME = SYSTEM(19)
+   USER.LEVEL = 5  ; Default level, should be looked up
+
+   * Get terminal information
+   TERMINAL.ID = SYSTEM(9)
+   SESSION.ID = SYSTEM(24) ; Process ID
+
+   * Store and register will be set by POS program
+   CURRENT.STORE = ''
+   CURRENT.REGISTER = ''
+   RETURN
+
+**************************************************************************
+* Load System Configuration
+**************************************************************************
+LOAD.CONFIG:
+   * Read system configuration
+   READ CONFIG.REC FROM F.SYSTEM.CONFIG, 'SYSTEM' ELSE
+      * Set default configuration if not found
+      TAX.RATE = 0.0825
+      CURRENCY.SYMBOL = '$'
+      DATE.FORMAT = 'MM/DD/YYYY'
+      TIME.FORMAT = '12HR'
+      DECIMAL.PLACES = 2
+      ROUNDING.METHOD = 'NORMAL'
+      LOYALTY.ENABLED = TRUE
+      WEB.ENABLED = FALSE
+
+      * Write default configuration
+      CONFIG.REC = ''
+      CONFIG.REC<1> = TAX.RATE
+      CONFIG.REC<2> = CURRENCY.SYMBOL
+      CONFIG.REC<3> = DATE.FORMAT
+      CONFIG.REC<4> = TIME.FORMAT
+      CONFIG.REC<5> = DECIMAL.PLACES
+      CONFIG.REC<6> = ROUNDING.METHOD
+      CONFIG.REC<7> = LOYALTY.ENABLED
+      CONFIG.REC<8> = WEB.ENABLED
+
+      WRITE CONFIG.REC TO F.SYSTEM.CONFIG, 'SYSTEM'
+   END ELSE
+      * Parse configuration
+      TAX.RATE = CONFIG.REC<1>
+      CURRENCY.SYMBOL = CONFIG.REC<2>
+      DATE.FORMAT = CONFIG.REC<3>
+      TIME.FORMAT = CONFIG.REC<4>
+      DECIMAL.PLACES = CONFIG.REC<5>
+      ROUNDING.METHOD = CONFIG.REC<6>
+      LOYALTY.ENABLED = CONFIG.REC<7>
+      WEB.ENABLED = CONFIG.REC<8>
+   END
+   RETURN
+
+END

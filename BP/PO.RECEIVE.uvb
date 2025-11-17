@@ -1,0 +1,471 @@
+SUBROUTINE PO.RECEIVE(PO.NUMBER, RECEIPT.ITEMS, RECEIPT.ID.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: PO.RECEIVE
+* Purpose: Receive Items from Purchase Order
+* Parameters:
+*   PO.NUMBER (IN) - Purchase order number
+*   RECEIPT.ITEMS (IN) - Items being received
+*     Format: ITEM.ID|QTY_RECEIVED|LOT_NUMBER|EXPIRY_DATE^...
+*   RECEIPT.ID.OUT (OUT) - Generated receipt ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+RECEIPT.ID.OUT = ''
+
+* Validate inputs
+IF PO.NUMBER = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'PO number is required'
+   RETURN
+END
+
+IF RECEIPT.ITEMS = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Receipt items are required'
+   RETURN
+END
+
+* Read PO record
+READU PO.REC FROM F.PURCHASE.ORDERS, PO.NUMBER LOCKED
+   ERROR.CODE = ERR.RECORD.LOCKED
+   ERROR.MSG = 'Purchase order is locked'
+   RETURN
+END ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Purchase order not found: ' : PO.NUMBER
+   RETURN
+END
+
+* Validate PO status
+PO.STATUS = PO.REC<37>
+IF PO.STATUS = 'CANCELLED' OR PO.STATUS = 'CLOSED' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Cannot receive against ' : PO.STATUS : ' purchase order'
+   RELEASE F.PURCHASE.ORDERS, PO.NUMBER
+   RETURN
+END
+
+* Parse receipt items
+GOSUB PARSE.RECEIPT.ITEMS
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.NUMBER
+   RETURN
+END
+
+* Validate receipt quantities
+GOSUB VALIDATE.RECEIPT.QTY
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.NUMBER
+   RETURN
+END
+
+* Generate receipt ID
+GOSUB GENERATE.RECEIPT.ID
+
+* Create receipt record
+GOSUB CREATE.RECEIPT.RECORD
+
+* Update PO quantities
+GOSUB UPDATE.PO.QUANTITIES
+
+* Update inventory
+GOSUB UPDATE.INVENTORY.RECEIPT
+
+* Update PO status
+GOSUB UPDATE.PO.STATUS
+
+* Write updated PO
+WRITE PO.REC TO F.PURCHASE.ORDERS, PO.NUMBER
+
+* Update vendor performance
+GOSUB UPDATE.VENDOR.PERFORMANCE
+
+* Log receipt
+LOG.MSG = 'PO receipt created: ' : RECEIPT.ID.OUT
+LOG.MSG := ' for PO: ' : PO.NUMBER
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Parse Receipt Items
+**************************************************************************
+PARSE.RECEIPT.ITEMS:
+   * Parse item list
+   ITEM.LIST = RECEIPT.ITEMS
+   REC.ITEM.COUNT = DCOUNT(ITEM.LIST, '^')
+
+   DIM REC.ITEM.IDS(REC.ITEM.COUNT)
+   DIM REC.QTYS(REC.ITEM.COUNT)
+   DIM REC.LOTS(REC.ITEM.COUNT)
+   DIM REC.EXPIRY(REC.ITEM.COUNT)
+
+   FOR I = 1 TO REC.ITEM.COUNT
+      ITEM.DATA = ITEM.LIST<1, 1, I>
+
+      REC.ITEM.IDS(I) = FIELD(ITEM.DATA, '|', 1)
+      REC.QTYS(I) = FIELD(ITEM.DATA, '|', 2)
+      REC.LOTS(I) = FIELD(ITEM.DATA, '|', 3)
+      REC.EXPIRY(I) = FIELD(ITEM.DATA, '|', 4)
+
+      * Validate item ID
+      IF REC.ITEM.IDS(I) = '' THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Item ID missing for line ' : I
+         RETURN
+      END
+
+      * Validate quantity
+      IF REC.QTYS(I) = '' OR NOT(NUM(REC.QTYS(I))) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid quantity for line ' : I
+         RETURN
+      END
+
+      IF REC.QTYS(I) <= 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Quantity must be greater than zero for line ' : I
+         RETURN
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Validate Receipt Quantities
+**************************************************************************
+VALIDATE.RECEIPT.QTY:
+   * Verify all items are on the PO
+   PO.ITEM.COUNT = DCOUNT(PO.REC<16>, VM)
+
+   FOR I = 1 TO REC.ITEM.COUNT
+      ITEM.ID = REC.ITEM.IDS(I)
+      REC.QTY = REC.QTYS(I)
+
+      * Find item on PO
+      FOUND = FALSE
+      PO.LINE = 0
+
+      FOR J = 1 TO PO.ITEM.COUNT
+         IF PO.REC<16, J> = ITEM.ID THEN
+            FOUND = TRUE
+            PO.LINE = J
+            EXIT
+         END
+      NEXT J
+
+      IF NOT(FOUND) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Item not on PO: ' : ITEM.ID
+         RETURN
+      END
+
+      * Check quantity outstanding
+      QTY.OUTSTANDING = PO.REC<22, PO.LINE>
+      IF QTY.OUTSTANDING = '' THEN QTY.OUTSTANDING = 0
+
+      IF REC.QTY > QTY.OUTSTANDING THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Receipt quantity exceeds outstanding quantity'
+         ERROR.MSG := ' for item ' : ITEM.ID
+         ERROR.MSG := ' (Outstanding: ' : QTY.OUTSTANDING : ', Receiving: ' : REC.QTY : ')'
+         RETURN
+      END
+
+      * Store PO line reference
+      REC.PO.LINES(I) = PO.LINE
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Generate Receipt ID
+**************************************************************************
+GENERATE.RECEIPT.ID:
+   * Format: RCV-YYYYMMDD-XXXX
+   DATE.STR = OCONV(SYSTEM.DATE, 'D4-YMD')
+   DATE.STR = CONVERT('-', '', DATE.STR)
+
+   SEQ.KEY = 'RCV-SEQ*' : SYSTEM.DATE
+
+   OPEN 'RECEIPT.SEQUENCES' TO F.RCV.SEQ ELSE
+      EXECUTE 'CREATE.FILE RECEIPT.SEQUENCES 1 1'
+      OPEN 'RECEIPT.SEQUENCES' TO F.RCV.SEQ ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open receipt sequence file'
+         RETURN
+      END
+   END
+
+   READU SEQ.REC FROM F.RCV.SEQ, SEQ.KEY ELSE
+      SEQ.NUM = 1
+   END
+   SEQ.NUM = SEQ.REC<1>
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.RCV.SEQ, SEQ.KEY
+
+   SEQ.STR = OCONV(SEQ.NUM, 'R(0)#4')
+   RECEIPT.ID.OUT = 'RCV-' : DATE.STR : '-' : SEQ.STR
+   RETURN
+
+**************************************************************************
+* Create Receipt Record
+**************************************************************************
+CREATE.RECEIPT.RECORD:
+   RCV.REC = ''
+   RCV.REC<1> = RECEIPT.ID.OUT
+   RCV.REC<2> = PO.NUMBER
+   RCV.REC<3> = PO.REC<3>  ; VENDOR.ID
+   RCV.REC<4> = PO.REC<4>  ; VENDOR.NAME
+   RCV.REC<5> = SYSTEM.DATE  ; RECEIPT.DATE
+   RCV.REC<6> = SYSTEM.TIME  ; RECEIPT.TIME
+   RCV.REC<7> = USER.ID  ; RECEIVED.BY
+   RCV.REC<8> = PO.REC<6>  ; SHIP.TO.STORE
+   RCV.REC<9> = 'COMPLETE'  ; STATUS
+
+   * Add item details
+   FOR I = 1 TO REC.ITEM.COUNT
+      PO.LINE = REC.PO.LINES(I)
+
+      RCV.REC<10, I> = REC.ITEM.IDS(I)  ; ITEM.ID
+      RCV.REC<11, I> = PO.REC<17, PO.LINE>  ; SKU
+      RCV.REC<12, I> = PO.REC<18, PO.LINE>  ; ITEM.DESC
+      RCV.REC<13, I> = PO.REC<19, PO.LINE>  ; VENDOR.ITEM
+      RCV.REC<14, I> = PO.REC<20, PO.LINE>  ; QTY.ORDERED
+      RCV.REC<15, I> = REC.QTYS(I)  ; QTY.RECEIVED
+      RCV.REC<16, I> = PO.REC<23, PO.LINE>  ; UNIT.COST
+      RCV.REC<17, I> = REC.QTYS(I) * PO.REC<23, PO.LINE>  ; EXTENDED.COST
+      RCV.REC<18, I> = REC.LOTS(I)  ; LOT.NUMBER
+      RCV.REC<19, I> = REC.EXPIRY(I)  ; EXPIRY.DATE
+   NEXT I
+
+   * Calculate receipt total
+   TOTAL.COST = 0
+   FOR I = 1 TO REC.ITEM.COUNT
+      TOTAL.COST += RCV.REC<17, I>
+   NEXT I
+   RCV.REC<20> = TOTAL.COST
+
+   * Add notes
+   RCV.REC<21> = ''  ; NOTES
+   RCV.REC<22> = USER.ID  ; CREATED.BY
+   RCV.REC<23> = SYSTEM.DATE  ; CREATED.DATE
+   RCV.REC<24> = SYSTEM.TIME  ; CREATED.TIME
+
+   * Write receipt
+   WRITE RCV.REC TO F.RECEIPTS, RECEIPT.ID.OUT
+   RETURN
+
+**************************************************************************
+* Update PO Quantities
+**************************************************************************
+UPDATE.PO.QUANTITIES:
+   * Update quantities for each received item
+   FOR I = 1 TO REC.ITEM.COUNT
+      PO.LINE = REC.PO.LINES(I)
+      REC.QTY = REC.QTYS(I)
+
+      * Update received quantity
+      OLD.REC = PO.REC<21, PO.LINE>
+      IF OLD.REC = '' THEN OLD.REC = 0
+      PO.REC<21, PO.LINE> = OLD.REC + REC.QTY
+
+      * Update outstanding quantity
+      OLD.OUTSTANDING = PO.REC<22, PO.LINE>
+      IF OLD.OUTSTANDING = '' THEN OLD.OUTSTANDING = 0
+      PO.REC<22, PO.LINE> = OLD.OUTSTANDING - REC.QTY
+   NEXT I
+
+   * Add receipt to PO tracking
+   RCV.COUNT = DCOUNT(PO.REC<44>, VM)
+   IF RCV.COUNT = 0 OR PO.REC<44> = '' THEN
+      RCV.INDEX = 1
+   END ELSE
+      RCV.INDEX = RCV.COUNT + 1
+   END
+
+   PO.REC<44, RCV.INDEX> = RECEIPT.ID.OUT  ; RECEIPTS
+   PO.REC<45, RCV.INDEX> = SYSTEM.DATE  ; RECEIPT.DATES
+   RETURN
+
+**************************************************************************
+* Update Inventory Receipt
+**************************************************************************
+UPDATE.INVENTORY.RECEIPT:
+   STORE.ID.VAL = PO.REC<6>  ; SHIP.TO.STORE
+
+   FOR I = 1 TO REC.ITEM.COUNT
+      ITEM.ID = REC.ITEM.IDS(I)
+      REC.QTY = REC.QTYS(I)
+      PO.LINE = REC.PO.LINES(I)
+      UNIT.COST = PO.REC<23, PO.LINE>
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+         WARN.MSG = 'Item not found during receipt: ' : ITEM.ID
+         CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+         CONTINUE
+      END
+
+      * Find store index
+      GOSUB FIND.STORE.INDEX
+      IF STORE.INDEX = 0 THEN
+         RELEASE F.INVENTORY, ITEM.ID
+         CONTINUE
+      END
+
+      * Update quantity on hand
+      OLD.QTY = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+      IF OLD.QTY = '' THEN OLD.QTY = 0
+      NEW.QTY = OLD.QTY + REC.QTY
+      ITEM.REC<QTY.ON.HAND, STORE.INDEX> = NEW.QTY
+
+      * Update available quantity
+      ALLOC.QTY = ITEM.REC<QTY.ALLOCATED, STORE.INDEX>
+      IF ALLOC.QTY = '' THEN ALLOC.QTY = 0
+      ITEM.REC<QTY.AVAILABLE, STORE.INDEX> = NEW.QTY - ALLOC.QTY
+
+      * Update quantity on order
+      ON.ORDER = ITEM.REC<QTY.ON.ORDER>
+      IF ON.ORDER = '' THEN ON.ORDER = 0
+      IF ON.ORDER >= REC.QTY THEN
+         ITEM.REC<QTY.ON.ORDER> = ON.ORDER - REC.QTY
+      END ELSE
+         ITEM.REC<QTY.ON.ORDER> = 0
+      END
+
+      * Update last cost
+      ITEM.REC<LAST.COST> = UNIT.COST
+
+      * Update average cost (weighted average)
+      OLD.AVG = ITEM.REC<AVG.COST>
+      IF OLD.AVG = '' OR OLD.AVG = 0 THEN
+         ITEM.REC<AVG.COST> = UNIT.COST
+      END ELSE
+         * Weighted average: (old_qty * old_avg + new_qty * new_cost) / total_qty
+         NEW.AVG = ((OLD.QTY * OLD.AVG) + (REC.QTY * UNIT.COST)) / NEW.QTY
+         CALL UTILS.COMMON('ROUND.AMOUNT', NEW.AVG, NEW.AVG)
+         ITEM.REC<AVG.COST> = NEW.AVG
+      END
+
+      * Update last receipt date
+      ITEM.REC<LAST.RECEIPT.DATE> = SYSTEM.DATE
+
+      WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+
+      * Create inventory transaction
+      INV.TRANS.ID = ITEM.ID : '*RCV*' : STORE.ID.VAL : '*' : RECEIPT.ID.OUT
+      INV.TRANS.REC = ''
+      INV.TRANS.REC<1> = ITEM.ID
+      INV.TRANS.REC<2> = 'RECEIVE'
+      INV.TRANS.REC<3> = SYSTEM.DATE
+      INV.TRANS.REC<4> = SYSTEM.TIME
+      INV.TRANS.REC<5> = USER.ID
+      INV.TRANS.REC<6> = 'PO Receipt'
+      INV.TRANS.REC<7> = OLD.QTY
+      INV.TRANS.REC<8> = NEW.QTY
+      INV.TRANS.REC<9> = REC.QTY
+      INV.TRANS.REC<10> = STORE.ID.VAL
+      INV.TRANS.REC<11> = UNIT.COST
+      INV.TRANS.REC<12> = REC.QTY * UNIT.COST
+      INV.TRANS.REC<13> = 'PO: ' : PO.NUMBER : ', Receipt: ' : RECEIPT.ID.OUT
+      INV.TRANS.REC<14> = RECEIPT.ID.OUT
+
+      WRITE INV.TRANS.REC TO F.INVENTORY.TRANS, INV.TRANS.ID
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Find Store Index
+**************************************************************************
+FIND.STORE.INDEX:
+   STORE.INDEX = 0
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT STORE.ID ELSE EXIT
+      CURRENT.INDEX += 1
+      IF STORE.ID = STORE.ID.VAL THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Update PO Status
+**************************************************************************
+UPDATE.PO.STATUS:
+   * Check if all items fully received
+   FULLY.RECEIVED = TRUE
+   PO.ITEM.COUNT = DCOUNT(PO.REC<16>, VM)
+
+   FOR I = 1 TO PO.ITEM.COUNT
+      QTY.OUTSTANDING = PO.REC<22, I>
+      IF QTY.OUTSTANDING = '' THEN QTY.OUTSTANDING = 0
+
+      IF QTY.OUTSTANDING > 0 THEN
+         FULLY.RECEIVED = FALSE
+         EXIT
+      END
+   NEXT I
+
+   IF FULLY.RECEIVED THEN
+      PO.REC<37> = 'RECEIVED'
+   END ELSE
+      IF PO.REC<37> # 'PARTIAL' THEN
+         PO.REC<37> = 'PARTIAL'
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Update Vendor Performance
+**************************************************************************
+UPDATE.VENDOR.PERFORMANCE:
+   VENDOR.ID = PO.REC<3>
+
+   READU VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+      RETURN
+   END
+
+   * Update last receipt date
+   VENDOR.REC<30> = SYSTEM.DATE  ; LAST.RECEIPT.DATE
+
+   * Update YTD purchases
+   TOTAL.COST = 0
+   FOR I = 1 TO REC.ITEM.COUNT
+      TOTAL.COST += RCV.REC<17, I>
+   NEXT I
+
+   YTD.PURCH = VENDOR.REC<31>  ; YTD.PURCHASES
+   IF YTD.PURCH = '' THEN YTD.PURCH = 0
+   VENDOR.REC<31> = YTD.PURCH + TOTAL.COST
+
+   * Check on-time delivery
+   EXPECTED.DATE = PO.REC<14>
+   IF SYSTEM.DATE <= EXPECTED.DATE THEN
+      * On time - update percentage
+      ON.TIME.PCT = VENDOR.REC<35>  ; ON.TIME.PCT
+      IF ON.TIME.PCT = '' THEN ON.TIME.PCT = 100
+      * Simple moving average
+      ON.TIME.PCT = (ON.TIME.PCT * 0.9) + (100 * 0.1)
+      VENDOR.REC<35> = ON.TIME.PCT
+   END ELSE
+      * Late delivery
+      ON.TIME.PCT = VENDOR.REC<35>
+      IF ON.TIME.PCT = '' THEN ON.TIME.PCT = 100
+      ON.TIME.PCT = (ON.TIME.PCT * 0.9) + (0 * 0.1)
+      VENDOR.REC<35> = ON.TIME.PCT
+   END
+
+   WRITE VENDOR.REC TO F.VENDORS, VENDOR.ID
+   RETURN
+
+END

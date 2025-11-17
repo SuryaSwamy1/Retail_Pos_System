@@ -1,0 +1,525 @@
+SUBROUTINE PROMO.CREATE(PROMO.REC, PROMO.ID.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: PROMO.CREATE
+* Purpose: Create Promotional Campaign
+* Parameters:
+*   PROMO.REC (IN) - Promotion record with all fields populated
+*   PROMO.ID.OUT (OUT) - Generated promotion ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+PROMO.ID.OUT = ''
+
+* Validate required fields
+GOSUB VALIDATE.PROMOTION
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check for overlapping promotions
+GOSUB CHECK.OVERLAPPING.PROMOS
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Generate promotion ID
+GOSUB GENERATE.PROMO.ID
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Calculate estimated impact
+GOSUB CALCULATE.ESTIMATED.IMPACT
+
+* Set default values
+IF PROMO.REC<PROMO.STATUS> = '' THEN
+   PROMO.REC<PROMO.STATUS> = 'PENDING'
+END
+
+IF PROMO.REC<USAGE.COUNT> = '' THEN
+   PROMO.REC<USAGE.COUNT> = 0
+END
+
+IF PROMO.REC<TOTAL.DISCOUNT.AMT> = '' THEN
+   PROMO.REC<TOTAL.DISCOUNT.AMT> = 0
+END
+
+* Set audit fields
+PROMO.REC<PROMO.ID> = PROMO.ID.OUT
+PROMO.REC<CREATED.BY> = USER.ID
+PROMO.REC<CREATED.DATE> = SYSTEM.DATE
+PROMO.REC<CREATED.TIME> = SYSTEM.TIME
+PROMO.REC<MODIFIED.BY> = USER.ID
+PROMO.REC<MODIFIED.DATE> = SYSTEM.DATE
+PROMO.REC<MODIFIED.TIME> = SYSTEM.TIME
+
+* Write promotion record
+WRITE PROMO.REC TO F.PROMOTIONS, PROMO.ID.OUT ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write promotion record'
+   RETURN
+END
+
+* Create promotion items if applicable
+GOSUB CREATE.PROMOTION.ITEMS
+
+* Create coupon codes if needed
+GOSUB CREATE.COUPON.CODES
+
+* Send notifications
+GOSUB SEND.PROMO.NOTIFICATIONS
+
+LOG.MSG = 'Promotion created: ' : PROMO.ID.OUT : ' - ' : PROMO.REC<PROMO.NAME>
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate Promotion
+**************************************************************************
+VALIDATE.PROMOTION:
+   * Check promotion name
+   IF PROMO.REC<PROMO.NAME> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Promotion name is required'
+      RETURN
+   END
+
+   * Check promotion type
+   IF PROMO.REC<PROMO.TYPE> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Promotion type is required'
+      RETURN
+   END
+
+   VALID.TYPES = 'PERCENT.OFF':VM:'DOLLAR.OFF':VM:'BOGO':VM:'BUY.X.GET.Y'
+   VALID.TYPES := VM:'FREE.SHIPPING':VM:'POINTS.MULTIPLIER':VM:'BUNDLE'
+   VALID.TYPES := VM:'TIERED.DISCOUNT':VM:'GIFT.WITH.PURCHASE'
+
+   LOCATE PROMO.REC<PROMO.TYPE> IN VALID.TYPES<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid promotion type: ' : PROMO.REC<PROMO.TYPE>
+      RETURN
+   END
+
+   * Validate dates
+   IF PROMO.REC<START.DATE> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Start date is required'
+      RETURN
+   END
+
+   IF PROMO.REC<END.DATE> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'End date is required'
+      RETURN
+   END
+
+   IF PROMO.REC<END.DATE> < PROMO.REC<START.DATE> THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'End date must be after start date'
+      RETURN
+   END
+
+   * Validate discount amount/percentage
+   PROMO.TYPE = PROMO.REC<PROMO.TYPE>
+
+   BEGIN CASE
+      CASE PROMO.TYPE = 'PERCENT.OFF'
+         DISCOUNT.PCT = PROMO.REC<DISCOUNT.PERCENT>
+         IF DISCOUNT.PCT = '' OR NOT(NUM(DISCOUNT.PCT)) THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Discount percentage is required'
+            RETURN
+         END
+
+         IF DISCOUNT.PCT <= 0 OR DISCOUNT.PCT > 100 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Discount percentage must be between 0 and 100'
+            RETURN
+         END
+
+      CASE PROMO.TYPE = 'DOLLAR.OFF'
+         DISCOUNT.AMT = PROMO.REC<DISCOUNT.AMOUNT>
+         IF DISCOUNT.AMT = '' OR NOT(NUM(DISCOUNT.AMT)) THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Discount amount is required'
+            RETURN
+         END
+
+         IF DISCOUNT.AMT <= 0 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Discount amount must be greater than zero'
+            RETURN
+         END
+
+      CASE PROMO.TYPE = 'POINTS.MULTIPLIER'
+         MULTIPLIER = PROMO.REC<POINTS.MULTIPLIER>
+         IF MULTIPLIER = '' OR NOT(NUM(MULTIPLIER)) THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Points multiplier is required'
+            RETURN
+         END
+
+         IF MULTIPLIER <= 0 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Points multiplier must be greater than zero'
+            RETURN
+         END
+   END CASE
+
+   * Validate minimum purchase if specified
+   IF PROMO.REC<MIN.PURCHASE> # '' THEN
+      IF NOT(NUM(PROMO.REC<MIN.PURCHASE>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Minimum purchase must be numeric'
+         RETURN
+      END
+
+      IF PROMO.REC<MIN.PURCHASE> < 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Minimum purchase cannot be negative'
+         RETURN
+      END
+   END
+
+   * Validate maximum uses
+   IF PROMO.REC<MAX.USES> # '' THEN
+      IF NOT(NUM(PROMO.REC<MAX.USES>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Maximum uses must be numeric'
+         RETURN
+      END
+
+      IF PROMO.REC<MAX.USES> <= 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Maximum uses must be greater than zero'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Check Overlapping Promos
+**************************************************************************
+CHECK.OVERLAPPING.PROMOS:
+   * Check for conflicting promotions on same items
+
+   IF PROMO.REC<PROMO.ITEMS> = '' THEN RETURN
+
+   START.DATE = PROMO.REC<START.DATE>
+   END.DATE = PROMO.REC<END.DATE>
+
+   * Get items in this promotion
+   NEW.ITEMS = PROMO.REC<PROMO.ITEMS>
+
+   SELECT.CMD = 'SELECT PROMOTIONS WITH STATUS = "ACTIVE"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT EXISTING.PROMO.ID ELSE EXIT
+
+      READ EXISTING.PROMO FROM F.PROMOTIONS, EXISTING.PROMO.ID ELSE CONTINUE
+
+      * Check date overlap
+      EXISTING.START = EXISTING.PROMO<START.DATE>
+      EXISTING.END = EXISTING.PROMO<END.DATE>
+
+      DATE.OVERLAP = FALSE
+
+      IF START.DATE <= EXISTING.END AND END.DATE >= EXISTING.START THEN
+         DATE.OVERLAP = TRUE
+      END
+
+      IF NOT(DATE.OVERLAP) THEN CONTINUE
+
+      * Check item overlap
+      EXISTING.ITEMS = EXISTING.PROMO<PROMO.ITEMS>
+
+      IF EXISTING.ITEMS = '' THEN CONTINUE
+
+      * Check for common items
+      GOSUB CHECK.ITEM.OVERLAP
+      IF ITEM.OVERLAP THEN
+         * Allow overlap if configured
+         IF PROMO.REC<ALLOW.STACKING> = 'Y' THEN
+            CONTINUE
+         END
+
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Promotion overlaps with existing promotion: '
+         ERROR.MSG := EXISTING.PROMO<PROMO.NAME>
+         RETURN
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Check Item Overlap
+**************************************************************************
+CHECK.ITEM.OVERLAP:
+   ITEM.OVERLAP = FALSE
+
+   NEW.ITEM.COUNT = DCOUNT(NEW.ITEMS, VM)
+   EXISTING.ITEM.COUNT = DCOUNT(EXISTING.ITEMS, VM)
+
+   FOR I = 1 TO NEW.ITEM.COUNT
+      NEW.ITEM = NEW.ITEMS<1, I>
+
+      FOR J = 1 TO EXISTING.ITEM.COUNT
+         EXISTING.ITEM = EXISTING.ITEMS<1, J>
+
+         IF NEW.ITEM = EXISTING.ITEM THEN
+            ITEM.OVERLAP = TRUE
+            RETURN
+         END
+      NEXT J
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Generate Promo ID
+**************************************************************************
+GENERATE.PROMO.ID:
+   * Format: PROMO-YYYYMMDD-XXX
+
+   DATE.STR = OCONV(SYSTEM.DATE, 'D4-YMD')
+   DATE.STR = CONVERT('-', '', DATE.STR)
+
+   SEQ.KEY = 'PROMO-SEQ*' : SYSTEM.DATE
+
+   OPEN 'PROMO.SEQUENCES' TO F.PROMO.SEQ ELSE
+      EXECUTE 'CREATE.FILE PROMO.SEQUENCES 1 1'
+      OPEN 'PROMO.SEQUENCES' TO F.PROMO.SEQ ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open promotion sequence file'
+         RETURN
+      END
+   END
+
+   READU SEQ.REC FROM F.PROMO.SEQ, SEQ.KEY ELSE
+      SEQ.NUM = 1
+   END
+   SEQ.NUM = SEQ.REC<1>
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.PROMO.SEQ, SEQ.KEY
+
+   SEQ.STR = OCONV(SEQ.NUM, 'R(0)#3')
+   PROMO.ID.OUT = 'PROMO-' : DATE.STR : '-' : SEQ.STR
+   RETURN
+
+**************************************************************************
+* Calculate Estimated Impact
+**************************************************************************
+CALCULATE.ESTIMATED.IMPACT:
+   * Estimate potential revenue impact based on historical data
+
+   ESTIMATED.USAGE = 0
+   ESTIMATED.DISCOUNT = 0
+   ESTIMATED.REVENUE = 0
+
+   * Check if items are specified
+   IF PROMO.REC<PROMO.ITEMS> = '' THEN RETURN
+
+   ITEM.COUNT = DCOUNT(PROMO.REC<PROMO.ITEMS>, VM)
+
+   * Calculate average sales for affected items
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = PROMO.REC<PROMO.ITEMS, I>
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Get 30-day sales average
+      SALES.30DAY = ITEM.REC<SALES.30DAY>
+      IF SALES.30DAY = '' THEN SALES.30DAY = 0
+
+      AVG.PRICE = ITEM.REC<PRICE.LEVEL1>
+      IF AVG.PRICE = '' THEN AVG.PRICE = 0
+
+      * Project sales during promotion period
+      PROMO.DAYS = PROMO.REC<END.DATE> - PROMO.REC<START.DATE> + 1
+      PROJECTED.UNITS = (SALES.30DAY / 30) * PROMO.DAYS
+
+      * Estimate promotion lift (20% increase)
+      PROJECTED.UNITS = PROJECTED.UNITS * 1.2
+
+      ESTIMATED.USAGE += PROJECTED.UNITS
+
+      * Calculate discount per item
+      PROMO.TYPE = PROMO.REC<PROMO.TYPE>
+
+      BEGIN CASE
+         CASE PROMO.TYPE = 'PERCENT.OFF'
+            DISCOUNT.PER.ITEM = AVG.PRICE * (PROMO.REC<DISCOUNT.PERCENT> / 100)
+
+         CASE PROMO.TYPE = 'DOLLAR.OFF'
+            DISCOUNT.PER.ITEM = PROMO.REC<DISCOUNT.AMOUNT>
+
+         CASE 1
+            DISCOUNT.PER.ITEM = 0
+      END CASE
+
+      ESTIMATED.DISCOUNT += (PROJECTED.UNITS * DISCOUNT.PER.ITEM)
+      ESTIMATED.REVENUE += (PROJECTED.UNITS * AVG.PRICE)
+   NEXT I
+
+   PROMO.REC<ESTIMATED.USAGE> = INT(ESTIMATED.USAGE)
+   PROMO.REC<ESTIMATED.DISCOUNT.AMT> = ESTIMATED.DISCOUNT
+   PROMO.REC<ESTIMATED.REVENUE> = ESTIMATED.REVENUE
+   PROMO.REC<ESTIMATED.NET.REVENUE> = ESTIMATED.REVENUE - ESTIMATED.DISCOUNT
+   RETURN
+
+**************************************************************************
+* Create Promotion Items
+**************************************************************************
+CREATE.PROMOTION.ITEMS:
+   * Create individual records for each item in promotion
+
+   IF PROMO.REC<PROMO.ITEMS> = '' THEN RETURN
+
+   OPEN 'PROMO.ITEMS' TO F.PROMO.ITEMS ELSE
+      EXECUTE 'CREATE.FILE PROMO.ITEMS 1 101'
+      OPEN 'PROMO.ITEMS' TO F.PROMO.ITEMS ELSE
+         RETURN
+      END
+   END
+
+   ITEM.COUNT = DCOUNT(PROMO.REC<PROMO.ITEMS>, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = PROMO.REC<PROMO.ITEMS, I>
+
+      PI.ID = PROMO.ID.OUT : '*' : ITEM.ID
+      PI.REC = ''
+      PI.REC<1> = PROMO.ID.OUT
+      PI.REC<2> = ITEM.ID
+      PI.REC<3> = PROMO.REC<PROMO.NAME>
+      PI.REC<4> = PROMO.REC<PROMO.TYPE>
+      PI.REC<5> = PROMO.REC<DISCOUNT.PERCENT>
+      PI.REC<6> = PROMO.REC<DISCOUNT.AMOUNT>
+      PI.REC<7> = PROMO.REC<START.DATE>
+      PI.REC<8> = PROMO.REC<END.DATE>
+      PI.REC<9> = 0  ; Usage count
+      PI.REC<10> = 0  ; Discount amount
+      PI.REC<11> = 'ACTIVE'
+
+      WRITE PI.REC TO F.PROMO.ITEMS, PI.ID
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Create Coupon Codes
+**************************************************************************
+CREATE.COUPON.CODES:
+   * Generate coupon codes if needed
+
+   IF PROMO.REC<REQUIRES.COUPON> # 'Y' THEN RETURN
+
+   OPEN 'COUPONS' TO F.COUPONS ELSE
+      EXECUTE 'CREATE.FILE COUPONS 1 101'
+      OPEN 'COUPONS' TO F.COUPONS ELSE
+         RETURN
+      END
+   END
+
+   * Check if coupon code is provided
+   COUPON.CODE = PROMO.REC<COUPON.CODE>
+
+   IF COUPON.CODE = '' THEN
+      * Auto-generate coupon code
+      GOSUB GENERATE.COUPON.CODE
+   END
+
+   * Verify coupon code is unique
+   READ EXISTING.COUPON FROM F.COUPONS, COUPON.CODE THEN
+      ERROR.CODE = ERR.DUPLICATE.KEY
+      ERROR.MSG = 'Coupon code already exists: ' : COUPON.CODE
+      RETURN
+   END
+
+   * Create coupon record
+   COUPON.REC = ''
+   COUPON.REC<1> = COUPON.CODE
+   COUPON.REC<2> = PROMO.REC<PROMO.NAME>
+   COUPON.REC<3> = PROMO.REC<PROMO.TYPE>
+   COUPON.REC<4> = PROMO.REC<DISCOUNT.PERCENT>
+   COUPON.REC<5> = PROMO.REC<START.DATE>
+   COUPON.REC<6> = PROMO.REC<END.DATE>
+   COUPON.REC<7> = PROMO.REC<MAX.USES>
+   COUPON.REC<8> = 0  ; Times used
+   COUPON.REC<9> = ''  ; Customer restriction
+   COUPON.REC<10> = 'ACTIVE'
+   COUPON.REC<11> = PROMO.ID.OUT
+   COUPON.REC<12> = PROMO.REC<MIN.PURCHASE>
+
+   WRITE COUPON.REC TO F.COUPONS, COUPON.CODE
+
+   * Update promotion with coupon code
+   PROMO.REC<COUPON.CODE> = COUPON.CODE
+   RETURN
+
+**************************************************************************
+* Generate Coupon Code
+**************************************************************************
+GENERATE.COUPON.CODE:
+   * Generate unique alphanumeric code
+
+   * Use first 3 letters of promo name
+   PROMO.NAME = PROMO.REC<PROMO.NAME>
+   CODE.PREFIX = OCONV(PROMO.NAME[1,3], 'MCU')
+   CODE.PREFIX = CONVERT(' ', '', CODE.PREFIX)
+
+   * Add year
+   YEAR.PART = OCONV(SYSTEM.DATE, 'D4/')[9,2]
+
+   * Add random 4-digit number
+   RANDOM.PART = RND(10000)
+   RANDOM.STR = OCONV(RANDOM.PART, 'R(0)#4')
+
+   COUPON.CODE = CODE.PREFIX : YEAR.PART : RANDOM.STR
+
+   * Verify uniqueness
+   READ EXISTING FROM F.COUPONS, COUPON.CODE THEN
+      * Try again with different random number
+      GOSUB GENERATE.COUPON.CODE
+   END
+   RETURN
+
+**************************************************************************
+* Send Promo Notifications
+**************************************************************************
+SEND.PROMO.NOTIFICATIONS:
+   * Notify marketing team
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   EMAIL.ID = 'PROMO.CREATE*' : PROMO.ID.OUT
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'marketing@company.com'
+   EMAIL.REC<2> = 'New Promotion Created: ' : PROMO.REC<PROMO.NAME>
+   EMAIL.REC<3> = 'A new promotion has been created:' : AM : AM
+   EMAIL.REC<3> := 'Promotion ID: ' : PROMO.ID.OUT : AM
+   EMAIL.REC<3> := 'Name: ' : PROMO.REC<PROMO.NAME> : AM
+   EMAIL.REC<3> := 'Type: ' : PROMO.REC<PROMO.TYPE> : AM
+   EMAIL.REC<3> := 'Start Date: ' : OCONV(PROMO.REC<START.DATE>, 'D4/') : AM
+   EMAIL.REC<3> := 'End Date: ' : OCONV(PROMO.REC<END.DATE>, 'D4/') : AM
+
+   IF PROMO.REC<COUPON.CODE> # '' THEN
+      EMAIL.REC<3> := 'Coupon Code: ' : PROMO.REC<COUPON.CODE> : AM
+   END
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', PROMO.REC<ESTIMATED.DISCOUNT.AMT>, FMT.DISC)
+   CALL UTILS.COMMON('FORMAT.AMOUNT', PROMO.REC<ESTIMATED.REVENUE>, FMT.REV)
+
+   EMAIL.REC<3> := AM : 'Estimated Impact:' : AM
+   EMAIL.REC<3> := 'Projected Usage: ' : PROMO.REC<ESTIMATED.USAGE> : ' units' : AM
+   EMAIL.REC<3> := 'Estimated Discount: $' : FMT.DISC : AM
+   EMAIL.REC<3> := 'Estimated Revenue: $' : FMT.REV : AM
+
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

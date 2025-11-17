@@ -1,0 +1,342 @@
+SUBROUTINE CUST.UPDATE(CUST.ID.IN, CUST.REC.IN, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: CUST.UPDATE
+* Purpose: Update Existing Customer Record
+* Parameters:
+*   CUST.ID.IN (IN) - Customer ID to update
+*   CUST.REC.IN (IN) - Customer record with updated fields
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate input
+IF CUST.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Customer ID is required'
+   RETURN
+END
+
+* Read existing record with lock
+READU OLD.CUST.REC FROM F.CUSTOMERS, CUST.ID.IN LOCKED
+   * Record is locked by another user
+   ERROR.CODE = ERR.RECORD.LOCKED
+   ERROR.MSG = 'Customer record is locked by another user'
+   RETURN
+END ELSE
+   * Record does not exist
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Customer not found: ' : CUST.ID.IN
+   RETURN
+END
+
+* Preserve audit trail fields from original record
+ORIG.CREATED.BY = OLD.CUST.REC<CUST.CREATED.BY>
+ORIG.CREATED.DATE = OLD.CUST.REC<CUST.CREATED.DATE>
+ORIG.CREATED.TIME = OLD.CUST.REC<CUST.CREATED.TIME>
+
+* Validate updated data
+CUST.REC = CUST.REC.IN
+GOSUB VALIDATE.CUSTOMER.UPDATE
+IF ERROR.CODE # ERR.SUCCESS THEN
+   * Release lock before returning
+   RELEASE F.CUSTOMERS, CUST.ID.IN
+   RETURN
+END
+
+* Update audit fields
+CUST.REC<CUST.CREATED.BY> = ORIG.CREATED.BY
+CUST.REC<CUST.CREATED.DATE> = ORIG.CREATED.DATE
+CUST.REC<CUST.CREATED.TIME> = ORIG.CREATED.TIME
+CUST.REC<CUST.MODIFIED.BY> = USER.ID
+CUST.REC<CUST.MODIFIED.DATE> = SYSTEM.DATE
+CUST.REC<CUST.MODIFIED.TIME> = SYSTEM.TIME
+
+* Check for loyalty tier upgrade
+IF OLD.CUST.REC<LOYALTY.TIER> # CUST.REC<LOYALTY.TIER> THEN
+   GOSUB PROCESS.TIER.CHANGE
+END
+
+* Check for credit limit change - may require approval
+IF OLD.CUST.REC<CREDIT.LIMIT> # CUST.REC<CREDIT.LIMIT> THEN
+   GOSUB PROCESS.CREDIT.LIMIT.CHANGE
+   IF ERROR.CODE # ERR.SUCCESS THEN
+      RELEASE F.CUSTOMERS, CUST.ID.IN
+      RETURN
+   END
+END
+
+* Write updated record
+WRITE CUST.REC TO F.CUSTOMERS, CUST.ID.IN ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write customer record'
+   RETURN
+END
+
+* Log customer update
+LOG.MSG = 'Customer updated: ' : CUST.ID.IN : ' - ' : CUST.REC<CUST.NAME>
+LOG.MSG := ' by user: ' : USER.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+* Create audit trail entry
+GOSUB CREATE.AUDIT.TRAIL
+
+RETURN
+
+**************************************************************************
+* Validate Customer Update
+**************************************************************************
+VALIDATE.CUSTOMER.UPDATE:
+   * Check customer name
+   IF CUST.REC<CUST.NAME> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Customer name is required'
+      RETURN
+   END
+
+   * Validate customer type
+   VALID.TYPES = 'R':VM:'W':VM:'C'
+   IF CUST.REC<CUST.TYPE> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Customer type is required'
+      RETURN
+   END
+   LOCATE CUST.REC<CUST.TYPE> IN VALID.TYPES<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid customer type. Must be R, W, or C'
+      RETURN
+   END
+
+   * Validate email if provided
+   IF CUST.REC<EMAIL> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.EMAIL', CUST.REC<EMAIL>, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid email address format'
+         RETURN
+      END
+   END
+
+   * Validate phone if provided
+   IF CUST.REC<PHONE,1> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.PHONE', CUST.REC<PHONE,1>, FORMATTED.PHONE, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid phone number format'
+         RETURN
+      END
+      CUST.REC<PHONE,1> = FORMATTED.PHONE
+   END
+
+   * Validate credit limit
+   IF CUST.REC<CREDIT.LIMIT> # '' THEN
+      IF NOT(NUM(CUST.REC<CREDIT.LIMIT>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Credit limit must be numeric'
+         RETURN
+      END
+      IF CUST.REC<CREDIT.LIMIT> < 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Credit limit cannot be negative'
+         RETURN
+      END
+   END
+
+   * Validate credit balance
+   IF CUST.REC<CREDIT.BALANCE> # '' THEN
+      IF NOT(NUM(CUST.REC<CREDIT.BALANCE>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Credit balance must be numeric'
+         RETURN
+      END
+      IF CUST.REC<CREDIT.BALANCE> < 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Credit balance cannot be negative'
+         RETURN
+      END
+   END
+
+   * Validate discount percentage
+   IF CUST.REC<DISCOUNT.PCT> # '' THEN
+      IF NOT(NUM(CUST.REC<DISCOUNT.PCT>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Discount percentage must be numeric'
+         RETURN
+      END
+      IF CUST.REC<DISCOUNT.PCT> < 0 OR CUST.REC<DISCOUNT.PCT> > 100 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Discount percentage must be between 0 and 100'
+         RETURN
+      END
+   END
+
+   * Validate price level
+   IF CUST.REC<PRICE.LEVEL> # '' THEN
+      IF NOT(NUM(CUST.REC<PRICE.LEVEL>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Price level must be numeric'
+         RETURN
+      END
+      IF CUST.REC<PRICE.LEVEL> < 1 OR CUST.REC<PRICE.LEVEL> > 5 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Price level must be between 1 and 5'
+         RETURN
+      END
+   END
+
+   * Validate status
+   VALID.STATUS = STATUS.ACTIVE:VM:STATUS.INACTIVE:VM:STATUS.SUSPENDED
+   IF CUST.REC<CUST.STATUS> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Customer status is required'
+      RETURN
+   END
+   LOCATE CUST.REC<CUST.STATUS> IN VALID.STATUS<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid customer status'
+      RETURN
+   END
+
+   * Validate loyalty tier if provided
+   IF CUST.REC<LOYALTY.TIER> # '' THEN
+      VALID.TIERS = 'BRONZE':VM:'SILVER':VM:'GOLD':VM:'PLATINUM'
+      LOCATE CUST.REC<LOYALTY.TIER> IN VALID.TIERS<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid loyalty tier'
+         RETURN
+      END
+   END
+
+   * Validate loyalty points
+   IF CUST.REC<LOYALTY.POINTS> # '' THEN
+      IF NOT(NUM(CUST.REC<LOYALTY.POINTS>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Loyalty points must be numeric'
+         RETURN
+      END
+      IF CUST.REC<LOYALTY.POINTS> < 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Loyalty points cannot be negative'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Process Loyalty Tier Change
+**************************************************************************
+PROCESS.TIER.CHANGE:
+   * Log tier change
+   TIER.LOG = 'Loyalty tier changed for customer ' : CUST.ID.IN
+   TIER.LOG := ': ' : OLD.CUST.REC<LOYALTY.TIER> : ' -> ' : CUST.REC<LOYALTY.TIER>
+   CALL UTILS.COMMON('LOG.ERROR', TIER.LOG, 'INFO')
+
+   * Add note to customer record
+   NOTE.TEXT = 'Tier changed from ' : OLD.CUST.REC<LOYALTY.TIER>
+   NOTE.TEXT := ' to ' : CUST.REC<LOYALTY.TIER>
+   NOTE.TEXT := ' on ' : OCONV(SYSTEM.DATE, 'D4/')
+   NOTE.TEXT := ' by ' : USER.ID
+
+   NOTE.COUNT = DCOUNT(CUST.REC<CUST.NOTES>, VM)
+   CUST.REC<CUST.NOTES, NOTE.COUNT + 1> = NOTE.TEXT
+
+   * Send tier upgrade notification
+   IF CUST.REC<EMAIL> # '' THEN
+      EMAIL.LOG = 'Tier upgrade email sent to: ' : CUST.REC<EMAIL>
+      CALL UTILS.COMMON('LOG.ERROR', EMAIL.LOG, 'INFO')
+   END
+   RETURN
+
+**************************************************************************
+* Process Credit Limit Change
+**************************************************************************
+PROCESS.CREDIT.LIMIT.CHANGE:
+   OLD.LIMIT = OLD.CUST.REC<CREDIT.LIMIT>
+   NEW.LIMIT = CUST.REC<CREDIT.LIMIT>
+
+   * Calculate change amount and percentage
+   CHANGE.AMT = NEW.LIMIT - OLD.LIMIT
+   IF OLD.LIMIT > 0 THEN
+      CHANGE.PCT = (CHANGE.AMT / OLD.LIMIT) * 100
+   END ELSE
+      CHANGE.PCT = 100
+   END
+
+   * Check if approval is required (increases over 20% or $10,000)
+   APPROVAL.REQUIRED = FALSE
+   IF CHANGE.AMT > 0 THEN
+      IF CHANGE.PCT > 20 OR CHANGE.AMT > 10000 THEN
+         APPROVAL.REQUIRED = TRUE
+      END
+   END
+
+   IF APPROVAL.REQUIRED AND USER.LEVEL < 8 THEN
+      ERROR.CODE = ERR.PERMISSION.DENIED
+      ERROR.MSG = 'Credit limit increase requires manager approval'
+      RETURN
+   END
+
+   * Log credit limit change
+   CREDIT.LOG = 'Credit limit changed for customer ' : CUST.ID.IN
+   CREDIT.LOG := ': ' : OLD.LIMIT : ' -> ' : NEW.LIMIT
+   CREDIT.LOG := ' (' : CHANGE.AMT : ')'
+   IF APPROVAL.REQUIRED THEN
+      CREDIT.LOG := ' [APPROVED BY: ' : USER.ID : ']'
+   END
+   CALL UTILS.COMMON('LOG.ERROR', CREDIT.LOG, 'INFO')
+
+   * Add note to customer record
+   NOTE.TEXT = 'Credit limit changed from ' : OLD.LIMIT : ' to ' : NEW.LIMIT
+   NOTE.TEXT := ' on ' : OCONV(SYSTEM.DATE, 'D4/')
+   NOTE.TEXT := ' by ' : USER.ID
+   IF APPROVAL.REQUIRED THEN
+      NOTE.TEXT := ' [APPROVED]'
+   END
+
+   NOTE.COUNT = DCOUNT(CUST.REC<CUST.NOTES>, VM)
+   CUST.REC<CUST.NOTES, NOTE.COUNT + 1> = NOTE.TEXT
+   RETURN
+
+**************************************************************************
+* Create Audit Trail Entry
+**************************************************************************
+CREATE.AUDIT.TRAIL:
+   * Compare old and new records to identify changes
+   CHANGES = ''
+   CHANGE.COUNT = 0
+
+   * Check each field for changes
+   FOR FIELD.NUM = 1 TO 38
+      OLD.VALUE = OLD.CUST.REC<FIELD.NUM>
+      NEW.VALUE = CUST.REC<FIELD.NUM>
+
+      IF OLD.VALUE # NEW.VALUE THEN
+         CHANGE.COUNT += 1
+         CHANGES<CHANGE.COUNT> = FIELD.NUM : '|' : OLD.VALUE : '|' : NEW.VALUE
+      END
+   NEXT FIELD.NUM
+
+   * Write audit trail if there were changes
+   IF CHANGE.COUNT > 0 THEN
+      AUDIT.ID = CUST.ID.IN : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+      AUDIT.REC = ''
+      AUDIT.REC<1> = CUST.ID.IN
+      AUDIT.REC<2> = 'UPDATE'
+      AUDIT.REC<3> = USER.ID
+      AUDIT.REC<4> = SYSTEM.DATE
+      AUDIT.REC<5> = SYSTEM.TIME
+      AUDIT.REC<6> = CHANGES
+
+      * Write to audit file (if exists)
+      OPEN 'AUDIT.TRAIL' TO F.AUDIT THEN
+         WRITE AUDIT.REC TO F.AUDIT, AUDIT.ID
+      END
+   END
+   RETURN
+
+END

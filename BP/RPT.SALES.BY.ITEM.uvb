@@ -1,0 +1,560 @@
+SUBROUTINE RPT.SALES.BY.ITEM(REPORT.PARAMS, OUTPUT.TYPE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: RPT.SALES.BY.ITEM
+* Purpose: Generate Sales by Item Report
+* Parameters:
+*   REPORT.PARAMS (IN) - Report parameters:
+*                        <1> = Start date
+*                        <2> = End date
+*                        <3> = Store ID filter
+*                        <4> = Category filter
+*                        <5> = Top N items (0 = all)
+*                        <6> = Sort order (REVENUE/QUANTITY/MARGIN/PROFIT)
+*   OUTPUT.TYPE (IN) - Output destination
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Parse report parameters
+START.DATE = REPORT.PARAMS<1>
+END.DATE = REPORT.PARAMS<2>
+STORE.ID.FILTER = REPORT.PARAMS<3>
+CATEGORY.FILTER = REPORT.PARAMS<4>
+TOP.N.ITEMS = REPORT.PARAMS<5>
+SORT.ORDER = REPORT.PARAMS<6>
+
+* Default to current month
+IF START.DATE = '' THEN
+   MONTH.STR = OCONV(SYSTEM.DATE, 'D4/')[1,7]
+   START.DATE = ICONV('01/' : MONTH.STR, 'D/')
+END
+
+IF END.DATE = '' THEN END.DATE = SYSTEM.DATE
+IF TOP.N.ITEMS = '' THEN TOP.N.ITEMS = 0
+IF SORT.ORDER = '' THEN SORT.ORDER = 'REVENUE'
+
+* Initialize report
+GOSUB INITIALIZE.REPORT
+
+* Collect sales data
+GOSUB COLLECT.SALES.DATA
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Sort and limit data
+GOSUB SORT.SALES.DATA
+GOSUB LIMIT.TOP.ITEMS
+
+* Generate report output
+GOSUB GENERATE.REPORT.OUTPUT
+
+* Output report
+GOSUB OUTPUT.REPORT
+
+LOG.MSG = 'Sales by item report generated'
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Initialize Report
+**************************************************************************
+INITIALIZE.REPORT:
+   REPORT.TITLE = 'SALES BY ITEM REPORT'
+   REPORT.DATE = SYSTEM.DATE
+   REPORT.TIME = SYSTEM.TIME
+   REPORT.USER = USER.ID
+
+   * Initialize totals
+   TOTAL.ITEMS = 0
+   TOTAL.QTY.SOLD = 0
+   TOTAL.REVENUE = 0
+   TOTAL.COST = 0
+   TOTAL.PROFIT = 0
+   TOTAL.TRANSACTIONS = 0
+
+   REPORT.DATA = ''
+   RETURN
+
+**************************************************************************
+* Collect Sales Data
+**************************************************************************
+COLLECT.SALES.DATA:
+   * Build selection criteria
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE <= "' : END.DATE : '"'
+
+   IF STORE.ID.FILTER # '' THEN
+      SELECT.CMD := ' AND WITH STORE.ID = "' : STORE.ID.FILTER : '"'
+   END
+
+   EXECUTE SELECT.CMD
+
+   * Collect item sales
+   MAT ITEM.SALES = ''
+   MAT ITEM.QTY = ''
+   MAT ITEM.COST = ''
+   MAT ITEM.REVENUE = ''
+   MAT ITEM.TRANS.COUNT = ''
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Process each item in transaction
+      ITEM.IDS = TRANS.REC<ITEM.IDS>
+      ITEM.QTYS = TRANS.REC<ITEM.QTYS>
+      ITEM.PRICES = TRANS.REC<ITEM.PRICES>
+      ITEM.COSTS = TRANS.REC<ITEM.COSTS>
+
+      IF ITEM.IDS = '' THEN CONTINUE
+
+      ITEM.COUNT = DCOUNT(ITEM.IDS, VM)
+
+      FOR I = 1 TO ITEM.COUNT
+         ITEM.ID = ITEM.IDS<1, I>
+         ITEM.QTY = ITEM.QTYS<1, I>
+         ITEM.PRICE = ITEM.PRICES<1, I>
+         ITEM.COST = ITEM.COSTS<1, I>
+
+         IF ITEM.QTY = '' THEN ITEM.QTY = 0
+         IF ITEM.PRICE = '' THEN ITEM.PRICE = 0
+         IF ITEM.COST = '' THEN ITEM.COST = 0
+
+         * Apply category filter
+         IF CATEGORY.FILTER # '' THEN
+            READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+            IF ITEM.REC<CATEGORY> # CATEGORY.FILTER THEN CONTINUE
+         END
+
+         * Accumulate item totals
+         GOSUB ACCUMULATE.ITEM.SALES
+      NEXT I
+
+      TOTAL.TRANSACTIONS += 1
+   REPEAT
+
+   * Process accumulated data
+   GOSUB PROCESS.ITEM.TOTALS
+   RETURN
+
+**************************************************************************
+* Accumulate Item Sales
+**************************************************************************
+ACCUMULATE.ITEM.SALES:
+   * Find or create item entry
+   LOCATE ITEM.ID IN ITEM.SALES<1> SETTING POS ELSE
+      * Add new item
+      ITEM.CNT = DCOUNT(ITEM.SALES, AM)
+      IF ITEM.CNT = 0 OR ITEM.SALES = '' THEN
+         POS = 1
+      END ELSE
+         POS = ITEM.CNT + 1
+      END
+
+      ITEM.SALES<POS> = ITEM.ID
+      ITEM.QTY<POS> = 0
+      ITEM.COST<POS> = 0
+      ITEM.REVENUE<POS> = 0
+      ITEM.TRANS.COUNT<POS> = 0
+   END
+
+   * Accumulate values
+   CURR.QTY = ITEM.QTY<POS>
+   IF CURR.QTY = '' THEN CURR.QTY = 0
+   ITEM.QTY<POS> = CURR.QTY + ITEM.QTY
+
+   CURR.COST = ITEM.COST<POS>
+   IF CURR.COST = '' THEN CURR.COST = 0
+   ITEM.COST<POS> = CURR.COST + (ITEM.COST * ITEM.QTY)
+
+   CURR.REV = ITEM.REVENUE<POS>
+   IF CURR.REV = '' THEN CURR.REV = 0
+   ITEM.REVENUE<POS> = CURR.REV + (ITEM.PRICE * ITEM.QTY)
+
+   CURR.TRANS = ITEM.TRANS.COUNT<POS>
+   IF CURR.TRANS = '' THEN CURR.TRANS = 0
+   ITEM.TRANS.COUNT<POS> = CURR.TRANS + 1
+   RETURN
+
+**************************************************************************
+* Process Item Totals
+**************************************************************************
+PROCESS.ITEM.TOTALS:
+   ITEM.CNT = DCOUNT(ITEM.SALES, AM)
+   IF ITEM.CNT = 0 OR ITEM.SALES = '' THEN
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'No sales data found for period'
+      RETURN
+   END
+
+   FOR I = 1 TO ITEM.CNT
+      ITEM.ID = ITEM.SALES<I>
+      QTY.SOLD = ITEM.QTY<I>
+      COST.TOTAL = ITEM.COST<I>
+      REVENUE.TOTAL = ITEM.REVENUE<I>
+      TRANS.COUNT = ITEM.TRANS.COUNT<I>
+
+      IF QTY.SOLD = '' THEN QTY.SOLD = 0
+      IF COST.TOTAL = '' THEN COST.TOTAL = 0
+      IF REVENUE.TOTAL = '' THEN REVENUE.TOTAL = 0
+      IF TRANS.COUNT = '' THEN TRANS.COUNT = 0
+
+      * Get item details
+      READ INV.REC FROM F.INVENTORY, ITEM.ID ELSE
+         ITEM.SKU = ITEM.ID
+         ITEM.DESC = 'Unknown Item'
+         ITEM.CATEGORY = ''
+      END ELSE
+         ITEM.SKU = INV.REC<SKU>
+         ITEM.DESC = INV.REC<ITEM.DESCRIPTION>
+         ITEM.CATEGORY = INV.REC<CATEGORY>
+      END
+
+      * Calculate metrics
+      PROFIT.TOTAL = REVENUE.TOTAL - COST.TOTAL
+
+      IF REVENUE.TOTAL > 0 THEN
+         MARGIN.PCT = (PROFIT.TOTAL / REVENUE.TOTAL) * 100
+      END ELSE
+         MARGIN.PCT = 0
+      END
+
+      IF QTY.SOLD > 0 THEN
+         AVG.PRICE = REVENUE.TOTAL / QTY.SOLD
+         AVG.COST = COST.TOTAL / QTY.SOLD
+      END ELSE
+         AVG.PRICE = 0
+         AVG.COST = 0
+      END
+
+      * Store item data
+      GOSUB STORE.ITEM.SALES.DATA
+
+      * Update report totals
+      TOTAL.QTY.SOLD += QTY.SOLD
+      TOTAL.REVENUE += REVENUE.TOTAL
+      TOTAL.COST += COST.TOTAL
+      TOTAL.PROFIT += PROFIT.TOTAL
+   NEXT I
+
+   TOTAL.ITEMS = ITEM.CNT
+   RETURN
+
+**************************************************************************
+* Store Item Sales Data
+**************************************************************************
+STORE.ITEM.SALES.DATA:
+   DATA.ROW = ITEM.ID
+   DATA.ROW := AM : ITEM.SKU
+   DATA.ROW := AM : ITEM.DESC
+   DATA.ROW := AM : ITEM.CATEGORY
+   DATA.ROW := AM : QTY.SOLD
+   DATA.ROW := AM : REVENUE.TOTAL
+   DATA.ROW := AM : COST.TOTAL
+   DATA.ROW := AM : PROFIT.TOTAL
+   DATA.ROW := AM : MARGIN.PCT
+   DATA.ROW := AM : AVG.PRICE
+   DATA.ROW := AM : TRANS.COUNT
+
+   IF REPORT.DATA = '' THEN
+      REPORT.DATA = DATA.ROW
+   END ELSE
+      REPORT.DATA := VM : DATA.ROW
+   END
+   RETURN
+
+**************************************************************************
+* Sort Sales Data
+**************************************************************************
+SORT.SALES.DATA:
+   IF REPORT.DATA = '' THEN RETURN
+
+   ROW.COUNT = DCOUNT(REPORT.DATA, VM)
+   IF ROW.COUNT <= 1 THEN RETURN
+
+   * Bubble sort
+   FOR I = 1 TO ROW.COUNT - 1
+      FOR J = I + 1 TO ROW.COUNT
+         ROW1 = REPORT.DATA<1, I>
+         ROW2 = REPORT.DATA<1, J>
+
+         GOSUB COMPARE.SALES.ROWS
+
+         IF SWAP.ROWS THEN
+            REPORT.DATA<1, I> = ROW2
+            REPORT.DATA<1, J> = ROW1
+         END
+      NEXT J
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Compare Sales Rows
+**************************************************************************
+COMPARE.SALES.ROWS:
+   SWAP.ROWS = FALSE
+
+   BEGIN CASE
+      CASE SORT.ORDER = 'REVENUE'
+         REV1 = ROW1<1, 1, 6>
+         REV2 = ROW2<1, 1, 6>
+         IF REV1 < REV2 THEN SWAP.ROWS = TRUE
+
+      CASE SORT.ORDER = 'QUANTITY'
+         QTY1 = ROW1<1, 1, 5>
+         QTY2 = ROW2<1, 1, 5>
+         IF QTY1 < QTY2 THEN SWAP.ROWS = TRUE
+
+      CASE SORT.ORDER = 'MARGIN'
+         MARGIN1 = ROW1<1, 1, 9>
+         MARGIN2 = ROW2<1, 1, 9>
+         IF MARGIN1 < MARGIN2 THEN SWAP.ROWS = TRUE
+
+      CASE SORT.ORDER = 'PROFIT'
+         PROFIT1 = ROW1<1, 1, 8>
+         PROFIT2 = ROW2<1, 1, 8>
+         IF PROFIT1 < PROFIT2 THEN SWAP.ROWS = TRUE
+   END CASE
+   RETURN
+
+**************************************************************************
+* Limit Top Items
+**************************************************************************
+LIMIT.TOP.ITEMS:
+   IF TOP.N.ITEMS <= 0 THEN RETURN
+   IF REPORT.DATA = '' THEN RETURN
+
+   ROW.COUNT = DCOUNT(REPORT.DATA, VM)
+   IF ROW.COUNT <= TOP.N.ITEMS THEN RETURN
+
+   * Keep only top N items
+   NEW.DATA = ''
+   FOR I = 1 TO TOP.N.ITEMS
+      IF NEW.DATA = '' THEN
+         NEW.DATA = REPORT.DATA<1, I>
+      END ELSE
+         NEW.DATA := VM : REPORT.DATA<1, I>
+      END
+   NEXT I
+
+   REPORT.DATA = NEW.DATA
+   RETURN
+
+**************************************************************************
+* Generate Report Output
+**************************************************************************
+GENERATE.REPORT.OUTPUT:
+   REPORT.OUTPUT = ''
+
+   GOSUB BUILD.SALES.REPORT.HEADER
+   GOSUB BUILD.SALES.COLUMN.HEADERS
+   GOSUB BUILD.SALES.DETAIL.LINES
+   GOSUB BUILD.SALES.REPORT.FOOTER
+   RETURN
+
+**************************************************************************
+* Build Sales Report Header
+**************************************************************************
+BUILD.SALES.REPORT.HEADER:
+   SEPARATOR = CONVERT(' ', '=', SPACE(140))
+
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := '                    ' : REPORT.TITLE : CHAR(10)
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := CHAR(10)
+
+   REPORT.OUTPUT := 'Report Date: ' : OCONV(REPORT.DATE, 'D4/') : CHAR(10)
+   CALL UTILS.COMMON('FORMAT.TIME', REPORT.TIME, FMT.TIME)
+   REPORT.OUTPUT := 'Report Time: ' : FMT.TIME : CHAR(10)
+   REPORT.OUTPUT := 'Run By: ' : REPORT.USER : CHAR(10)
+   REPORT.OUTPUT := CHAR(10)
+
+   REPORT.OUTPUT := 'Period: ' : OCONV(START.DATE, 'D4/')
+   REPORT.OUTPUT := ' to ' : OCONV(END.DATE, 'D4/') : CHAR(10)
+
+   IF STORE.ID.FILTER # '' THEN
+      REPORT.OUTPUT := 'Store: ' : STORE.ID.FILTER : CHAR(10)
+   END
+
+   IF CATEGORY.FILTER # '' THEN
+      REPORT.OUTPUT := 'Category: ' : CATEGORY.FILTER : CHAR(10)
+   END
+
+   IF TOP.N.ITEMS > 0 THEN
+      REPORT.OUTPUT := 'Showing Top ' : TOP.N.ITEMS : ' Items by '
+      REPORT.OUTPUT := SORT.ORDER : CHAR(10)
+   END
+
+   REPORT.OUTPUT := CHAR(10) : SEPARATOR : CHAR(10) : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Build Sales Column Headers
+**************************************************************************
+BUILD.SALES.COLUMN.HEADERS:
+   HEADER.LINE = ''
+   HEADER.LINE := 'SKU' : SPACE(12)
+   HEADER.LINE := 'Description' : SPACE(24)
+   HEADER.LINE := 'Category' : SPACE(7)
+   HEADER.LINE := 'Qty Sold' : SPACE(2)
+   HEADER.LINE := 'Revenue' : SPACE(5)
+   HEADER.LINE := 'Cost' : SPACE(7)
+   HEADER.LINE := 'Profit' : SPACE(6)
+   HEADER.LINE := 'Margin%' : SPACE(2)
+   HEADER.LINE := 'Avg Price' : SPACE(2)
+   HEADER.LINE := 'Trans'
+
+   REPORT.OUTPUT := HEADER.LINE : CHAR(10)
+
+   UNDERLINE = CONVERT(' ', '-', SPACE(140))
+   REPORT.OUTPUT := UNDERLINE : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Build Sales Detail Lines
+**************************************************************************
+BUILD.SALES.DETAIL.LINES:
+   IF REPORT.DATA = '' THEN RETURN
+
+   ROW.COUNT = DCOUNT(REPORT.DATA, VM)
+
+   FOR I = 1 TO ROW.COUNT
+      DATA.ROW = REPORT.DATA<1, I>
+
+      ITEM.SKU = DATA.ROW<1, 1, 2>
+      ITEM.DESC = DATA.ROW<1, 1, 3>
+      ITEM.CATEGORY = DATA.ROW<1, 1, 4>
+      QTY.SOLD = DATA.ROW<1, 1, 5>
+      REVENUE.TOTAL = DATA.ROW<1, 1, 6>
+      COST.TOTAL = DATA.ROW<1, 1, 7>
+      PROFIT.TOTAL = DATA.ROW<1, 1, 8>
+      MARGIN.PCT = DATA.ROW<1, 1, 9>
+      AVG.PRICE = DATA.ROW<1, 1, 10>
+      TRANS.COUNT = DATA.ROW<1, 1, 11>
+
+      * Format data
+      SKU.STR = ITEM.SKU[1,15]
+      DESC.STR = ITEM.DESC[1,35]
+      CAT.STR = ITEM.CATEGORY[1,15]
+      QTY.STR = OCONV(QTY.SOLD, 'R(#####)')
+
+      CALL UTILS.COMMON('FORMAT.AMOUNT', REVENUE.TOTAL, FMT.REV)
+      CALL UTILS.COMMON('FORMAT.AMOUNT', COST.TOTAL, FMT.COST)
+      CALL UTILS.COMMON('FORMAT.AMOUNT', PROFIT.TOTAL, FMT.PROFIT)
+      CALL UTILS.COMMON('FORMAT.AMOUNT', AVG.PRICE, FMT.AVG)
+
+      MARGIN.STR = OCONV(MARGIN.PCT, 'MD2') : '%'
+      TRANS.STR = OCONV(TRANS.COUNT, 'R(####)')
+
+      * Build detail line
+      DETAIL.LINE = ''
+      DETAIL.LINE := SKU.STR : SPACE(16 - LEN(SKU.STR))
+      DETAIL.LINE := DESC.STR : SPACE(36 - LEN(DESC.STR))
+      DETAIL.LINE := CAT.STR : SPACE(16 - LEN(CAT.STR))
+      DETAIL.LINE := QTY.STR : SPACE(11 - LEN(QTY.STR))
+      DETAIL.LINE := FMT.REV : SPACE(12 - LEN(FMT.REV))
+      DETAIL.LINE := FMT.COST : SPACE(11 - LEN(FMT.COST))
+      DETAIL.LINE := FMT.PROFIT : SPACE(12 - LEN(FMT.PROFIT))
+      DETAIL.LINE := MARGIN.STR : SPACE(10 - LEN(MARGIN.STR))
+      DETAIL.LINE := FMT.AVG : SPACE(12 - LEN(FMT.AVG))
+      DETAIL.LINE := TRANS.STR
+
+      REPORT.OUTPUT := DETAIL.LINE : CHAR(10)
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Build Sales Report Footer
+**************************************************************************
+BUILD.SALES.REPORT.FOOTER:
+   SEPARATOR = CONVERT(' ', '=', SPACE(140))
+
+   REPORT.OUTPUT := CHAR(10) : SEPARATOR : CHAR(10)
+
+   * Format totals
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.REVENUE, FMT.TOTAL.REV)
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.COST, FMT.TOTAL.COST)
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.PROFIT, FMT.TOTAL.PROFIT)
+
+   * Calculate overall margin
+   IF TOTAL.REVENUE > 0 THEN
+      OVERALL.MARGIN = (TOTAL.PROFIT / TOTAL.REVENUE) * 100
+   END ELSE
+      OVERALL.MARGIN = 0
+   END
+
+   REPORT.OUTPUT := 'Total Items: ' : TOTAL.ITEMS : CHAR(10)
+   REPORT.OUTPUT := 'Total Quantity Sold: ' : TOTAL.QTY.SOLD : CHAR(10)
+   REPORT.OUTPUT := 'Total Revenue: $' : FMT.TOTAL.REV : CHAR(10)
+   REPORT.OUTPUT := 'Total Cost: $' : FMT.TOTAL.COST : CHAR(10)
+   REPORT.OUTPUT := 'Total Profit: $' : FMT.TOTAL.PROFIT : CHAR(10)
+   REPORT.OUTPUT := 'Overall Margin: ' : OCONV(OVERALL.MARGIN, 'MD2')
+   REPORT.OUTPUT := '%' : CHAR(10)
+   REPORT.OUTPUT := 'Total Transactions: ' : TOTAL.TRANSACTIONS : CHAR(10)
+
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := 'End of Report' : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Output Report
+**************************************************************************
+OUTPUT.REPORT:
+   BEGIN CASE
+      CASE OUTPUT.TYPE = 'SCREEN'
+         CRT REPORT.OUTPUT
+
+      CASE OUTPUT.TYPE = 'PRINT'
+         PRINTER ON
+         PRINT REPORT.OUTPUT
+         PRINTER OFF
+
+      CASE OUTPUT.TYPE = 'FILE'
+         GOSUB OUTPUT.SALES.TO.FILE
+
+      CASE OUTPUT.TYPE = 'EMAIL'
+         GOSUB OUTPUT.SALES.TO.EMAIL
+
+      CASE 1
+         CRT REPORT.OUTPUT
+   END CASE
+   RETURN
+
+**************************************************************************
+* Output Sales to File
+**************************************************************************
+OUTPUT.SALES.TO.FILE:
+   OPEN 'REPORTS' TO F.REPORTS ELSE
+      EXECUTE 'CREATE.FILE REPORTS 1 101'
+      OPEN 'REPORTS' TO F.REPORTS ELSE RETURN
+   END
+
+   REPORT.ID = 'SALES.BY.ITEM*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   WRITE REPORT.OUTPUT TO F.REPORTS, REPORT.ID
+
+   CRT 'Report saved: ' : REPORT.ID
+   RETURN
+
+**************************************************************************
+* Output Sales to Email
+**************************************************************************
+OUTPUT.SALES.TO.EMAIL:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   EMAIL.ID = 'RPT.SALES.ITEM*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'sales@company.com'
+   EMAIL.REC<2> = 'Sales by Item Report - ' : OCONV(SYSTEM.DATE, 'D4/')
+   EMAIL.REC<3> = REPORT.OUTPUT
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

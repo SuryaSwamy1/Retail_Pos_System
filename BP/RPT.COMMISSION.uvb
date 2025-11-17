@@ -1,0 +1,392 @@
+SUBROUTINE RPT.COMMISSION(START.DATE, END.DATE, DEPARTMENT, REPORT.REC, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: RPT.COMMISSION
+* Purpose: Generate Employee Commission Report
+* Parameters:
+*   START.DATE (IN) - Start date for report
+*   END.DATE (IN) - End date for report
+*   DEPARTMENT (IN) - Department filter (optional, '' = all)
+*   REPORT.REC (OUT) - Generated report
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+REPORT.REC = ''
+
+* Validate dates
+IF START.DATE = '' THEN START.DATE = SYSTEM.DATE - 30
+IF END.DATE = '' THEN END.DATE = SYSTEM.DATE
+
+IF END.DATE < START.DATE THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'End date cannot be before start date'
+   RETURN
+END
+
+* Initialize report
+GOSUB INITIALIZE.REPORT
+
+* Gather commission data
+GOSUB GATHER.COMMISSION.DATA
+
+* Calculate commissions
+GOSUB CALCULATE.COMMISSIONS
+
+* Sort results
+GOSUB SORT.RESULTS
+
+* Generate report
+GOSUB GENERATE.REPORT
+
+RETURN
+
+**************************************************************************
+* Initialize Report
+**************************************************************************
+INITIALIZE.REPORT:
+   * Initialize commission tracking array
+   EMP.LIST = ''
+   EMP.SALES = ''
+   EMP.COMMISSIONS = ''
+   EMP.TIER.BONUSES = ''
+   EMP.TOTAL.COMP = ''
+
+   TOTAL.SALES = 0
+   TOTAL.COMMISSIONS = 0
+   TOTAL.BONUSES = 0
+   TOTAL.COMPENSATION = 0
+   RETURN
+
+**************************************************************************
+* Gather Commission Data
+**************************************************************************
+GATHER.COMMISSION.DATA:
+   * Select transactions in date range
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE <= "' : END.DATE : '"'
+   SELECT.CMD := ' AND WITH STATUS = "COMPLETED"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Get cashier/salesperson
+      CASHIER.ID = TRANS.REC<CASHIER.ID>
+      IF CASHIER.ID = '' THEN CONTINUE
+
+      * Check department filter
+      IF DEPARTMENT # '' THEN
+         READ EMP.REC FROM F.EMPLOYEES, CASHIER.ID ELSE CONTINUE
+
+         EMP.DEPT = EMP.REC<EMP.DEPARTMENT>
+         IF EMP.DEPT # DEPARTMENT THEN CONTINUE
+      END
+
+      * Get transaction total
+      TRANS.TOTAL = TRANS.REC<TOTAL>
+      IF TRANS.TOTAL = '' THEN TRANS.TOTAL = 0
+
+      * Add to employee sales
+      LOCATE CASHIER.ID IN EMP.LIST<1> USING VM SETTING POS ELSE
+         * Add new employee
+         EMP.LIST<1, -1> = CASHIER.ID
+         EMP.SALES<1, -1> = TRANS.TOTAL
+      END ELSE
+         * Update existing employee
+         CURRENT.SALES = EMP.SALES<1, POS>
+         IF CURRENT.SALES = '' THEN CURRENT.SALES = 0
+         EMP.SALES<1, POS> = CURRENT.SALES + TRANS.TOTAL
+      END
+
+      TOTAL.SALES += TRANS.TOTAL
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Calculate Commissions
+**************************************************************************
+CALCULATE.COMMISSIONS:
+   IF EMP.LIST = '' THEN RETURN
+
+   EMP.COUNT = DCOUNT(EMP.LIST, VM)
+
+   FOR I = 1 TO EMP.COUNT
+      EMP.ID = EMP.LIST<1, I>
+      SALES.AMT = EMP.SALES<1, I>
+      IF SALES.AMT = '' THEN SALES.AMT = 0
+
+      * Read employee record for commission rate
+      READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+         COMM.RATE = 0
+         TIER.BONUS = 0
+         CONTINUE
+      END
+
+      * Get commission rate
+      COMM.RATE = EMP.REC<COMMISSION.RATE>
+      IF COMM.RATE = '' THEN COMM.RATE = 0
+
+      * Calculate base commission
+      BASE.COMMISSION = SALES.AMT * (COMM.RATE / 100)
+
+      * Calculate tier bonus based on sales volume
+      GOSUB CALCULATE.TIER.BONUS
+
+      * Total compensation
+      TOTAL.COMP = BASE.COMMISSION + TIER.BONUS
+
+      * Store results
+      EMP.COMMISSIONS<1, I> = BASE.COMMISSION
+      EMP.TIER.BONUSES<1, I> = TIER.BONUS
+      EMP.TOTAL.COMP<1, I> = TOTAL.COMP
+
+      * Add to totals
+      TOTAL.COMMISSIONS += BASE.COMMISSION
+      TOTAL.BONUSES += TIER.BONUS
+      TOTAL.COMPENSATION += TOTAL.COMP
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Calculate Tier Bonus
+**************************************************************************
+CALCULATE.TIER.BONUS:
+   TIER.BONUS = 0
+
+   * Tier bonuses based on sales volume
+   * < $5,000 = 0%
+   * $5,000 - $10,000 = 0.5%
+   * $10,000 - $25,000 = 1%
+   * $25,000 - $50,000 = 1.5%
+   * > $50,000 = 2%
+
+   BEGIN CASE
+      CASE SALES.AMT >= 50000
+         TIER.BONUS = SALES.AMT * 0.02
+
+      CASE SALES.AMT >= 25000
+         TIER.BONUS = SALES.AMT * 0.015
+
+      CASE SALES.AMT >= 10000
+         TIER.BONUS = SALES.AMT * 0.01
+
+      CASE SALES.AMT >= 5000
+         TIER.BONUS = SALES.AMT * 0.005
+
+      CASE 1
+         TIER.BONUS = 0
+   END CASE
+   RETURN
+
+**************************************************************************
+* Sort Results
+**************************************************************************
+SORT.RESULTS:
+   * Sort by total compensation (descending)
+   IF EMP.LIST = '' THEN RETURN
+
+   EMP.COUNT = DCOUNT(EMP.LIST, VM)
+
+   * Simple bubble sort
+   FOR I = 1 TO EMP.COUNT - 1
+      FOR J = I + 1 TO EMP.COUNT
+         COMP.I = EMP.TOTAL.COMP<1, I>
+         COMP.J = EMP.TOTAL.COMP<1, J>
+
+         IF COMP.I = '' THEN COMP.I = 0
+         IF COMP.J = '' THEN COMP.J = 0
+
+         IF COMP.J > COMP.I THEN
+            * Swap all arrays
+            TEMP = EMP.LIST<1, I>
+            EMP.LIST<1, I> = EMP.LIST<1, J>
+            EMP.LIST<1, J> = TEMP
+
+            TEMP = EMP.SALES<1, I>
+            EMP.SALES<1, I> = EMP.SALES<1, J>
+            EMP.SALES<1, J> = TEMP
+
+            TEMP = EMP.COMMISSIONS<1, I>
+            EMP.COMMISSIONS<1, I> = EMP.COMMISSIONS<1, J>
+            EMP.COMMISSIONS<1, J> = TEMP
+
+            TEMP = EMP.TIER.BONUSES<1, I>
+            EMP.TIER.BONUSES<1, I> = EMP.TIER.BONUSES<1, J>
+            EMP.TIER.BONUSES<1, J> = TEMP
+
+            TEMP = EMP.TOTAL.COMP<1, I>
+            EMP.TOTAL.COMP<1, I> = EMP.TOTAL.COMP<1, J>
+            EMP.TOTAL.COMP<1, J> = TEMP
+         END
+      NEXT J
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Generate Report
+**************************************************************************
+GENERATE.REPORT:
+   REPORT.REC = ''
+
+   * Header
+   REPORT.REC<1> = '========================================='
+   REPORT.REC<2> = '        EMPLOYEE COMMISSION REPORT       '
+   REPORT.REC<3> = '========================================='
+   REPORT.REC<4> = ''
+   REPORT.REC<5> = 'Report Period: ' : OCONV(START.DATE, 'D4/') : ' to ' : OCONV(END.DATE, 'D4/')
+   IF DEPARTMENT # '' THEN
+      REPORT.REC<6> = 'Department: ' : DEPARTMENT
+   END ELSE
+      REPORT.REC<6> = 'Department: All'
+   END
+   REPORT.REC<7> = 'Generated: ' : OCONV(SYSTEM.DATE, 'D4/') : ' ' : OCONV(SYSTEM.TIME, 'MTS')
+   REPORT.REC<8> = ''
+   REPORT.REC<9> = '-----------------------------------------'
+   REPORT.REC<10> = 'SUMMARY'
+   REPORT.REC<11> = '-----------------------------------------'
+   REPORT.REC<12> = 'Total Sales: $' : TOTAL.SALES
+   REPORT.REC<13> = 'Total Base Commissions: $' : TOTAL.COMMISSIONS
+   REPORT.REC<14> = 'Total Tier Bonuses: $' : TOTAL.BONUSES
+   REPORT.REC<15> = 'Total Compensation: $' : TOTAL.COMPENSATION
+   REPORT.REC<16> = ''
+   REPORT.REC<17> = '-----------------------------------------'
+   REPORT.REC<18> = 'EMPLOYEE DETAILS'
+   REPORT.REC<19> = '-----------------------------------------'
+
+   LINE.NUM = 20
+
+   IF EMP.LIST = '' THEN
+      REPORT.REC<LINE.NUM> = 'No commission data found for this period'
+      RETURN
+   END
+
+   EMP.COUNT = DCOUNT(EMP.LIST, VM)
+
+   FOR I = 1 TO EMP.COUNT
+      EMP.ID = EMP.LIST<1, I>
+      SALES.AMT = EMP.SALES<1, I>
+      COMM.AMT = EMP.COMMISSIONS<1, I>
+      BONUS.AMT = EMP.TIER.BONUSES<1, I>
+      TOTAL.AMT = EMP.TOTAL.COMP<1, I>
+
+      * Get employee name
+      READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+         EMP.NAME = 'Unknown'
+         EMP.DEPT = ''
+         COMM.RATE = 0
+      END
+      EMP.NAME = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+      EMP.DEPT = EMP.REC<EMP.DEPARTMENT>
+      COMM.RATE = EMP.REC<COMMISSION.RATE>
+      IF COMM.RATE = '' THEN COMM.RATE = 0
+
+      * Format output
+      REPORT.REC<LINE.NUM> = ''
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = 'Employee: ' : EMP.NAME : ' (' : EMP.ID : ')'
+      LINE.NUM += 1
+
+      IF EMP.DEPT # '' THEN
+         REPORT.REC<LINE.NUM> = '  Department: ' : EMP.DEPT
+         LINE.NUM += 1
+      END
+
+      REPORT.REC<LINE.NUM> = '  Commission Rate: ' : COMM.RATE : '%'
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  Total Sales: $' : SALES.AMT
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  Base Commission: $' : COMM.AMT
+      LINE.NUM += 1
+
+      IF BONUS.AMT > 0 THEN
+         REPORT.REC<LINE.NUM> = '  Tier Bonus: $' : BONUS.AMT
+         LINE.NUM += 1
+      END
+
+      REPORT.REC<LINE.NUM> = '  Total Compensation: $' : TOTAL.AMT
+      LINE.NUM += 1
+
+      * Calculate statistics
+      IF SALES.AMT > 0 THEN
+         COMP.PCT = (TOTAL.AMT / SALES.AMT) * 100
+         REPORT.REC<LINE.NUM> = '  Effective Rate: ' : COMP.PCT : '%'
+         LINE.NUM += 1
+      END
+
+      REPORT.REC<LINE.NUM> = '  -----------------------------------------'
+      LINE.NUM += 1
+   NEXT I
+
+   REPORT.REC<LINE.NUM> = ''
+   LINE.NUM += 1
+
+   * Additional statistics
+   REPORT.REC<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = 'STATISTICS'
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+
+   * Average sales per employee
+   AVG.SALES = TOTAL.SALES / EMP.COUNT
+   REPORT.REC<LINE.NUM> = 'Average Sales per Employee: $' : AVG.SALES
+   LINE.NUM += 1
+
+   * Average commission per employee
+   AVG.COMM = TOTAL.COMMISSIONS / EMP.COUNT
+   REPORT.REC<LINE.NUM> = 'Average Commission per Employee: $' : AVG.COMM
+   LINE.NUM += 1
+
+   * Average total compensation per employee
+   AVG.COMP = TOTAL.COMPENSATION / EMP.COUNT
+   REPORT.REC<LINE.NUM> = 'Average Total Compensation per Employee: $' : AVG.COMP
+   LINE.NUM += 1
+
+   * Overall commission rate
+   IF TOTAL.SALES > 0 THEN
+      OVERALL.RATE = (TOTAL.COMPENSATION / TOTAL.SALES) * 100
+      REPORT.REC<LINE.NUM> = 'Overall Compensation Rate: ' : OVERALL.RATE : '%'
+      LINE.NUM += 1
+   END
+
+   * Top performer
+   IF EMP.LIST # '' THEN
+      TOP.EMP.ID = EMP.LIST<1, 1>
+      READ TOP.EMP.REC FROM F.EMPLOYEES, TOP.EMP.ID ELSE
+         TOP.EMP.NAME = 'Unknown'
+      END
+      TOP.EMP.NAME = TOP.EMP.REC<FIRST.NAME> : ' ' : TOP.EMP.REC<LAST.NAME>
+      TOP.SALES = EMP.SALES<1, 1>
+      TOP.COMP = EMP.TOTAL.COMP<1, 1>
+
+      REPORT.REC<LINE.NUM> = ''
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = 'Top Performer: ' : TOP.EMP.NAME
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '  Sales: $' : TOP.SALES
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '  Total Compensation: $' : TOP.COMP
+      LINE.NUM += 1
+   END
+
+   REPORT.REC<LINE.NUM> = ''
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '           END OF REPORT                 '
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '========================================='
+
+   RETURN
+
+END

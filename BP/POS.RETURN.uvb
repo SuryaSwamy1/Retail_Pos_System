@@ -1,0 +1,588 @@
+SUBROUTINE POS.RETURN(ORIGINAL.TRANS.ID, RETURN.ITEMS, RETURN.TRANS.ID, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: POS.RETURN
+* Purpose: Process Product Return Transaction
+* Parameters:
+*   ORIGINAL.TRANS.ID (IN) - Original transaction ID
+*   RETURN.ITEMS (IN) - Items being returned:
+*                       <1,n> = Item ID
+*                       <2,n> = Quantity
+*                       <3,n> = Reason code
+*   RETURN.TRANS.ID (OUT) - Generated return transaction ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+RETURN.TRANS.ID = ''
+
+* Validate original transaction
+GOSUB VALIDATE.ORIGINAL.TRANSACTION
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Validate return items
+GOSUB VALIDATE.RETURN.ITEMS
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check return policy
+GOSUB CHECK.RETURN.POLICY
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Calculate return total
+GOSUB CALCULATE.RETURN.TOTAL
+
+* Create return transaction
+GOSUB CREATE.RETURN.TRANSACTION
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Process refund
+GOSUB PROCESS.REFUND
+
+* Update inventory
+GOSUB UPDATE.INVENTORY.RETURN
+
+* Reverse loyalty points
+GOSUB REVERSE.LOYALTY.POINTS
+
+* Update customer history
+GOSUB UPDATE.CUSTOMER.HISTORY
+
+* Update statistics
+GOSUB UPDATE.RETURN.STATISTICS
+
+* Generate receipt
+GOSUB GENERATE.RETURN.RECEIPT
+
+LOG.MSG = 'Return processed: ' : RETURN.TRANS.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate Original Transaction
+**************************************************************************
+VALIDATE.ORIGINAL.TRANSACTION:
+   IF ORIGINAL.TRANS.ID = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Original transaction ID is required'
+      RETURN
+   END
+
+   READ ORIGINAL.TRANS FROM F.POS.TRANS, ORIGINAL.TRANS.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Original transaction not found'
+      RETURN
+   END
+
+   * Check if transaction has been returned already
+   IF ORIGINAL.TRANS<RETURN.FLAG> = 'Y' THEN
+      * Check for partial vs full return
+      RETURN.AMT = ORIGINAL.TRANS<RETURN.AMOUNT>
+      TRANS.TOTAL = ORIGINAL.TRANS<TOTAL>
+
+      IF RETURN.AMT >= TRANS.TOTAL THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Transaction has already been fully returned'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Validate Return Items
+**************************************************************************
+VALIDATE.RETURN.ITEMS:
+   IF RETURN.ITEMS = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'No return items specified'
+      RETURN
+   END
+
+   ITEM.COUNT = DCOUNT(RETURN.ITEMS<1>, VM)
+   ORIGINAL.ITEMS = ORIGINAL.TRANS<ITEM.IDS>
+   ORIGINAL.QTYS = ORIGINAL.TRANS<ITEM.QTYS>
+
+   FOR I = 1 TO ITEM.COUNT
+      RETURN.ITEM.ID = RETURN.ITEMS<1, I>
+      RETURN.QTY = RETURN.ITEMS<2, I>
+
+      * Verify item was in original transaction
+      LOCATE RETURN.ITEM.ID IN ORIGINAL.ITEMS<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Item ' : RETURN.ITEM.ID : ' not in original transaction'
+         RETURN
+      END
+
+      * Check quantity
+      ORIGINAL.QTY = ORIGINAL.QTYS<1, POS>
+      IF RETURN.QTY > ORIGINAL.QTY THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Return quantity exceeds original quantity for item ' : RETURN.ITEM.ID
+         RETURN
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Check Return Policy
+**************************************************************************
+CHECK.RETURN.POLICY:
+   * Check return window (default 30 days)
+   TRANS.DATE = ORIGINAL.TRANS<TRANS.DATE>
+   DAYS.SINCE = SYSTEM.DATE - TRANS.DATE
+
+   RETURN.WINDOW = 30  ; Days
+
+   IF DAYS.SINCE > RETURN.WINDOW THEN
+      * Check for manager override
+      IF USER.LEVEL < 8 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Return window expired (30 days). Manager approval required.'
+         RETURN
+      END
+   END
+
+   * Check for non-returnable items
+   ITEM.COUNT = DCOUNT(RETURN.ITEMS<1>, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = RETURN.ITEMS<1, I>
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Check returnable flag
+      IF ITEM.REC<RETURNABLE> = 'N' THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Item ' : ITEM.ID : ' is not returnable'
+         RETURN
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Calculate Return Total
+**************************************************************************
+CALCULATE.RETURN.TOTAL:
+   RETURN.SUBTOTAL = 0
+   RETURN.TAX = 0
+   RETURN.TOTAL = 0
+
+   ITEM.COUNT = DCOUNT(RETURN.ITEMS<1>, VM)
+   ORIGINAL.ITEMS = ORIGINAL.TRANS<ITEM.IDS>
+   ORIGINAL.PRICES = ORIGINAL.TRANS<ITEM.PRICES>
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = RETURN.ITEMS<1, I>
+      RETURN.QTY = RETURN.ITEMS<2, I>
+
+      * Find item in original transaction
+      LOCATE ITEM.ID IN ORIGINAL.ITEMS<1> USING VM SETTING POS THEN
+         ITEM.PRICE = ORIGINAL.PRICES<1, POS>
+
+         ITEM.TOTAL = ITEM.PRICE * RETURN.QTY
+         RETURN.SUBTOTAL += ITEM.TOTAL
+      END
+   NEXT I
+
+   * Calculate proportional tax refund
+   ORIGINAL.SUBTOTAL = ORIGINAL.TRANS<SUBTOTAL>
+   ORIGINAL.TAX = ORIGINAL.TRANS<TAX>
+
+   IF ORIGINAL.SUBTOTAL > 0 THEN
+      TAX.RATE = ORIGINAL.TAX / ORIGINAL.SUBTOTAL
+      RETURN.TAX = RETURN.SUBTOTAL * TAX.RATE
+   END
+
+   RETURN.TOTAL = RETURN.SUBTOTAL + RETURN.TAX
+   RETURN
+
+**************************************************************************
+* Create Return Transaction
+**************************************************************************
+CREATE.RETURN.TRANSACTION:
+   * Generate return transaction ID
+   TRANS.ID.BASE = 'RTN-' : OCONV(SYSTEM.DATE, 'D4-YMD')
+   TRANS.ID.BASE = CONVERT('-', '', TRANS.ID.BASE)
+
+   SEQ.KEY = 'TRANS-SEQ*' : SYSTEM.DATE
+
+   OPEN 'TRANS.SEQUENCES' TO F.TRANS.SEQ ELSE
+      EXECUTE 'CREATE.FILE TRANS.SEQUENCES 1 1'
+      OPEN 'TRANS.SEQUENCES' TO F.TRANS.SEQ ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open sequence file'
+         RETURN
+      END
+   END
+
+   READU SEQ.REC FROM F.TRANS.SEQ, SEQ.KEY ELSE
+      SEQ.NUM = 1
+   END
+   SEQ.NUM = SEQ.REC<1>
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.TRANS.SEQ, SEQ.KEY
+
+   SEQ.STR = OCONV(SEQ.NUM, 'R(0)#6')
+   RETURN.TRANS.ID = TRANS.ID.BASE : SEQ.STR
+
+   * Create return transaction record
+   RETURN.TRANS = ''
+   RETURN.TRANS<TRANS.ID> = RETURN.TRANS.ID
+   RETURN.TRANS<TRANS.TYPE> = 'RETURN'
+   RETURN.TRANS<TRANS.DATE> = SYSTEM.DATE
+   RETURN.TRANS<TRANS.TIME> = SYSTEM.TIME
+   RETURN.TRANS<STORE.ID> = ORIGINAL.TRANS<STORE.ID>
+   RETURN.TRANS<REGISTER.ID> = ORIGINAL.TRANS<REGISTER.ID>
+   RETURN.TRANS<CASHIER.ID> = USER.ID
+   RETURN.TRANS<CUSTOMER.ID> = ORIGINAL.TRANS<CUSTOMER.ID>
+
+   * Link to original transaction
+   RETURN.TRANS<ORIGINAL.TRANS.ID> = ORIGINAL.TRANS.ID
+
+   * Copy return items
+   ITEM.COUNT = DCOUNT(RETURN.ITEMS<1>, VM)
+   FOR I = 1 TO ITEM.COUNT
+      RETURN.TRANS<ITEM.IDS, I> = RETURN.ITEMS<1, I>
+      RETURN.TRANS<ITEM.QTYS, I> = RETURN.ITEMS<2, I>
+      RETURN.TRANS<RETURN.REASONS, I> = RETURN.ITEMS<3, I>
+
+      * Get prices from original
+      ITEM.ID = RETURN.ITEMS<1, I>
+      LOCATE ITEM.ID IN ORIGINAL.ITEMS<1> USING VM SETTING POS THEN
+         RETURN.TRANS<ITEM.PRICES, I> = ORIGINAL.PRICES<1, POS>
+      END
+   NEXT I
+
+   * Totals (negative for return)
+   RETURN.TRANS<SUBTOTAL> = -RETURN.SUBTOTAL
+   RETURN.TRANS<TAX> = -RETURN.TAX
+   RETURN.TRANS<TOTAL> = -RETURN.TOTAL
+
+   RETURN.TRANS<STATUS> = 'COMPLETED'
+
+   WRITE RETURN.TRANS TO F.POS.TRANS, RETURN.TRANS.ID ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Failed to write return transaction'
+      RETURN
+   END
+
+   * Update original transaction
+   READU ORIGINAL.TRANS FROM F.POS.TRANS, ORIGINAL.TRANS.ID ELSE
+      RETURN
+   END
+
+   ORIGINAL.TRANS<RETURN.FLAG> = 'Y'
+
+   PREV.RETURN.AMT = ORIGINAL.TRANS<RETURN.AMOUNT>
+   IF PREV.RETURN.AMT = '' THEN PREV.RETURN.AMT = 0
+
+   ORIGINAL.TRANS<RETURN.AMOUNT> = PREV.RETURN.AMT + RETURN.TOTAL
+
+   WRITE ORIGINAL.TRANS TO F.POS.TRANS, ORIGINAL.TRANS.ID
+   RETURN
+
+**************************************************************************
+* Process Refund
+**************************************************************************
+PROCESS.REFUND:
+   * Determine refund method (same as original payment)
+   PAYMENT.TYPE = ORIGINAL.TRANS<PAYMENT.TYPE>
+
+   REFUND.AMT = RETURN.TOTAL
+
+   BEGIN CASE
+      CASE PAYMENT.TYPE = 'CASH'
+         * Cash refund
+         REFUND.METHOD = 'CASH'
+
+      CASE PAYMENT.TYPE = 'CREDIT' OR PAYMENT.TYPE = 'DEBIT'
+         * Credit back to card
+         REFUND.METHOD = 'CREDIT.CARD'
+         CARD.NUM = ORIGINAL.TRANS<CARD.NUMBER>
+
+         * Process card refund (simulated)
+         GOSUB PROCESS.CARD.REFUND
+
+      CASE PAYMENT.TYPE = 'GIFT.CARD'
+         * Credit back to gift card
+         REFUND.METHOD = 'GIFT.CARD'
+         GC.NUM = ORIGINAL.TRANS<GIFT.CARD.NUMBER>
+
+         GOSUB PROCESS.GC.REFUND
+
+      CASE 1
+         * Default to store credit
+         REFUND.METHOD = 'STORE.CREDIT'
+         GOSUB ISSUE.STORE.CREDIT
+   END CASE
+
+   RETURN.TRANS<REFUND.METHOD> = REFUND.METHOD
+   RETURN.TRANS<REFUND.AMOUNT> = REFUND.AMT
+   RETURN.TRANS<REFUND.DATE> = SYSTEM.DATE
+
+   WRITE RETURN.TRANS TO F.POS.TRANS, RETURN.TRANS.ID
+   RETURN
+
+**************************************************************************
+* Process Card Refund
+**************************************************************************
+PROCESS.CARD.REFUND:
+   * Simulate credit card refund
+   * In production, integrate with payment processor
+
+   REFUND.STATUS = 'APPROVED'
+   REFUND.AUTH.CODE = 'RTN' : RND(999999)
+
+   RETURN.TRANS<REFUND.STATUS> = REFUND.STATUS
+   RETURN.TRANS<REFUND.AUTH.CODE> = REFUND.AUTH.CODE
+   RETURN
+
+**************************************************************************
+* Process GC Refund
+**************************************************************************
+PROCESS.GC.REFUND:
+   OPEN 'GIFT.CARDS' TO F.GIFT.CARDS ELSE RETURN
+
+   READU GC.REC FROM F.GIFT.CARDS, GC.NUM ELSE RETURN
+
+   CURRENT.BAL = GC.REC<3>
+   IF CURRENT.BAL = '' THEN CURRENT.BAL = 0
+
+   GC.REC<3> = CURRENT.BAL + REFUND.AMT
+
+   WRITE GC.REC TO F.GIFT.CARDS, GC.NUM
+   RETURN
+
+**************************************************************************
+* Issue Store Credit
+**************************************************************************
+ISSUE.STORE.CREDIT:
+   OPEN 'STORE.CREDITS' TO F.CREDITS ELSE
+      EXECUTE 'CREATE.FILE STORE.CREDITS 1 101'
+      OPEN 'STORE.CREDITS' TO F.CREDITS ELSE RETURN
+   END
+
+   CREDIT.ID = 'SC*' : RETURN.TRANS.ID
+   CREDIT.REC = ''
+   CREDIT.REC<1> = CREDIT.ID
+   CREDIT.REC<2> = ORIGINAL.TRANS<CUSTOMER.ID>
+   CREDIT.REC<3> = REFUND.AMT
+   CREDIT.REC<4> = REFUND.AMT  ; Balance
+   CREDIT.REC<5> = SYSTEM.DATE
+   CREDIT.REC<6> = SYSTEM.DATE + 365  ; Expires in 1 year
+   CREDIT.REC<7> = 'ACTIVE'
+
+   WRITE CREDIT.REC TO F.CREDITS, CREDIT.ID
+
+   RETURN.TRANS<STORE.CREDIT.ID> = CREDIT.ID
+   RETURN
+
+**************************************************************************
+* Update Inventory Return
+**************************************************************************
+UPDATE.INVENTORY.RETURN:
+   STORE.ID = RETURN.TRANS<STORE.ID>
+
+   * Find store index
+   STORE.INDEX = 0
+   GOSUB FIND.STORE.INDEX
+
+   IF STORE.INDEX = 0 THEN RETURN
+
+   ITEM.COUNT = DCOUNT(RETURN.ITEMS<1>, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = RETURN.ITEMS<1, I>
+      RETURN.QTY = RETURN.ITEMS<2, I>
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Add quantity back to inventory
+      CURRENT.QTY = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+      IF CURRENT.QTY = '' THEN CURRENT.QTY = 0
+
+      ITEM.REC<QTY.ON.HAND, STORE.INDEX> = CURRENT.QTY + RETURN.QTY
+
+      WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Find Store Index
+**************************************************************************
+FIND.STORE.INDEX:
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT ST.ID ELSE EXIT
+      CURRENT.INDEX += 1
+      IF ST.ID = STORE.ID THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Reverse Loyalty Points
+**************************************************************************
+REVERSE.LOYALTY.POINTS:
+   CUST.ID = ORIGINAL.TRANS<CUSTOMER.ID>
+   IF CUST.ID = '' THEN RETURN
+
+   READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+
+   LOYAL.ID = CUST.REC<LOYALTY.ID>
+   IF LOYAL.ID = '' THEN RETURN
+
+   * Calculate points to reverse (proportional)
+   ORIGINAL.POINTS = ORIGINAL.TRANS<LOYALTY.POINTS.EARNED>
+   IF ORIGINAL.POINTS = '' OR ORIGINAL.POINTS <= 0 THEN RETURN
+
+   ORIGINAL.TOTAL = ORIGINAL.TRANS<TOTAL>
+   IF ORIGINAL.TOTAL <= 0 THEN RETURN
+
+   POINTS.TO.REVERSE = INT((RETURN.TOTAL / ORIGINAL.TOTAL) * ORIGINAL.POINTS)
+
+   IF POINTS.TO.REVERSE > 0 THEN
+      * Deduct points
+      READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+
+      CURRENT.POINTS = CUST.REC<LOYALTY.POINTS>
+      IF CURRENT.POINTS = '' THEN CURRENT.POINTS = 0
+
+      CUST.REC<LOYALTY.POINTS> = CURRENT.POINTS - POINTS.TO.REVERSE
+      IF CUST.REC<LOYALTY.POINTS> < 0 THEN
+         CUST.REC<LOYALTY.POINTS> = 0
+      END
+
+      WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+
+      * Create loyalty transaction
+      GOSUB CREATE.LOYALTY.REVERSAL
+   END
+   RETURN
+
+**************************************************************************
+* Create Loyalty Reversal
+**************************************************************************
+CREATE.LOYALTY.REVERSAL:
+   OPEN 'LOYALTY.TRANS' TO F.LOYAL.TRANS ELSE RETURN
+
+   LT.ID = LOYAL.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME : '*REV'
+   LT.REC = ''
+   LT.REC<1> = LOYAL.ID
+   LT.REC<2> = CUST.ID
+   LT.REC<3> = SYSTEM.DATE
+   LT.REC<4> = SYSTEM.TIME
+   LT.REC<5> = 'REVERSAL'
+   LT.REC<6> = POINTS.TO.REVERSE
+   LT.REC<7> = RETURN.TRANS.ID
+   LT.REC<8> = 'RETURN'
+   LT.REC<9> = RETURN.TOTAL
+   LT.REC<14> = 'COMPLETED'
+
+   WRITE LT.REC TO F.LOYAL.TRANS, LT.ID
+   RETURN
+
+**************************************************************************
+* Update Customer History
+**************************************************************************
+UPDATE.CUSTOMER.HISTORY:
+   CUST.ID = ORIGINAL.TRANS<CUSTOMER.ID>
+   IF CUST.ID = '' THEN RETURN
+
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+
+   * Update return count
+   RETURN.COUNT = CUST.REC<RETURN.COUNT>
+   IF RETURN.COUNT = '' THEN RETURN.COUNT = 0
+
+   CUST.REC<RETURN.COUNT> = RETURN.COUNT + 1
+
+   * Update return amount
+   RETURN.AMT = CUST.REC<RETURN.AMOUNT>
+   IF RETURN.AMT = '' THEN RETURN.AMT = 0
+
+   CUST.REC<RETURN.AMOUNT> = RETURN.AMT + RETURN.TOTAL
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+   RETURN
+
+**************************************************************************
+* Update Return Statistics
+**************************************************************************
+UPDATE.RETURN.STATISTICS:
+   OPEN 'RETURN.STATS' TO F.RETURN.STATS ELSE
+      EXECUTE 'CREATE.FILE RETURN.STATS 1 101'
+      OPEN 'RETURN.STATS' TO F.RETURN.STATS ELSE RETURN
+   END
+
+   STAT.ID = OCONV(SYSTEM.DATE, 'D4-YM')
+
+   READU STAT.REC FROM F.RETURN.STATS, STAT.ID ELSE
+      STAT.REC = ''
+      STAT.REC<1> = STAT.ID
+      STAT.REC<2> = 0  ; Return count
+      STAT.REC<3> = 0  ; Return amount
+   END
+
+   COUNT = STAT.REC<2>
+   IF COUNT = '' THEN COUNT = 0
+   STAT.REC<2> = COUNT + 1
+
+   AMT = STAT.REC<3>
+   IF AMT = '' THEN AMT = 0
+   STAT.REC<3> = AMT + RETURN.TOTAL
+
+   WRITE STAT.REC TO F.RETURN.STATS, STAT.ID
+   RETURN
+
+**************************************************************************
+* Generate Return Receipt
+**************************************************************************
+GENERATE.RETURN.RECEIPT:
+   RECEIPT.TEXT = ''
+   RECEIPT.TEXT := '====== RETURN RECEIPT ======' : CHAR(10)
+   RECEIPT.TEXT := 'Return ID: ' : RETURN.TRANS.ID : CHAR(10)
+   RECEIPT.TEXT := 'Original Trans: ' : ORIGINAL.TRANS.ID : CHAR(10)
+   RECEIPT.TEXT := 'Date: ' : OCONV(SYSTEM.DATE, 'D4/') : CHAR(10)
+   RECEIPT.TEXT := CHAR(10)
+
+   ITEM.COUNT = DCOUNT(RETURN.ITEMS<1>, VM)
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = RETURN.ITEMS<1, I>
+      ITEM.QTY = RETURN.ITEMS<2, I>
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+         ITEM.DESC = ITEM.ID
+      END ELSE
+         ITEM.DESC = ITEM.REC<ITEM.DESCRIPTION>
+      END
+
+      RECEIPT.TEXT := ITEM.DESC[1,30] : CHAR(10)
+      RECEIPT.TEXT := '  Qty: ' : ITEM.QTY : CHAR(10)
+   NEXT I
+
+   RECEIPT.TEXT := CHAR(10)
+   CALL UTILS.COMMON('FORMAT.AMOUNT', RETURN.TOTAL, FMT.TOTAL)
+   RECEIPT.TEXT := 'REFUND AMOUNT: $' : FMT.TOTAL : CHAR(10)
+   RECEIPT.TEXT := 'Refund Method: ' : REFUND.METHOD : CHAR(10)
+   RECEIPT.TEXT := '============================' : CHAR(10)
+
+   * Store receipt
+   RETURN.TRANS<RECEIPT.TEXT> = RECEIPT.TEXT
+   WRITE RETURN.TRANS TO F.POS.TRANS, RETURN.TRANS.ID
+
+   * Print receipt
+   CRT RECEIPT.TEXT
+   RETURN
+
+END

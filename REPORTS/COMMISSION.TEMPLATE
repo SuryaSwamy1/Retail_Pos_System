@@ -1,0 +1,72 @@
+================================================================================
+                        RETAIL POS SYSTEM
+                      COMMISSION REPORT
+================================================================================
+
+Store ID: [STORE_ID]                           Period: [PERIOD]
+Store Name: [STORE_NAME]                       Report Date: [REPORT_DATE]
+
+--------------------------------------------------------------------------------
+COMMISSION SUMMARY
+--------------------------------------------------------------------------------
+Total Sales by Commission Employees:                    $[TOTAL_SALES]
+Total Commission Payable:                               $[TOTAL_COMM]
+Average Commission Rate:                                [AVG_RATE]%
+Number of Commission Employees:                         [EMP_COUNT]
+--------------------------------------------------------------------------------
+
+EMPLOYEE COMMISSION BREAKDOWN
+--------------------------------------------------------------------------------
+Employee ID  Name                Sales      Rate  Commission  Bonus   Total
+--------------------------------------------------------------------------------
+[EMP1]       [NAME1]             $[SAL1]    [RT1]% $[COM1]    $[BON1] $[TOT1]
+[EMP2]       [NAME2]             $[SAL2]    [RT2]% $[COM2]    $[BON2] $[TOT2]
+[EMP3]       [NAME3]             $[SAL3]    [RT3]% $[COM3]    $[BON3] $[TOT3]
+[EMP4]       [NAME4]             $[SAL4]    [RT4]% $[COM4]    $[BON4] $[TOT4]
+[EMP5]       [NAME5]             $[SAL5]    [RT5]% $[COM5]    $[BON5] $[TOT5]
+[EMP6]       [NAME6]             $[SAL6]    [RT6]% $[COM6]    $[BON6] $[TOT6]
+[EMP7]       [NAME7]             $[SAL7]    [RT7]% $[COM7]    $[BON7] $[TOT7]
+[EMP8]       [NAME8]             $[SAL8]    [RT8]% $[COM8]    $[BON8] $[TOT8]
+--------------------------------------------------------------------------------
+TOTALS:                          $[TOT_SAL] -      $[TOT_COM] $[TOT_BON] $[GRAND]
+--------------------------------------------------------------------------------
+
+TOP PERFORMERS
+--------------------------------------------------------------------------------
+Rank  Employee ID  Name                 Sales      Commission
+--------------------------------------------------------------------------------
+1     [EMP1]       [NAME1]              $[SAL1]    $[COM1]
+2     [EMP2]       [NAME2]              $[SAL2]    $[COM2]
+3     [EMP3]       [NAME3]              $[SAL3]    $[COM3]
+--------------------------------------------------------------------------------
+
+COMMISSION BY CATEGORY
+--------------------------------------------------------------------------------
+Employee      Electronics  Clothing  Footwear  Other    Total
+--------------------------------------------------------------------------------
+[NAME1]       $[E1]        $[C1]     $[F1]     $[O1]    $[T1]
+[NAME2]       $[E2]        $[C2]     $[F2]     $[O2]    $[T2]
+[NAME3]       $[E3]        $[C3]     $[F3]     $[O3]    $[T3]
+[NAME4]       $[E4]        $[C4]     $[F4]     $[O4]    $[T4]
+[NAME5]       $[E5]        $[C5]     $[F5]     $[O5]    $[T5]
+--------------------------------------------------------------------------------
+
+BONUS QUALIFICATIONS MET
+--------------------------------------------------------------------------------
+Employee ID  Name                 Bonus Type           Amount    Status
+--------------------------------------------------------------------------------
+[EMP1]       [NAME1]              Sales Target         $[AMT1]   EARNED
+[EMP2]       [NAME2]              Customer Satisfaction $[AMT2]   EARNED
+[EMP3]       [NAME3]              Perfect Attendance   $[AMT3]   EARNED
+--------------------------------------------------------------------------------
+
+COMMISSION ADJUSTMENTS
+--------------------------------------------------------------------------------
+Employee ID  Name                 Type        Amount    Reason
+--------------------------------------------------------------------------------
+[EMP1]       [NAME1]              DEDUCTION   $[AMT1]   Return Processing
+[EMP2]       [NAME2]              ADDITION    $[AMT2]   Manager Override
+--------------------------------------------------------------------------------
+
+Report Generated: [TIMESTAMP]
+================================================================================

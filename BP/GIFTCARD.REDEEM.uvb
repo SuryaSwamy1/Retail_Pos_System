@@ -1,0 +1,293 @@
+SUBROUTINE GIFTCARD.REDEEM(GC.NUMBER, REDEEM.AMOUNT, POS.TRANS.ID, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: GIFTCARD.REDEEM
+* Purpose: Redeem Gift Card for Payment
+* Parameters:
+*   GC.NUMBER (IN) - Gift card number
+*   REDEEM.AMOUNT (IN) - Amount to redeem
+*   POS.TRANS.ID (IN) - POS transaction ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate gift card number
+IF GC.NUMBER = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Gift card number is required'
+   RETURN
+END
+
+* Validate Luhn check digit
+CALL UTILS.COMMON('LUHN.VALIDATE', GC.NUMBER, VALID.FLAG)
+IF NOT(VALID.FLAG) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid gift card number'
+   RETURN
+END
+
+* Validate redemption amount
+IF REDEEM.AMOUNT = '' OR NOT(NUM(REDEEM.AMOUNT)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Redemption amount must be numeric'
+   RETURN
+END
+
+IF REDEEM.AMOUNT <= 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Redemption amount must be positive'
+   RETURN
+END
+
+* Open gift card file
+OPEN 'GIFT.CARDS' TO F.GIFT.CARDS ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Cannot open gift card file'
+   RETURN
+END
+
+* Read and lock gift card
+READU GC.REC FROM F.GIFT.CARDS, GC.NUMBER ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Gift card not found'
+   RETURN
+END
+
+* Check card status
+GOSUB CHECK.CARD.STATUS
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.GIFT.CARDS, GC.NUMBER
+   RETURN
+END
+
+* Check expiration
+GOSUB CHECK.EXPIRATION
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.GIFT.CARDS, GC.NUMBER
+   RETURN
+END
+
+* Check sufficient balance
+GOSUB CHECK.BALANCE
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.GIFT.CARDS, GC.NUMBER
+   RETURN
+END
+
+* Update gift card balance
+GOSUB UPDATE.CARD.BALANCE
+
+* Write updated card
+WRITE GC.REC TO F.GIFT.CARDS, GC.NUMBER
+
+* Create redemption transaction
+GOSUB CREATE.REDEMPTION.TRANSACTION
+
+* Create redemption audit
+GOSUB CREATE.REDEMPTION.AUDIT
+
+* Update statistics
+GOSUB UPDATE.REDEMPTION.STATISTICS
+
+LOG.MSG = 'Gift card redeemed: ' : GC.NUMBER : ' - Amount: $' : REDEEM.AMOUNT
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Check Card Status
+**************************************************************************
+CHECK.CARD.STATUS:
+   CARD.STATUS = GC.REC<4>
+
+   BEGIN CASE
+      CASE CARD.STATUS = 'ACTIVE'
+         * OK to redeem
+         RETURN
+
+      CASE CARD.STATUS = 'SUSPENDED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Gift card is suspended'
+         RETURN
+
+      CASE CARD.STATUS = 'EXPIRED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Gift card has expired'
+         RETURN
+
+      CASE CARD.STATUS = 'DEPLETED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Gift card balance is zero'
+         RETURN
+
+      CASE 1
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid gift card status'
+         RETURN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Check Expiration
+**************************************************************************
+CHECK.EXPIRATION:
+   EXPIRATION.DATE = GC.REC<10>
+
+   IF EXPIRATION.DATE = '' THEN RETURN
+
+   IF SYSTEM.DATE > EXPIRATION.DATE THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Gift card has expired on ' : OCONV(EXPIRATION.DATE, 'D4/')
+
+      * Update status to expired
+      GC.REC<4> = 'EXPIRED'
+      WRITE GC.REC TO F.GIFT.CARDS, GC.NUMBER
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Check Balance
+**************************************************************************
+CHECK.BALANCE:
+   CURRENT.BALANCE = GC.REC<3>
+   IF CURRENT.BALANCE = '' THEN CURRENT.BALANCE = 0
+
+   IF REDEEM.AMOUNT > CURRENT.BALANCE THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Insufficient balance. Available: $' : CURRENT.BALANCE
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Update Card Balance
+**************************************************************************
+UPDATE.CARD.BALANCE:
+   * Get current balance
+   CURRENT.BALANCE = GC.REC<3>
+   IF CURRENT.BALANCE = '' THEN CURRENT.BALANCE = 0
+
+   PREVIOUS.BALANCE = CURRENT.BALANCE
+
+   * Update balance
+   NEW.BALANCE = CURRENT.BALANCE - REDEEM.AMOUNT
+   GC.REC<3> = NEW.BALANCE
+
+   * Update status if depleted
+   IF NEW.BALANCE <= 0 THEN
+      GC.REC<4> = 'DEPLETED'
+   END
+
+   * Update last transaction info
+   GC.REC<11> = SYSTEM.DATE
+   GC.REC<12> = 'REDEMPTION'
+
+   * Update redemption statistics
+   TOTAL.REDEMPTIONS = GC.REC<14>
+   IF TOTAL.REDEMPTIONS = '' THEN TOTAL.REDEMPTIONS = 0
+   GC.REC<14> = TOTAL.REDEMPTIONS + 1
+
+   TOTAL.REDEEM.AMT = GC.REC<16>
+   IF TOTAL.REDEEM.AMT = '' THEN TOTAL.REDEEM.AMT = 0
+   GC.REC<16> = TOTAL.REDEEM.AMT + REDEEM.AMOUNT
+
+   * Update modified fields
+   GC.REC<19> = USER.ID
+   GC.REC<20> = SYSTEM.DATE
+   RETURN
+
+**************************************************************************
+* Create Redemption Transaction
+**************************************************************************
+CREATE.REDEMPTION.TRANSACTION:
+   OPEN 'GIFTCARD.TRANS' TO F.GC.TRANS ELSE
+      EXECUTE 'CREATE.FILE GIFTCARD.TRANS 1 101'
+      OPEN 'GIFTCARD.TRANS' TO F.GC.TRANS ELSE RETURN
+   END
+
+   TRANS.ID = GC.NUMBER : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME : '*REDEEM'
+
+   TRANS.REC = ''
+   TRANS.REC<1> = GC.NUMBER
+   TRANS.REC<2> = 'REDEMPTION'
+   TRANS.REC<3> = SYSTEM.DATE
+   TRANS.REC<4> = SYSTEM.TIME
+   TRANS.REC<5> = REDEEM.AMOUNT
+   TRANS.REC<6> = PREVIOUS.BALANCE
+   TRANS.REC<7> = NEW.BALANCE
+   TRANS.REC<8> = STORE.ID
+   TRANS.REC<9> = USER.ID
+   TRANS.REC<10> = POS.TRANS.ID
+   TRANS.REC<11> = 'COMPLETED'
+
+   WRITE TRANS.REC TO F.GC.TRANS, TRANS.ID
+   RETURN
+
+**************************************************************************
+* Create Redemption Audit
+**************************************************************************
+CREATE.REDEMPTION.AUDIT:
+   OPEN 'GIFTCARD.AUDIT' TO F.GC.AUDIT ELSE
+      EXECUTE 'CREATE.FILE GIFTCARD.AUDIT 1 101'
+      OPEN 'GIFTCARD.AUDIT' TO F.GC.AUDIT ELSE RETURN
+   END
+
+   AUDIT.ID = GC.NUMBER : '*REDEEM*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+
+   AUDIT.REC = ''
+   AUDIT.REC<1> = GC.NUMBER
+   AUDIT.REC<2> = 'REDEMPTION'
+   AUDIT.REC<3> = REDEEM.AMOUNT
+   AUDIT.REC<4> = USER.ID
+   AUDIT.REC<5> = SYSTEM.DATE
+   AUDIT.REC<6> = SYSTEM.TIME
+   AUDIT.REC<7> = STORE.ID
+   AUDIT.REC<8> = GC.REC<9>  ; Customer ID
+   AUDIT.REC<9> = PREVIOUS.BALANCE
+   AUDIT.REC<10> = NEW.BALANCE
+   AUDIT.REC<11> = POS.TRANS.ID
+
+   WRITE AUDIT.REC TO F.GC.AUDIT, AUDIT.ID
+   RETURN
+
+**************************************************************************
+* Update Redemption Statistics
+**************************************************************************
+UPDATE.REDEMPTION.STATISTICS:
+   OPEN 'GIFTCARD.STATS' TO F.GC.STATS ELSE
+      EXECUTE 'CREATE.FILE GIFTCARD.STATS 1 101'
+      OPEN 'GIFTCARD.STATS' TO F.GC.STATS ELSE RETURN
+   END
+
+   STAT.ID = OCONV(SYSTEM.DATE, 'D4-YM')
+
+   READU STAT.REC FROM F.GC.STATS, STAT.ID ELSE
+      STAT.REC = ''
+      STAT.REC<1> = STAT.ID
+      STAT.REC<2> = 0  ; Activations
+      STAT.REC<3> = 0  ; Activation amount
+      STAT.REC<4> = 0  ; Loads
+      STAT.REC<5> = 0  ; Load amount
+      STAT.REC<6> = 0  ; Redemptions
+      STAT.REC<7> = 0  ; Redemption amount
+   END
+
+   * Update redemption count
+   REDEEM.COUNT = STAT.REC<6>
+   IF REDEEM.COUNT = '' THEN REDEEM.COUNT = 0
+   STAT.REC<6> = REDEEM.COUNT + 1
+
+   * Update redemption amount
+   REDEEM.AMT = STAT.REC<7>
+   IF REDEEM.AMT = '' THEN REDEEM.AMT = 0
+   STAT.REC<7> = REDEEM.AMT + REDEEM.AMOUNT
+
+   WRITE STAT.REC TO F.GC.STATS, STAT.ID
+   RETURN
+
+END

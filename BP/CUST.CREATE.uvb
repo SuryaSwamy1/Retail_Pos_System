@@ -1,0 +1,230 @@
+SUBROUTINE CUST.CREATE(CUST.REC, CUST.ID.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: CUST.CREATE
+* Purpose: Create New Customer Record
+* Parameters:
+*   CUST.REC (IN) - Customer record with all fields populated
+*   CUST.ID.OUT (OUT) - Generated customer ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+CUST.ID.OUT = ''
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate required fields
+GOSUB VALIDATE.CUSTOMER
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Generate unique customer ID
+CALL UTILS.COMMON('GENERATE.ID', 'CUST', F.CUSTOMERS, CUST.ID.OUT)
+IF CUST.ID.OUT = '' THEN
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to generate customer ID'
+   RETURN
+END
+
+* Set audit fields
+CUST.REC<CUST.CREATED.BY> = USER.ID
+CUST.REC<CUST.CREATED.DATE> = SYSTEM.DATE
+CUST.REC<CUST.CREATED.TIME> = SYSTEM.TIME
+CUST.REC<CUST.MODIFIED.BY> = USER.ID
+CUST.REC<CUST.MODIFIED.DATE> = SYSTEM.DATE
+CUST.REC<CUST.MODIFIED.TIME> = SYSTEM.TIME
+
+* Initialize customer status if not set
+IF CUST.REC<CUST.STATUS> = '' THEN
+   CUST.REC<CUST.STATUS> = STATUS.ACTIVE
+END
+
+* Initialize numeric fields
+IF CUST.REC<CREDIT.LIMIT> = '' THEN CUST.REC<CREDIT.LIMIT> = 0
+IF CUST.REC<CREDIT.BALANCE> = '' THEN CUST.REC<CREDIT.BALANCE> = 0
+IF CUST.REC<DISCOUNT.PCT> = '' THEN CUST.REC<DISCOUNT.PCT> = 0
+IF CUST.REC<LOYALTY.POINTS> = '' THEN CUST.REC<LOYALTY.POINTS> = 0
+IF CUST.REC<TOTAL.PURCHASES> = '' THEN CUST.REC<TOTAL.PURCHASES> = 0
+IF CUST.REC<TOTAL.RETURNS> = '' THEN CUST.REC<TOTAL.RETURNS> = 0
+
+* Generate loyalty ID if not provided
+IF CUST.REC<LOYALTY.ID> = '' AND LOYALTY.ENABLED THEN
+   GOSUB GENERATE.LOYALTY.ID
+END
+
+* Set default loyalty tier
+IF CUST.REC<LOYALTY.TIER> = '' AND LOYALTY.ENABLED THEN
+   CUST.REC<LOYALTY.TIER> = 'BRONZE'
+END
+
+* Set default price level
+IF CUST.REC<PRICE.LEVEL> = '' THEN
+   CUST.REC<PRICE.LEVEL> = 1
+END
+
+* Write customer record
+WRITE CUST.REC TO F.CUSTOMERS, CUST.ID.OUT ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write customer record'
+   RETURN
+END
+
+* Log customer creation
+LOG.MSG = 'Customer created: ' : CUST.ID.OUT : ' - ' : CUST.REC<CUST.NAME>
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+* Send welcome email if enabled
+IF CUST.REC<EMAIL> # '' AND WEB.ENABLED THEN
+   GOSUB SEND.WELCOME.EMAIL
+END
+
+RETURN
+
+**************************************************************************
+* Validate Customer Data
+**************************************************************************
+VALIDATE.CUSTOMER:
+   * Check customer name
+   IF CUST.REC<CUST.NAME> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Customer name is required'
+      RETURN
+   END
+
+   * Validate customer type
+   VALID.TYPES = 'R':VM:'W':VM:'C'
+   IF CUST.REC<CUST.TYPE> = '' THEN
+      CUST.REC<CUST.TYPE> = 'R'  ; Default to Retail
+   END ELSE
+      LOCATE CUST.REC<CUST.TYPE> IN VALID.TYPES<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid customer type. Must be R, W, or C'
+         RETURN
+      END
+   END
+
+   * Validate email if provided
+   IF CUST.REC<EMAIL> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.EMAIL', CUST.REC<EMAIL>, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid email address format'
+         RETURN
+      END
+   END
+
+   * Validate phone if provided
+   IF CUST.REC<PHONE,1> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.PHONE', CUST.REC<PHONE,1>, FORMATTED.PHONE, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid phone number format'
+         RETURN
+      END
+      CUST.REC<PHONE,1> = FORMATTED.PHONE
+   END
+
+   * Validate credit limit
+   IF CUST.REC<CREDIT.LIMIT> # '' THEN
+      IF NOT(NUM(CUST.REC<CREDIT.LIMIT>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Credit limit must be numeric'
+         RETURN
+      END
+      IF CUST.REC<CREDIT.LIMIT> < 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Credit limit cannot be negative'
+         RETURN
+      END
+   END
+
+   * Validate discount percentage
+   IF CUST.REC<DISCOUNT.PCT> # '' THEN
+      IF NOT(NUM(CUST.REC<DISCOUNT.PCT>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Discount percentage must be numeric'
+         RETURN
+      END
+      IF CUST.REC<DISCOUNT.PCT> < 0 OR CUST.REC<DISCOUNT.PCT> > 100 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Discount percentage must be between 0 and 100'
+         RETURN
+      END
+   END
+
+   * Validate price level
+   IF CUST.REC<PRICE.LEVEL> # '' THEN
+      IF NOT(NUM(CUST.REC<PRICE.LEVEL>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Price level must be numeric'
+         RETURN
+      END
+      IF CUST.REC<PRICE.LEVEL> < 1 OR CUST.REC<PRICE.LEVEL> > 5 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Price level must be between 1 and 5'
+         RETURN
+      END
+   END
+
+   * Validate payment terms
+   IF CUST.REC<PAYMENT.TERMS> # '' THEN
+      VALID.TERMS = 'COD':VM:'NET30':VM:'NET60':VM:'NET90'
+      LOCATE CUST.REC<PAYMENT.TERMS> IN VALID.TERMS<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid payment terms'
+         RETURN
+      END
+   END ELSE
+      CUST.REC<PAYMENT.TERMS> = 'COD'  ; Default
+   END
+
+   * Validate ZIP code format if provided
+   IF CUST.REC<ZIP> # '' THEN
+      ZIP.LEN = LEN(CUST.REC<ZIP>)
+      IF ZIP.LEN # 5 AND ZIP.LEN # 10 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'ZIP code must be 5 or 10 characters'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Generate Loyalty ID
+**************************************************************************
+GENERATE.LOYALTY.ID:
+   * Generate loyalty ID based on customer type and sequence
+   PREFIX = 'LOY'
+   RANDOM.PART = RND(999999)
+   LOYALTY.NUM = OCONV(RANDOM.PART, 'R(0)#6')
+
+   * Check digit using Luhn algorithm
+   CHECK.DIGIT = 0
+   SUM = 0
+   FOR I = 1 TO LEN(LOYALTY.NUM)
+      DIGIT = LOYALTY.NUM[I,1]
+      IF MOD(I, 2) = 0 THEN
+         DIGIT = DIGIT * 2
+         IF DIGIT > 9 THEN DIGIT = DIGIT - 9
+      END
+      SUM += DIGIT
+   NEXT I
+   CHECK.DIGIT = MOD(10 - MOD(SUM, 10), 10)
+
+   CUST.REC<LOYALTY.ID> = PREFIX : LOYALTY.NUM : CHECK.DIGIT
+   RETURN
+
+**************************************************************************
+* Send Welcome Email
+**************************************************************************
+SEND.WELCOME.EMAIL:
+   * In production, this would integrate with email service
+   * For now, just log the action
+   EMAIL.LOG = 'Welcome email sent to: ' : CUST.REC<EMAIL>
+   EMAIL.LOG := ' for customer: ' : CUST.ID.OUT
+   CALL UTILS.COMMON('LOG.ERROR', EMAIL.LOG, 'INFO')
+   RETURN
+
+END

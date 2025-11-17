@@ -1,0 +1,626 @@
+SUBROUTINE PO.APPROVE(PO.ID, APPROVER.ID, APPROVAL.NOTES, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: PO.APPROVE
+* Purpose: Approve Purchase Order
+* Parameters:
+*   PO.ID (IN) - Purchase Order ID to approve
+*   APPROVER.ID (IN) - ID of person approving
+*   APPROVAL.NOTES (IN) - Optional approval notes
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate PO ID
+IF PO.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Purchase order ID is required'
+   RETURN
+END
+
+* Read PO record
+READU PO.REC FROM F.PURCHASE.ORDERS, PO.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Purchase order not found'
+   RETURN
+END
+
+* Check PO status
+GOSUB CHECK.PO.STATUS
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.ID
+   RETURN
+END
+
+* Validate approver authorization
+GOSUB VALIDATE.APPROVER.AUTH
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.ID
+   RETURN
+END
+
+* Check budget availability
+GOSUB CHECK.BUDGET.AVAILABILITY
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.ID
+   RETURN
+END
+
+* Verify vendor status
+GOSUB VERIFY.VENDOR.STATUS
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.PURCHASE.ORDERS, PO.ID
+   RETURN
+END
+
+* Check item availability
+GOSUB CHECK.ITEM.AVAILABILITY
+
+* Update PO status
+GOSUB UPDATE.PO.STATUS
+
+* Create approval audit record
+GOSUB CREATE.APPROVAL.AUDIT
+
+* Send notifications
+GOSUB SEND.APPROVAL.NOTIFICATIONS
+
+* Update budget allocation
+GOSUB UPDATE.BUDGET.ALLOCATION
+
+* Update vendor statistics
+GOSUB UPDATE.VENDOR.STATISTICS
+
+* Generate PO confirmation
+GOSUB GENERATE.PO.CONFIRMATION
+
+LOG.MSG = 'Purchase order approved: ' : PO.ID : ' by ' : APPROVER.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Check PO Status
+**************************************************************************
+CHECK.PO.STATUS:
+   CURRENT.STATUS = PO.REC<PO.STATUS>
+
+   BEGIN CASE
+      CASE CURRENT.STATUS = 'DRAFT'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Purchase order is still in draft status'
+         RETURN
+
+      CASE CURRENT.STATUS = 'PENDING'
+         * Valid status for approval
+         RETURN
+
+      CASE CURRENT.STATUS = 'APPROVED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Purchase order is already approved'
+         RETURN
+
+      CASE CURRENT.STATUS = 'REJECTED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Purchase order has been rejected'
+         RETURN
+
+      CASE CURRENT.STATUS = 'CANCELLED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Purchase order has been cancelled'
+         RETURN
+
+      CASE CURRENT.STATUS = 'CLOSED'
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Purchase order is closed'
+         RETURN
+
+      CASE 1
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid purchase order status'
+         RETURN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Validate Approver Auth
+**************************************************************************
+VALIDATE.APPROVER.AUTH:
+   IF APPROVER.ID = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Approver ID is required'
+      RETURN
+   END
+
+   * Read approver employee record
+   READ APPROVER.REC FROM F.EMPLOYEES, APPROVER.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Approver not found'
+      RETURN
+   END
+
+   * Check approver is active
+   IF APPROVER.REC<EMP.STATUS> # 'ACTIVE' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Approver is not active'
+      RETURN
+   END
+
+   * Get PO total
+   PO.TOTAL = PO.REC<PO.TOTAL>
+   IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+   * Check approval authority based on amount
+   APPROVER.LEVEL = APPROVER.REC<SECURITY.LEVEL>
+   IF APPROVER.LEVEL = '' THEN APPROVER.LEVEL = 1
+
+   * Approval limits by level:
+   * Level 5+ = Up to $1,000
+   * Level 7+ = Up to $10,000
+   * Level 9+ = Up to $50,000
+   * Level 10+ = Unlimited
+
+   BEGIN CASE
+      CASE APPROVER.LEVEL >= 10
+         * Unlimited approval authority
+         RETURN
+
+      CASE APPROVER.LEVEL >= 9
+         IF PO.TOTAL > 50000 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Approval amount exceeds authorization limit'
+            RETURN
+         END
+
+      CASE APPROVER.LEVEL >= 7
+         IF PO.TOTAL > 10000 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Approval amount exceeds authorization limit'
+            RETURN
+         END
+
+      CASE APPROVER.LEVEL >= 5
+         IF PO.TOTAL > 1000 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Approval amount exceeds authorization limit'
+            RETURN
+         END
+
+      CASE 1
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Insufficient approval authority'
+         RETURN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Check Budget Availability
+**************************************************************************
+CHECK.BUDGET.AVAILABILITY:
+   * Get PO department
+   DEPARTMENT = PO.REC<DEPARTMENT>
+   IF DEPARTMENT = '' THEN DEPARTMENT = 'GENERAL'
+
+   * Get PO total
+   PO.TOTAL = PO.REC<PO.TOTAL>
+   IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+   * Open budget file
+   OPEN 'BUDGETS' TO F.BUDGETS ELSE
+      * No budget control
+      RETURN
+   END
+
+   * Get current month budget
+   BUDGET.KEY = DEPARTMENT : '*' : OCONV(SYSTEM.DATE, 'D4-YM')
+
+   READ BUDGET.REC FROM F.BUDGETS, BUDGET.KEY ELSE
+      * No budget defined for this period
+      RETURN
+   END
+
+   * Check budget availability
+   BUDGET.AMOUNT = BUDGET.REC<1>
+   IF BUDGET.AMOUNT = '' THEN BUDGET.AMOUNT = 0
+
+   COMMITTED.AMOUNT = BUDGET.REC<2>
+   IF COMMITTED.AMOUNT = '' THEN COMMITTED.AMOUNT = 0
+
+   SPENT.AMOUNT = BUDGET.REC<3>
+   IF SPENT.AMOUNT = '' THEN SPENT.AMOUNT = 0
+
+   AVAILABLE.AMOUNT = BUDGET.AMOUNT - COMMITTED.AMOUNT - SPENT.AMOUNT
+
+   IF PO.TOTAL > AVAILABLE.AMOUNT THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Insufficient budget - Available: $' : AVAILABLE.AMOUNT
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Verify Vendor Status
+**************************************************************************
+VERIFY.VENDOR.STATUS:
+   VENDOR.ID = PO.REC<VENDOR.ID>
+
+   READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Vendor not found'
+      RETURN
+   END
+
+   * Check vendor is active
+   IF VENDOR.REC<VENDOR.STATUS> # 'ACTIVE' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Vendor is not active'
+      RETURN
+   END
+
+   * Check vendor is not on hold
+   IF VENDOR.REC<ON.HOLD> = 'Y' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Vendor is on hold'
+      RETURN
+   END
+
+   * Check minimum order amount
+   MIN.ORDER = VENDOR.REC<MIN.ORDER.AMT>
+   IF MIN.ORDER # '' AND MIN.ORDER > 0 THEN
+      PO.TOTAL = PO.REC<PO.TOTAL>
+      IF PO.TOTAL < MIN.ORDER THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'PO amount below vendor minimum: $' : MIN.ORDER
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Check Item Availability
+**************************************************************************
+CHECK.ITEM.AVAILABILITY:
+   ITEM.IDS = PO.REC<PO.ITEM.IDS>
+   IF ITEM.IDS = '' THEN RETURN
+
+   ITEM.COUNT = DCOUNT(ITEM.IDS, VM)
+
+   UNAVAILABLE.ITEMS = ''
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = ITEM.IDS<1, I>
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+         UNAVAILABLE.ITEMS<1, -1> = ITEM.ID
+         CONTINUE
+      END
+
+      * Check if item is discontinued
+      IF ITEM.REC<ITEM.STATUS> = 'DISCONTINUED' THEN
+         UNAVAILABLE.ITEMS<1, -1> = ITEM.ID
+      END
+   NEXT I
+
+   * If there are unavailable items, add warning to notes
+   IF UNAVAILABLE.ITEMS # '' THEN
+      WARNING.NOTE = 'Warning: Items discontinued or unavailable: '
+      WARNING.NOTE := CONVERT(VM, ',', UNAVAILABLE.ITEMS)
+
+      APPROVAL.NOTES := AM : WARNING.NOTE
+   END
+   RETURN
+
+**************************************************************************
+* Update PO Status
+**************************************************************************
+UPDATE.PO.STATUS:
+   PO.REC<PO.STATUS> = 'APPROVED'
+   PO.REC<APPROVED.BY> = APPROVER.ID
+   PO.REC<APPROVED.DATE> = SYSTEM.DATE
+   PO.REC<APPROVED.TIME> = SYSTEM.TIME
+   PO.REC<APPROVAL.NOTES> = APPROVAL.NOTES
+
+   * Calculate expected delivery date
+   VENDOR.ID = PO.REC<VENDOR.ID>
+   READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+      LEAD.TIME = 7
+   END
+   LEAD.TIME = VENDOR.REC<LEAD.TIME.DAYS>
+   IF LEAD.TIME = '' THEN LEAD.TIME = 7
+
+   EXPECTED.DATE = SYSTEM.DATE + LEAD.TIME
+   PO.REC<EXPECTED.DATE> = EXPECTED.DATE
+
+   WRITE PO.REC TO F.PURCHASE.ORDERS, PO.ID
+   RETURN
+
+**************************************************************************
+* Create Approval Audit
+**************************************************************************
+CREATE.APPROVAL.AUDIT:
+   OPEN 'PO.APPROVALS' TO F.PO.APPROVALS ELSE
+      EXECUTE 'CREATE.FILE PO.APPROVALS 1 101'
+      OPEN 'PO.APPROVALS' TO F.PO.APPROVALS ELSE RETURN
+   END
+
+   APPROVAL.ID = PO.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   APPROVAL.REC = ''
+   APPROVAL.REC<1> = PO.ID
+   APPROVAL.REC<2> = APPROVER.ID
+   APPROVAL.REC<3> = SYSTEM.DATE
+   APPROVAL.REC<4> = SYSTEM.TIME
+   APPROVAL.REC<5> = 'APPROVED'
+   APPROVAL.REC<6> = APPROVAL.NOTES
+   APPROVAL.REC<7> = PO.REC<PO.TOTAL>
+   APPROVAL.REC<8> = PO.REC<VENDOR.ID>
+   APPROVAL.REC<9> = PO.REC<DEPARTMENT>
+   APPROVAL.REC<10> = PO.REC<CREATED.BY>
+
+   WRITE APPROVAL.REC TO F.PO.APPROVALS, APPROVAL.ID
+   RETURN
+
+**************************************************************************
+* Send Approval Notifications
+**************************************************************************
+SEND.APPROVAL.NOTIFICATIONS:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   * Notify requester
+   REQUESTER.ID = PO.REC<CREATED.BY>
+   IF REQUESTER.ID # '' THEN
+      READ REQUESTER.REC FROM F.EMPLOYEES, REQUESTER.ID ELSE
+         REQUESTER.EMAIL = ''
+      END
+      REQUESTER.EMAIL = REQUESTER.REC<EMAIL>
+
+      IF REQUESTER.EMAIL # '' THEN
+         GOSUB SEND.REQUESTER.EMAIL
+      END
+   END
+
+   * Notify vendor
+   VENDOR.ID = PO.REC<VENDOR.ID>
+   READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+      VENDOR.EMAIL = ''
+   END
+   VENDOR.EMAIL = VENDOR.REC<VENDOR.EMAIL>
+
+   IF VENDOR.EMAIL # '' THEN
+      GOSUB SEND.VENDOR.EMAIL
+   END
+
+   * Notify receiving department
+   GOSUB SEND.RECEIVING.EMAIL
+   RETURN
+
+**************************************************************************
+* Send Requester Email
+**************************************************************************
+SEND.REQUESTER.EMAIL:
+   EMAIL.ID = 'PO.APPROVED.REQ*' : PO.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = REQUESTER.EMAIL
+   EMAIL.REC<2> = 'Purchase Order Approved: ' : PO.ID
+   EMAIL.REC<3> = 'Your purchase order has been approved.' : AM : AM
+   EMAIL.REC<3> := 'PO Number: ' : PO.ID : AM
+   EMAIL.REC<3> := 'Vendor: ' : VENDOR.REC<VENDOR.NAME> : AM
+   EMAIL.REC<3> := 'Amount: $' : PO.REC<PO.TOTAL> : AM
+   EMAIL.REC<3> := 'Expected Delivery: ' : OCONV(PO.REC<EXPECTED.DATE>, 'D4/') : AM : AM
+   EMAIL.REC<3> := 'Approved By: ' : APPROVER.ID : AM
+   EMAIL.REC<3> := 'Approval Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Vendor Email
+**************************************************************************
+SEND.VENDOR.EMAIL:
+   EMAIL.ID = 'PO.APPROVED.VEN*' : PO.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = VENDOR.EMAIL
+   EMAIL.REC<2> = 'New Purchase Order: ' : PO.ID
+   EMAIL.REC<3> = 'We have issued a new purchase order.' : AM : AM
+   EMAIL.REC<3> := 'PO Number: ' : PO.ID : AM
+   EMAIL.REC<3> := 'PO Date: ' : OCONV(PO.REC<PO.DATE>, 'D4/') : AM
+   EMAIL.REC<3> := 'Amount: $' : PO.REC<PO.TOTAL> : AM
+   EMAIL.REC<3> := 'Expected Delivery: ' : OCONV(PO.REC<EXPECTED.DATE>, 'D4/') : AM : AM
+   EMAIL.REC<3> := 'Please confirm receipt of this order.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Receiving Email
+**************************************************************************
+SEND.RECEIVING.EMAIL:
+   OPEN 'SYSTEM.PARAMS' TO F.PARAMS ELSE RETURN
+
+   READ PARAM.REC FROM F.PARAMS, 'EMAIL.ADDRESSES' ELSE RETURN
+
+   RECEIVING.EMAIL = PARAM.REC<1>
+   IF RECEIVING.EMAIL = '' THEN RETURN
+
+   EMAIL.ID = 'PO.APPROVED.RCV*' : PO.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = RECEIVING.EMAIL
+   EMAIL.REC<2> = 'Purchase Order Approved - Receiving Notice: ' : PO.ID
+   EMAIL.REC<3> = 'A purchase order has been approved.' : AM : AM
+   EMAIL.REC<3> := 'PO Number: ' : PO.ID : AM
+   EMAIL.REC<3> := 'Vendor: ' : VENDOR.REC<VENDOR.NAME> : AM
+   EMAIL.REC<3> := 'Amount: $' : PO.REC<PO.TOTAL> : AM
+   EMAIL.REC<3> := 'Expected Delivery: ' : OCONV(PO.REC<EXPECTED.DATE>, 'D4/') : AM : AM
+   EMAIL.REC<3> := 'Please prepare to receive this order.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Update Budget Allocation
+**************************************************************************
+UPDATE.BUDGET.ALLOCATION:
+   * Get PO department
+   DEPARTMENT = PO.REC<DEPARTMENT>
+   IF DEPARTMENT = '' THEN DEPARTMENT = 'GENERAL'
+
+   * Open budget file
+   OPEN 'BUDGETS' TO F.BUDGETS ELSE RETURN
+
+   * Get current month budget
+   BUDGET.KEY = DEPARTMENT : '*' : OCONV(SYSTEM.DATE, 'D4-YM')
+
+   READU BUDGET.REC FROM F.BUDGETS, BUDGET.KEY ELSE RETURN
+
+   * Add to committed amount
+   COMMITTED.AMOUNT = BUDGET.REC<2>
+   IF COMMITTED.AMOUNT = '' THEN COMMITTED.AMOUNT = 0
+
+   PO.TOTAL = PO.REC<PO.TOTAL>
+   IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+   BUDGET.REC<2> = COMMITTED.AMOUNT + PO.TOTAL
+
+   WRITE BUDGET.REC TO F.BUDGETS, BUDGET.KEY
+   RETURN
+
+**************************************************************************
+* Update Vendor Statistics
+**************************************************************************
+UPDATE.VENDOR.STATISTICS:
+   VENDOR.ID = PO.REC<VENDOR.ID>
+
+   READU VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE RETURN
+
+   * Increment YTD purchases
+   YTD.PURCHASES = VENDOR.REC<YTD.PURCHASES>
+   IF YTD.PURCHASES = '' THEN YTD.PURCHASES = 0
+   VENDOR.REC<YTD.PURCHASES> = YTD.PURCHASES + 1
+
+   * Add to YTD purchase amount
+   YTD.AMT = VENDOR.REC<YTD.PURCHASE.AMT>
+   IF YTD.AMT = '' THEN YTD.AMT = 0
+
+   PO.TOTAL = PO.REC<PO.TOTAL>
+   IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+   VENDOR.REC<YTD.PURCHASE.AMT> = YTD.AMT + PO.TOTAL
+
+   * Increment total purchases
+   TOTAL.PURCHASES = VENDOR.REC<TOTAL.PURCHASES>
+   IF TOTAL.PURCHASES = '' THEN TOTAL.PURCHASES = 0
+   VENDOR.REC<TOTAL.PURCHASES> = TOTAL.PURCHASES + 1
+
+   * Add to total purchase amount
+   TOTAL.AMT = VENDOR.REC<TOTAL.PURCHASE.AMT>
+   IF TOTAL.AMT = '' THEN TOTAL.AMT = 0
+   VENDOR.REC<TOTAL.PURCHASE.AMT> = TOTAL.AMT + PO.TOTAL
+
+   * Update last order date
+   VENDOR.REC<LAST.ORDER.DATE> = SYSTEM.DATE
+
+   WRITE VENDOR.REC TO F.VENDORS, VENDOR.ID
+   RETURN
+
+**************************************************************************
+* Generate PO Confirmation
+**************************************************************************
+GENERATE.PO.CONFIRMATION:
+   OPEN 'PO.CONFIRMATIONS' TO F.PO.CONFIRM ELSE
+      EXECUTE 'CREATE.FILE PO.CONFIRMATIONS 1 101'
+      OPEN 'PO.CONFIRMATIONS' TO F.PO.CONFIRM ELSE RETURN
+   END
+
+   CONFIRM.TEXT = ''
+   CONFIRM.TEXT<1> = '========================================='
+   CONFIRM.TEXT<2> = '      PURCHASE ORDER CONFIRMATION       '
+   CONFIRM.TEXT<3> = '========================================='
+   CONFIRM.TEXT<4> = ''
+   CONFIRM.TEXT<5> = 'PO Number: ' : PO.ID
+   CONFIRM.TEXT<6> = 'PO Date: ' : OCONV(PO.REC<PO.DATE>, 'D4/')
+   CONFIRM.TEXT<7> = 'Approval Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   CONFIRM.TEXT<8> = 'Approved By: ' : APPROVER.ID
+   CONFIRM.TEXT<9> = ''
+   CONFIRM.TEXT<10> = 'VENDOR INFORMATION:'
+   CONFIRM.TEXT<11> = '-----------------------------------------'
+
+   VENDOR.ID = PO.REC<VENDOR.ID>
+   READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+      VENDOR.NAME = 'Unknown'
+   END
+   VENDOR.NAME = VENDOR.REC<VENDOR.NAME>
+
+   CONFIRM.TEXT<12> = 'Vendor: ' : VENDOR.NAME
+   CONFIRM.TEXT<13> = 'Vendor ID: ' : VENDOR.ID
+   CONFIRM.TEXT<14> = 'Contact: ' : VENDOR.REC<PRIMARY.CONTACT>
+   CONFIRM.TEXT<15> = 'Phone: ' : VENDOR.REC<VENDOR.PHONE>
+   CONFIRM.TEXT<16> = ''
+   CONFIRM.TEXT<17> = 'ITEMS ORDERED:'
+   CONFIRM.TEXT<18> = '-----------------------------------------'
+
+   LINE.NUM = 19
+
+   ITEM.IDS = PO.REC<PO.ITEM.IDS>
+   ITEM.QTYS = PO.REC<PO.ITEM.QTYS>
+   ITEM.COSTS = PO.REC<PO.ITEM.COSTS>
+
+   IF ITEM.IDS # '' THEN
+      ITEM.COUNT = DCOUNT(ITEM.IDS, VM)
+
+      FOR I = 1 TO ITEM.COUNT
+         ITEM.ID = ITEM.IDS<1, I>
+         ITEM.QTY = ITEM.QTYS<1, I>
+         ITEM.COST = ITEM.COSTS<1, I>
+
+         READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+            ITEM.NAME = 'Unknown Item'
+         END
+         ITEM.NAME = ITEM.REC<ITEM.NAME>
+
+         ITEM.TOTAL = ITEM.QTY * ITEM.COST
+
+         CONFIRM.TEXT<LINE.NUM> = ITEM.NAME
+         LINE.NUM += 1
+         CONFIRM.TEXT<LINE.NUM> = '  Item ID: ' : ITEM.ID
+         LINE.NUM += 1
+         CONFIRM.TEXT<LINE.NUM> = '  Quantity: ' : ITEM.QTY : ' @ $' : ITEM.COST : ' = $' : ITEM.TOTAL
+         LINE.NUM += 1
+         CONFIRM.TEXT<LINE.NUM> = ''
+         LINE.NUM += 1
+      NEXT I
+   END
+
+   CONFIRM.TEXT<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   CONFIRM.TEXT<LINE.NUM> = 'Total Amount: $' : PO.REC<PO.TOTAL>
+   LINE.NUM += 1
+   CONFIRM.TEXT<LINE.NUM> = ''
+   LINE.NUM += 1
+   CONFIRM.TEXT<LINE.NUM> = 'Expected Delivery: ' : OCONV(PO.REC<EXPECTED.DATE>, 'D4/')
+   LINE.NUM += 1
+   CONFIRM.TEXT<LINE.NUM> = 'Payment Terms: ' : VENDOR.REC<PAYMENT.TERMS>
+   LINE.NUM += 1
+   CONFIRM.TEXT<LINE.NUM> = ''
+   LINE.NUM += 1
+
+   IF APPROVAL.NOTES # '' THEN
+      CONFIRM.TEXT<LINE.NUM> = 'APPROVAL NOTES:'
+      LINE.NUM += 1
+      CONFIRM.TEXT<LINE.NUM> = APPROVAL.NOTES
+      LINE.NUM += 1
+      CONFIRM.TEXT<LINE.NUM> = ''
+      LINE.NUM += 1
+   END
+
+   CONFIRM.TEXT<LINE.NUM> = '========================================='
+
+   WRITE CONFIRM.TEXT TO F.PO.CONFIRM, PO.ID
+   RETURN
+
+END

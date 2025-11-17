@@ -1,0 +1,281 @@
+SUBROUTINE CUST.DELETE(CUST.ID.IN, SOFT.DELETE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: CUST.DELETE
+* Purpose: Delete or Deactivate Customer Record
+* Parameters:
+*   CUST.ID.IN (IN) - Customer ID to delete
+*   SOFT.DELETE (IN) - TRUE = deactivate, FALSE = hard delete
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate input
+IF CUST.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Customer ID is required'
+   RETURN
+END
+
+* Check user permissions for deletion
+IF USER.LEVEL < 8 THEN
+   ERROR.CODE = ERR.PERMISSION.DENIED
+   ERROR.MSG = 'Insufficient permissions to delete customer'
+   RETURN
+END
+
+* Read existing record with lock
+READU CUST.REC FROM F.CUSTOMERS, CUST.ID.IN LOCKED
+   * Record is locked by another user
+   ERROR.CODE = ERR.RECORD.LOCKED
+   ERROR.MSG = 'Customer record is locked by another user'
+   RETURN
+END ELSE
+   * Record does not exist
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Customer not found: ' : CUST.ID.IN
+   RETURN
+END
+
+* Check for dependencies - open transactions, outstanding balance
+GOSUB CHECK.DEPENDENCIES
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.CUSTOMERS, CUST.ID.IN
+   RETURN
+END
+
+IF SOFT.DELETE THEN
+   * Soft delete - just mark as inactive
+   GOSUB PERFORM.SOFT.DELETE
+END ELSE
+   * Hard delete - actually remove the record
+   GOSUB PERFORM.HARD.DELETE
+END
+
+* Log deletion
+LOG.MSG = 'Customer '
+IF SOFT.DELETE THEN
+   LOG.MSG := 'deactivated: '
+END ELSE
+   LOG.MSG := 'deleted: '
+END
+LOG.MSG := CUST.ID.IN : ' - ' : CUST.REC<CUST.NAME> : ' by user: ' : USER.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Check Dependencies
+**************************************************************************
+CHECK.DEPENDENCIES:
+   * Check for outstanding credit balance
+   IF CUST.REC<CREDIT.BALANCE> > 0 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Cannot delete customer with outstanding credit balance'
+      RETURN
+   END
+
+   * Check for open transactions (last 90 days)
+   CUTOFF.DATE = SYSTEM.DATE - 90
+   OPEN.TRANS.COUNT = 0
+
+   * Build select statement to find recent transactions
+   SELECT.CMD = 'SELECT POS.TRANS WITH CUSTOMER.ID = "' : CUST.ID.IN : '"'
+   SELECT.CMD := ' AND TRANS.DATE >= "' : CUTOFF.DATE : '"'
+   SELECT.CMD := ' AND STATUS # "' : STATUS.VOID : '"'
+
+   EXECUTE SELECT.CMD CAPTURING OUTPUT
+
+   * Count lines in output
+   OPEN.TRANS.COUNT = DCOUNT(OUTPUT, AM)
+
+   IF OPEN.TRANS.COUNT > 1 THEN  ; > 1 because last line is usually empty
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Cannot delete customer with recent transactions'
+      ERROR.MSG := ' (found ' : (OPEN.TRANS.COUNT - 1) : ' transactions in last 90 days)'
+      RETURN
+   END
+
+   * Check for active loyalty program participation
+   IF LOYALTY.ENABLED AND CUST.REC<LOYALTY.POINTS> > 0 THEN
+      IF NOT(SOFT.DELETE) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Cannot hard delete customer with loyalty points'
+         ERROR.MSG := ' (' : CUST.REC<LOYALTY.POINTS> : ' points remaining)'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Perform Soft Delete
+**************************************************************************
+PERFORM.SOFT.DELETE:
+   * Update status to inactive
+   CUST.REC<CUST.STATUS> = STATUS.INACTIVE
+
+   * Update audit fields
+   CUST.REC<CUST.MODIFIED.BY> = USER.ID
+   CUST.REC<CUST.MODIFIED.DATE> = SYSTEM.DATE
+   CUST.REC<CUST.MODIFIED.TIME> = SYSTEM.TIME
+
+   * Add note about deactivation
+   NOTE.TEXT = 'Customer deactivated on ' : OCONV(SYSTEM.DATE, 'D4/')
+   NOTE.TEXT := ' by ' : USER.ID
+   NOTE.COUNT = DCOUNT(CUST.REC<CUST.NOTES>, VM)
+   CUST.REC<CUST.NOTES, NOTE.COUNT + 1> = NOTE.TEXT
+
+   * Write updated record
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID.IN ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Failed to deactivate customer record'
+      RETURN
+   END
+
+   * Archive customer data
+   GOSUB ARCHIVE.CUSTOMER.DATA
+   RETURN
+
+**************************************************************************
+* Perform Hard Delete
+**************************************************************************
+PERFORM.HARD.DELETE:
+   * Archive customer data before deletion
+   GOSUB ARCHIVE.CUSTOMER.DATA
+
+   * Delete the record
+   DELETE F.CUSTOMERS, CUST.ID.IN ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Failed to delete customer record'
+      RETURN
+   END
+
+   * Delete related loyalty transactions
+   IF LOYALTY.ENABLED THEN
+      GOSUB DELETE.LOYALTY.RECORDS
+   END
+   RETURN
+
+**************************************************************************
+* Archive Customer Data
+**************************************************************************
+ARCHIVE.CUSTOMER.DATA:
+   * Open or create archive file
+   OPEN 'CUSTOMERS.ARCHIVE' TO F.CUST.ARCHIVE ELSE
+      * Archive file doesn't exist, create it
+      EXECUTE 'CREATE.FILE CUSTOMERS.ARCHIVE 1 101'
+      OPEN 'CUSTOMERS.ARCHIVE' TO F.CUST.ARCHIVE ELSE
+         * Cannot create archive, log warning
+         WARN.MSG = 'Warning: Cannot archive customer data for ' : CUST.ID.IN
+         CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+         RETURN
+      END
+   END
+
+   * Create archive record
+   ARCHIVE.ID = CUST.ID.IN : '*' : OCONV(SYSTEM.DATE, 'D4-YMD')
+   ARCHIVE.REC = CUST.REC
+   ARCHIVE.REC<100> = USER.ID  ; Who archived it
+   ARCHIVE.REC<101> = SYSTEM.DATE  ; When archived
+   ARCHIVE.REC<102> = SYSTEM.TIME
+   IF SOFT.DELETE THEN
+      ARCHIVE.REC<103> = 'DEACTIVATED'
+   END ELSE
+      ARCHIVE.REC<103> = 'DELETED'
+   END
+
+   * Write to archive
+   WRITE ARCHIVE.REC TO F.CUST.ARCHIVE, ARCHIVE.ID ELSE
+      WARN.MSG = 'Warning: Failed to write archive for customer ' : CUST.ID.IN
+      CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+   END
+
+   * Write purchase history summary
+   GOSUB ARCHIVE.PURCHASE.HISTORY
+   RETURN
+
+**************************************************************************
+* Archive Purchase History
+**************************************************************************
+ARCHIVE.PURCHASE.HISTORY:
+   * Select all transactions for this customer
+   SELECT.CMD = 'SELECT POS.TRANS WITH CUSTOMER.ID = "' : CUST.ID.IN : '"'
+   EXECUTE SELECT.CMD
+
+   TRANS.COUNT = 0
+   TOTAL.SALES = 0
+   TOTAL.RETURNS = 0
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      * Read transaction
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      TRANS.COUNT += 1
+
+      * Accumulate totals
+      TRANS.TYPE = TRANS.REC<TRANS.TYPE>
+      TRANS.AMT = TRANS.REC<TOTAL.AMOUNT>
+
+      IF TRANS.TYPE = TXN.RETURN THEN
+         TOTAL.RETURNS += TRANS.AMT
+      END ELSE
+         TOTAL.SALES += TRANS.AMT
+      END
+   REPEAT
+
+   * Create purchase history summary
+   HISTORY.REC = ''
+   HISTORY.REC<1> = CUST.ID.IN
+   HISTORY.REC<2> = TRANS.COUNT
+   HISTORY.REC<3> = TOTAL.SALES
+   HISTORY.REC<4> = TOTAL.RETURNS
+   HISTORY.REC<5> = TOTAL.SALES - TOTAL.RETURNS  ; Net sales
+   HISTORY.REC<6> = CUST.REC<LAST.PURCHASE.DATE>
+   HISTORY.REC<7> = CUST.REC<LAST.PURCHASE.AMT>
+   HISTORY.REC<8> = SYSTEM.DATE  ; Archive date
+
+   * Write purchase history to archive
+   OPEN 'PURCHASE.HISTORY.ARCHIVE' TO F.PURCHASE.ARCHIVE ELSE
+      EXECUTE 'CREATE.FILE PURCHASE.HISTORY.ARCHIVE 1 101'
+      OPEN 'PURCHASE.HISTORY.ARCHIVE' TO F.PURCHASE.ARCHIVE ELSE
+         RETURN
+      END
+   END
+
+   HISTORY.ID = CUST.ID.IN : '*' : OCONV(SYSTEM.DATE, 'D4-YMD')
+   WRITE HISTORY.REC TO F.PURCHASE.ARCHIVE, HISTORY.ID
+   RETURN
+
+**************************************************************************
+* Delete Loyalty Records
+**************************************************************************
+DELETE.LOYALTY.RECORDS:
+   * Select all loyalty transactions for this customer
+   SELECT.CMD = 'SELECT LOYALTY.TRANS WITH CUSTOMER.ID = "' : CUST.ID.IN : '"'
+   EXECUTE SELECT.CMD
+
+   DELETED.COUNT = 0
+   LOOP
+      READNEXT LOYALTY.TRANS.ID ELSE EXIT
+
+      * Delete loyalty transaction
+      DELETE F.LOYALTY.TRANS, LOYALTY.TRANS.ID ELSE
+         * Log error but continue
+         ERR.MSG = 'Failed to delete loyalty transaction: ' : LOYALTY.TRANS.ID
+         CALL UTILS.COMMON('LOG.ERROR', ERR.MSG, 'WARNING')
+      END
+      DELETED.COUNT += 1
+   REPEAT
+
+   LOG.MSG = 'Deleted ' : DELETED.COUNT : ' loyalty transactions for customer ' : CUST.ID.IN
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+END

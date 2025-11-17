@@ -1,0 +1,19 @@
+========================================
+RETAIL POS SYSTEM - SYSTEM LOG
+========================================
+Log Date: [DATE]
+System Version: 1.0.0
+Store ID: [STORE_ID]
+========================================
+
+[TIMESTAMP] [LEVEL] [MODULE] [MESSAGE]
+
+Example entries:
+2025-10-07 08:00:00 INFO STARTUP System initialization started
+2025-10-07 08:00:05 INFO DATABASE Database connection established
+2025-10-07 08:00:10 INFO STARTUP System ready for operations
+2025-10-07 09:15:23 WARN INVENTORY Low stock alert for item INV001
+2025-10-07 10:30:45 ERROR PAYMENT Payment gateway timeout - Transaction TXN12345
+2025-10-07 11:45:12 INFO POS Transaction completed - TXN12346
+2025-10-07 23:00:00 INFO BATCH EOD process started
+2025-10-07 23:15:00 INFO BATCH EOD process completed successfully

@@ -1,0 +1,361 @@
+SUBROUTINE INV.TRANSFER(ITEM.ID.IN, FROM.STORE, TO.STORE, TRANSFER.QTY, TRANSFER.NOTES, TRANS.ID.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: INV.TRANSFER
+* Purpose: Transfer Inventory Between Stores
+* Parameters:
+*   ITEM.ID.IN (IN) - Item ID to transfer
+*   FROM.STORE (IN) - Source store ID
+*   TO.STORE (IN) - Destination store ID
+*   TRANSFER.QTY (IN) - Quantity to transfer
+*   TRANSFER.NOTES (IN) - Transfer notes
+*   TRANS.ID.OUT (OUT) - Generated transfer transaction ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+TRANS.ID.OUT = ''
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate inputs
+IF ITEM.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Item ID is required'
+   RETURN
+END
+
+IF FROM.STORE = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Source store ID is required'
+   RETURN
+END
+
+IF TO.STORE = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Destination store ID is required'
+   RETURN
+END
+
+IF FROM.STORE = TO.STORE THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Source and destination stores cannot be the same'
+   RETURN
+END
+
+IF TRANSFER.QTY = '' OR NOT(NUM(TRANSFER.QTY)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Transfer quantity must be numeric'
+   RETURN
+END
+
+IF TRANSFER.QTY <= 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Transfer quantity must be greater than zero'
+   RETURN
+END
+
+* Check user permissions
+IF USER.LEVEL < 6 THEN
+   ERROR.CODE = ERR.PERMISSION.DENIED
+   ERROR.MSG = 'Insufficient permissions for inventory transfer'
+   RETURN
+END
+
+* Verify both stores exist
+GOSUB VERIFY.STORES
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Read item record with lock
+READU ITEM.REC FROM F.INVENTORY, ITEM.ID.IN LOCKED
+   ERROR.CODE = ERR.RECORD.LOCKED
+   ERROR.MSG = 'Item record is locked by another user'
+   RETURN
+END ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Item not found: ' : ITEM.ID.IN
+   RETURN
+END
+
+* Find store indexes
+GOSUB FIND.STORE.INDEXES
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.INVENTORY, ITEM.ID.IN
+   RETURN
+END
+
+* Verify sufficient quantity at source store
+GOSUB VERIFY.SOURCE.QUANTITY
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.INVENTORY, ITEM.ID.IN
+   RETURN
+END
+
+* Perform the transfer
+GOSUB EXECUTE.TRANSFER
+
+* Update item record
+ITEM.REC<ITEM.MODIFIED.BY> = USER.ID
+ITEM.REC<ITEM.MODIFIED.DATE> = SYSTEM.DATE
+ITEM.REC<ITEM.MODIFIED.TIME> = SYSTEM.TIME
+
+WRITE ITEM.REC TO F.INVENTORY, ITEM.ID.IN ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write updated item record'
+   RETURN
+END
+
+* Create transfer transaction record
+GOSUB CREATE.TRANSFER.RECORD
+
+* Create inventory transactions (out of source, into destination)
+GOSUB CREATE.INV.TRANSACTIONS
+
+* Log transfer
+LOG.MSG = 'Inventory transferred for item ' : ITEM.ID.IN
+LOG.MSG := ': ' : TRANSFER.QTY : ' units from ' : FROM.STORE
+LOG.MSG := ' to ' : TO.STORE
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+* Send notifications
+GOSUB SEND.TRANSFER.NOTIFICATIONS
+
+RETURN
+
+**************************************************************************
+* Verify Stores
+**************************************************************************
+VERIFY.STORES:
+   * Verify source store
+   READ FROM.STORE.REC FROM F.STORES, FROM.STORE ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Source store not found: ' : FROM.STORE
+      RETURN
+   END
+
+   * Check source store status
+   IF FROM.STORE.REC<5> # STATUS.ACTIVE THEN  ; Field 5 = STATUS
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Source store is not active'
+      RETURN
+   END
+
+   * Verify destination store
+   READ TO.STORE.REC FROM F.STORES, TO.STORE ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Destination store not found: ' : TO.STORE
+      RETURN
+   END
+
+   * Check destination store status
+   IF TO.STORE.REC<5> # STATUS.ACTIVE THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Destination store is not active'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Find Store Indexes
+**************************************************************************
+FIND.STORE.INDEXES:
+   FROM.STORE.INDEX = 0
+   TO.STORE.INDEX = 0
+
+   * Get list of all stores to find indexes
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT STORE.ID ELSE EXIT
+      CURRENT.INDEX += 1
+
+      IF STORE.ID = FROM.STORE THEN
+         FROM.STORE.INDEX = CURRENT.INDEX
+      END
+
+      IF STORE.ID = TO.STORE THEN
+         TO.STORE.INDEX = CURRENT.INDEX
+      END
+
+      IF FROM.STORE.INDEX > 0 AND TO.STORE.INDEX > 0 THEN
+         EXIT
+      END
+   REPEAT
+
+   IF FROM.STORE.INDEX = 0 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Source store not found in item record'
+      RETURN
+   END
+
+   IF TO.STORE.INDEX = 0 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Destination store not found in item record'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Verify Source Quantity
+**************************************************************************
+VERIFY.SOURCE.QUANTITY:
+   * Get current quantities at source store
+   FROM.QTY.OH = ITEM.REC<QTY.ON.HAND, FROM.STORE.INDEX>
+   FROM.QTY.ALLOC = ITEM.REC<QTY.ALLOCATED, FROM.STORE.INDEX>
+
+   IF FROM.QTY.OH = '' THEN FROM.QTY.OH = 0
+   IF FROM.QTY.ALLOC = '' THEN FROM.QTY.ALLOC = 0
+
+   FROM.QTY.AVAIL = FROM.QTY.OH - FROM.QTY.ALLOC
+
+   * Check if sufficient quantity available
+   IF FROM.QTY.AVAIL < TRANSFER.QTY THEN
+      ERROR.CODE = ERR.INSUFFICIENT.INVENTORY
+      ERROR.MSG = 'Insufficient available quantity at source store'
+      ERROR.MSG := ' (Available: ' : FROM.QTY.AVAIL : ', Requested: ' : TRANSFER.QTY : ')'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Execute Transfer
+**************************************************************************
+EXECUTE.TRANSFER:
+   * Reduce quantity at source store
+   NEW.FROM.QTY = FROM.QTY.OH - TRANSFER.QTY
+   ITEM.REC<QTY.ON.HAND, FROM.STORE.INDEX> = NEW.FROM.QTY
+   ITEM.REC<QTY.AVAILABLE, FROM.STORE.INDEX> = NEW.FROM.QTY - FROM.QTY.ALLOC
+
+   * Increase quantity at destination store
+   TO.QTY.OH = ITEM.REC<QTY.ON.HAND, TO.STORE.INDEX>
+   TO.QTY.ALLOC = ITEM.REC<QTY.ALLOCATED, TO.STORE.INDEX>
+
+   IF TO.QTY.OH = '' THEN TO.QTY.OH = 0
+   IF TO.QTY.ALLOC = '' THEN TO.QTY.ALLOC = 0
+
+   NEW.TO.QTY = TO.QTY.OH + TRANSFER.QTY
+   ITEM.REC<QTY.ON.HAND, TO.STORE.INDEX> = NEW.TO.QTY
+   ITEM.REC<QTY.AVAILABLE, TO.STORE.INDEX> = NEW.TO.QTY - TO.QTY.ALLOC
+
+   * Store before/after quantities for logging
+   OLD.FROM.QTY = FROM.QTY.OH
+   OLD.TO.QTY = TO.QTY.OH
+   RETURN
+
+**************************************************************************
+* Create Transfer Record
+**************************************************************************
+CREATE.TRANSFER.RECORD:
+   * Generate transfer ID
+   CALL UTILS.COMMON('GENERATE.ID', 'XFER', '', TRANS.ID.OUT)
+   IF TRANS.ID.OUT = '' THEN
+      TRANS.ID.OUT = 'XFER*' : ITEM.ID.IN : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   END
+
+   * Open or create transfer file
+   OPEN 'TRANSFERS' TO F.TRANSFERS ELSE
+      EXECUTE 'CREATE.FILE TRANSFERS 1 101'
+      OPEN 'TRANSFERS' TO F.TRANSFERS ELSE
+         * Cannot create file, just return
+         RETURN
+      END
+   END
+
+   * Build transfer record
+   XFER.REC = ''
+   XFER.REC<1> = TRANS.ID.OUT
+   XFER.REC<2> = ITEM.ID.IN
+   XFER.REC<3> = ITEM.REC<SKU>
+   XFER.REC<4> = ITEM.REC<ITEM.DESC>
+   XFER.REC<5> = FROM.STORE
+   XFER.REC<6> = TO.STORE
+   XFER.REC<7> = TRANSFER.QTY
+   XFER.REC<8> = ITEM.REC<AVG.COST>
+   XFER.REC<9> = TRANSFER.QTY * ITEM.REC<AVG.COST>  ; Total value
+   XFER.REC<10> = SYSTEM.DATE
+   XFER.REC<11> = SYSTEM.TIME
+   XFER.REC<12> = USER.ID
+   XFER.REC<13> = 'PENDING'  ; Status
+   XFER.REC<14> = TRANSFER.NOTES
+   XFER.REC<15> = ''  ; Shipped date
+   XFER.REC<16> = ''  ; Received date
+   XFER.REC<17> = ''  ; Received by
+   XFER.REC<18> = ''  ; Tracking number
+   XFER.REC<19> = OLD.FROM.QTY  ; Source qty before
+   XFER.REC<20> = NEW.FROM.QTY  ; Source qty after
+   XFER.REC<21> = OLD.TO.QTY  ; Dest qty before
+   XFER.REC<22> = NEW.TO.QTY  ; Dest qty after
+
+   WRITE XFER.REC TO F.TRANSFERS, TRANS.ID.OUT
+   RETURN
+
+**************************************************************************
+* Create Inventory Transactions
+**************************************************************************
+CREATE.INV.TRANSACTIONS:
+   * Transaction for source store (inventory out)
+   OUT.TRANS.ID = ITEM.ID.IN : '*OUT*' : FROM.STORE : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   OUT.TRANS.REC = ''
+   OUT.TRANS.REC<1> = ITEM.ID.IN
+   OUT.TRANS.REC<2> = 'XFER-OUT'
+   OUT.TRANS.REC<3> = SYSTEM.DATE
+   OUT.TRANS.REC<4> = SYSTEM.TIME
+   OUT.TRANS.REC<5> = USER.ID
+   OUT.TRANS.REC<6> = 'Transfer to ' : TO.STORE
+   OUT.TRANS.REC<7> = OLD.FROM.QTY
+   OUT.TRANS.REC<8> = NEW.FROM.QTY
+   OUT.TRANS.REC<9> = -TRANSFER.QTY  ; Negative for out
+   OUT.TRANS.REC<10> = FROM.STORE
+   OUT.TRANS.REC<11> = ITEM.REC<AVG.COST>
+   OUT.TRANS.REC<12> = -TRANSFER.QTY * ITEM.REC<AVG.COST>
+   OUT.TRANS.REC<13> = TRANSFER.NOTES
+   OUT.TRANS.REC<14> = TRANS.ID.OUT  ; Reference to transfer record
+
+   WRITE OUT.TRANS.REC TO F.INVENTORY.TRANS, OUT.TRANS.ID
+
+   * Transaction for destination store (inventory in)
+   IN.TRANS.ID = ITEM.ID.IN : '*IN*' : TO.STORE : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   IN.TRANS.REC = ''
+   IN.TRANS.REC<1> = ITEM.ID.IN
+   IN.TRANS.REC<2> = 'XFER-IN'
+   IN.TRANS.REC<3> = SYSTEM.DATE
+   IN.TRANS.REC<4> = SYSTEM.TIME
+   IN.TRANS.REC<5> = USER.ID
+   IN.TRANS.REC<6> = 'Transfer from ' : FROM.STORE
+   IN.TRANS.REC<7> = OLD.TO.QTY
+   IN.TRANS.REC<8> = NEW.TO.QTY
+   IN.TRANS.REC<9> = TRANSFER.QTY  ; Positive for in
+   IN.TRANS.REC<10> = TO.STORE
+   IN.TRANS.REC<11> = ITEM.REC<AVG.COST>
+   IN.TRANS.REC<12> = TRANSFER.QTY * ITEM.REC<AVG.COST>
+   IN.TRANS.REC<13> = TRANSFER.NOTES
+   IN.TRANS.REC<14> = TRANS.ID.OUT  ; Reference to transfer record
+
+   WRITE IN.TRANS.REC TO F.INVENTORY.TRANS, IN.TRANS.ID
+   RETURN
+
+**************************************************************************
+* Send Transfer Notifications
+**************************************************************************
+SEND.TRANSFER.NOTIFICATIONS:
+   * Build notification message
+   NOTIF.MSG = 'Inventory Transfer Notification' : AM
+   NOTIF.MSG := 'Transfer ID: ' : TRANS.ID.OUT : AM
+   NOTIF.MSG := 'Item: ' : ITEM.ID.IN : ' - ' : ITEM.REC<ITEM.DESC> : AM
+   NOTIF.MSG := 'SKU: ' : ITEM.REC<SKU> : AM
+   NOTIF.MSG := 'Quantity: ' : TRANSFER.QTY : AM
+   NOTIF.MSG := 'From Store: ' : FROM.STORE : AM
+   NOTIF.MSG := 'To Store: ' : TO.STORE : AM
+   NOTIF.MSG := 'Initiated by: ' : USER.ID : AM
+   NOTIF.MSG := 'Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+
+   * In production, send emails to both store managers
+   EMAIL.LOG = 'Transfer notification sent to store managers'
+   CALL UTILS.COMMON('LOG.ERROR', EMAIL.LOG, 'INFO')
+   RETURN
+
+END

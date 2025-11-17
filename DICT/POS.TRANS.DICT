@@ -1,0 +1,94 @@
+* POS.TRANS Dictionary Definitions
+* MultiValue Database Schema for Point-of-Sale Transactions
+
+* Field Definitions
+FIELD~TRANS.ID~1~Transaction ID~Primary Key (STORE-REGISTER-SEQ)
+FIELD~TRANS.TYPE~2~Transaction Type~SALE, RETURN, EXCHANGE, VOID, LAYAWAY
+FIELD~TRANS.DATE~3~Transaction Date~
+FIELD~TRANS.TIME~4~Transaction Time~
+FIELD~STORE.ID~5~Store ID~
+FIELD~REGISTER.ID~6~Register ID~
+FIELD~CASHIER.ID~7~Cashier ID~
+FIELD~SALES.REP.ID~8~Sales Rep ID~
+FIELD~CUSTOMER.ID~9~Customer ID~
+FIELD~ITEM.ID~10~Item IDs~Multivalued
+FIELD~SKU~11~SKUs~Multivalued (correlated with 10)
+FIELD~ITEM.DESC~12~Item Descriptions~Multivalued
+FIELD~QTY~13~Quantities~Multivalued
+FIELD~UNIT.PRICE~14~Unit Prices~Multivalued
+FIELD~EXTENDED.PRICE~15~Extended Prices~Multivalued (QTY * UNIT.PRICE)
+FIELD~COST~16~Unit Costs~Multivalued
+FIELD~DISCOUNT.CODE~17~Discount Codes~Multivalued
+FIELD~DISCOUNT.PCT~18~Discount Percentages~Multivalued
+FIELD~DISCOUNT.AMT~19~Discount Amounts~Multivalued
+FIELD~TAX.CODE~20~Tax Codes~Multivalued
+FIELD~TAX.RATE~21~Tax Rates~Multivalued
+FIELD~TAX.AMT~22~Tax Amounts~Multivalued
+FIELD~LINE.TOTAL~23~Line Totals~Multivalued (after discount + tax)
+FIELD~SERIAL.NUMBERS~24~Serial Numbers~Multivalued/Subvalued
+FIELD~LOT.NUMBERS~25~Lot Numbers~Multivalued/Subvalued
+FIELD~RETURN.REASON~26~Return Reason Codes~Multivalued
+FIELD~ORIGINAL.TRANS~27~Original Transaction ID~For returns
+FIELD~SUBTOTAL~28~Subtotal~Sum of line totals before tax
+FIELD~TOTAL.DISCOUNT~29~Total Discount Amount~
+FIELD~TOTAL.TAX~30~Total Tax Amount~
+FIELD~TOTAL.AMOUNT~31~Total Transaction Amount~
+FIELD~PAYMENT.TYPE~32~Payment Types~Multivalued (CASH,CREDIT,DEBIT,CHECK,GIFT)
+FIELD~PAYMENT.AMT~33~Payment Amounts~Multivalued
+FIELD~CARD.TYPE~34~Card Types~Multivalued (VISA,MC,AMEX,DISC)
+FIELD~CARD.NUMBER~35~Card Numbers~Multivalued (masked)
+FIELD~AUTH.CODE~36~Authorization Codes~Multivalued
+FIELD~CHECK.NUMBER~37~Check Numbers~Multivalued
+FIELD~GIFT.CARD.NUM~38~Gift Card Numbers~Multivalued
+FIELD~CHANGE.GIVEN~39~Change Given~
+FIELD~LOYALTY.ID~40~Loyalty ID Used~
+FIELD~POINTS.EARNED~41~Loyalty Points Earned~
+FIELD~POINTS.REDEEMED~42~Loyalty Points Redeemed~
+FIELD~PROMO.CODE~43~Promotion Code Applied~
+FIELD~COUPON.CODE~44~Coupon Codes~Multivalued
+FIELD~COUPON.AMT~45~Coupon Amounts~Multivalued
+FIELD~GIFT.RECEIPT~46~Gift Receipt Flag~Y/N
+FIELD~EMAIL.RECEIPT~47~Email Receipt Flag~Y/N
+FIELD~RECEIPT.EMAIL~48~Receipt Email Address~
+FIELD~COMMISSION.AMT~49~Total Commission Amount~
+FIELD~COMMISSION.SPLIT~50~Commission Split~Multivalued by sales rep
+FIELD~STATUS~51~Transaction Status~COMPLETE, VOID, SUSPENDED, POSTED
+FIELD~VOID.BY~52~Voided By User~
+FIELD~VOID.DATE~53~Void Date~
+FIELD~VOID.TIME~54~Void Time~
+FIELD~VOID.REASON~55~Void Reason~
+FIELD~SUSPEND.ID~56~Suspend/Layaway ID~
+FIELD~SHIP.TO.NAME~57~Ship To Name~
+FIELD~SHIP.TO.ADDRESS~58~Ship To Address~Multivalued (lines)
+FIELD~SHIP.METHOD~59~Shipping Method~
+FIELD~SHIP.COST~60~Shipping Cost~
+FIELD~TRACKING.NUMBER~61~Tracking Number~
+FIELD~NOTES~62~Transaction Notes~Multivalued
+FIELD~POSTED.FLAG~63~Posted to GL Flag~Y/N
+FIELD~POSTED.DATE~64~Posted Date~
+FIELD~BATCH.ID~65~Batch ID~
+FIELD~CREATED.BY~66~Created By User~
+FIELD~CREATED.DATE~67~Created Date~
+FIELD~CREATED.TIME~68~Created Time~
+FIELD~MODIFIED.BY~69~Modified By User~
+FIELD~MODIFIED.DATE~70~Modified Date~
+FIELD~MODIFIED.TIME~71~Modified Time~
+
+* Index Definitions
+INDEX~DATE.IDX~TRANS.DATE~Transaction Date Index
+INDEX~STORE.IDX~STORE.ID~Store Index
+INDEX~CASHIER.IDX~CASHIER.ID~Cashier Index
+INDEX~CUSTOMER.IDX~CUSTOMER.ID~Customer Index
+INDEX~STATUS.IDX~STATUS~Status Index
+INDEX~BATCH.IDX~BATCH.ID~Batch Index
+
+* Correlatives and Derived Fields
+CORR~TOTAL.ITEMS~COUNT(ITEM.ID)
+CORR~TOTAL.UNITS~SUM(QTY)
+CORR~TOTAL.COST~SUM(COST * QTY)
+CORR~GROSS.PROFIT~TOTAL.AMOUNT - TOTAL.COST
+CORR~PROFIT.MARGIN~(GROSS.PROFIT / TOTAL.AMOUNT) * 100
+CORR~AVG.ITEM.PRICE~TOTAL.AMOUNT / TOTAL.UNITS
+CORR~DISCOUNT.RATE~(TOTAL.DISCOUNT / SUBTOTAL) * 100
+CORR~TENDER.TOTAL~SUM(PAYMENT.AMT)
+CORR~TRANS.DATE.TIME~TRANS.DATE:" ":TRANS.TIME

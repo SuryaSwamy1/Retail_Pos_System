@@ -1,0 +1,592 @@
+SUBROUTINE RPT.INVENTORY.STATUS(REPORT.PARAMS, OUTPUT.TYPE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: RPT.INVENTORY.STATUS
+* Purpose: Generate Inventory Status Report
+* Parameters:
+*   REPORT.PARAMS (IN) - Report parameters:
+*                        <1> = Store ID (blank for all)
+*                        <2> = Category filter
+*                        <3> = Show zero qty (Y/N)
+*                        <4> = Show inactive (Y/N)
+*                        <5> = Sort order (QTY/VALUE/SKU/DESCRIPTION)
+*   OUTPUT.TYPE (IN) - Output destination:
+*                      SCREEN, PRINT, FILE, EMAIL
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Parse report parameters
+STORE.ID.FILTER = REPORT.PARAMS<1>
+CATEGORY.FILTER = REPORT.PARAMS<2>
+SHOW.ZERO.QTY = REPORT.PARAMS<3>
+SHOW.INACTIVE = REPORT.PARAMS<4>
+SORT.ORDER = REPORT.PARAMS<5>
+
+IF SHOW.ZERO.QTY = '' THEN SHOW.ZERO.QTY = 'N'
+IF SHOW.INACTIVE = '' THEN SHOW.INACTIVE = 'N'
+IF SORT.ORDER = '' THEN SORT.ORDER = 'SKU'
+
+* Initialize report
+GOSUB INITIALIZE.REPORT
+
+* Collect inventory data
+GOSUB COLLECT.INVENTORY.DATA
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Sort data
+GOSUB SORT.INVENTORY.DATA
+
+* Generate report output
+GOSUB GENERATE.REPORT.OUTPUT
+
+* Output report
+GOSUB OUTPUT.REPORT
+
+LOG.MSG = 'Inventory status report generated: ' : OUTPUT.TYPE
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Initialize Report
+**************************************************************************
+INITIALIZE.REPORT:
+   REPORT.TITLE = 'INVENTORY STATUS REPORT'
+   REPORT.DATE = SYSTEM.DATE
+   REPORT.TIME = SYSTEM.TIME
+   REPORT.USER = USER.ID
+
+   * Initialize counters
+   TOTAL.ITEMS = 0
+   TOTAL.QTY = 0
+   TOTAL.VALUE = 0
+   TOTAL.ON.ORDER = 0
+
+   * Initialize data storage
+   REPORT.DATA = ''
+   RETURN
+
+**************************************************************************
+* Collect Inventory Data
+**************************************************************************
+COLLECT.INVENTORY.DATA:
+   * Build selection criteria
+   SELECT.CMD = 'SELECT INVENTORY'
+
+   IF SHOW.INACTIVE # 'Y' THEN
+      SELECT.CMD := ' WITH STATUS = "ACTIVE"'
+   END
+
+   IF CATEGORY.FILTER # '' THEN
+      SELECT.CMD := ' AND WITH CATEGORY = "' : CATEGORY.FILTER : '"'
+   END
+
+   EXECUTE SELECT.CMD
+
+   ITEM.COUNT = 0
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Apply filters
+      GOSUB APPLY.ITEM.FILTERS
+      IF NOT(INCLUDE.ITEM) THEN CONTINUE
+
+      * Calculate inventory metrics
+      GOSUB CALCULATE.ITEM.METRICS
+
+      * Store item data
+      GOSUB STORE.ITEM.DATA
+
+      ITEM.COUNT += 1
+   REPEAT
+
+   IF ITEM.COUNT = 0 THEN
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'No inventory items found matching criteria'
+      RETURN
+   END
+
+   TOTAL.ITEMS = ITEM.COUNT
+   RETURN
+
+**************************************************************************
+* Apply Item Filters
+**************************************************************************
+APPLY.ITEM.FILTERS:
+   INCLUDE.ITEM = TRUE
+
+   * Get quantity for specified store or total
+   IF STORE.ID.FILTER # '' THEN
+      GOSUB GET.STORE.QTY
+      ITEM.QTY = STORE.QTY
+   END ELSE
+      * Sum all store quantities
+      ITEM.QTY = 0
+      QTY.LIST = ITEM.REC<QTY.ON.HAND>
+
+      IF QTY.LIST # '' THEN
+         QTY.COUNT = DCOUNT(QTY.LIST, VM)
+         FOR I = 1 TO QTY.COUNT
+            QTY.AMT = QTY.LIST<1, I>
+            IF QTY.AMT # '' THEN
+               ITEM.QTY += QTY.AMT
+            END
+         NEXT I
+      END
+   END
+
+   * Filter zero quantity items
+   IF SHOW.ZERO.QTY # 'Y' AND ITEM.QTY <= 0 THEN
+      INCLUDE.ITEM = FALSE
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Get Store Qty
+**************************************************************************
+GET.STORE.QTY:
+   STORE.QTY = 0
+
+   * Find store index
+   STORE.INDEX = 0
+   GOSUB FIND.STORE.INDEX
+
+   IF STORE.INDEX > 0 THEN
+      QTY.AMT = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+      IF QTY.AMT # '' THEN
+         STORE.QTY = QTY.AMT
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Find Store Index
+**************************************************************************
+FIND.STORE.INDEX:
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT ST.ID ELSE EXIT
+      CURRENT.INDEX += 1
+
+      IF ST.ID = STORE.ID.FILTER THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Calculate Item Metrics
+**************************************************************************
+CALCULATE.ITEM.METRICS:
+   * Item identification
+   ITEM.SKU = ITEM.REC<SKU>
+   ITEM.DESC = ITEM.REC<ITEM.DESCRIPTION>
+   ITEM.CATEGORY = ITEM.REC<CATEGORY>
+
+   * Costs and pricing
+   ITEM.COST = ITEM.REC<AVG.COST>
+   IF ITEM.COST = '' THEN ITEM.COST = 0
+
+   ITEM.PRICE = ITEM.REC<PRICE.LEVEL1>
+   IF ITEM.PRICE = '' THEN ITEM.PRICE = 0
+
+   * Calculate extended value
+   ITEM.EXT.COST = ITEM.QTY * ITEM.COST
+   ITEM.EXT.PRICE = ITEM.QTY * ITEM.PRICE
+
+   * Margin calculation
+   IF ITEM.PRICE > 0 THEN
+      ITEM.MARGIN.AMT = ITEM.PRICE - ITEM.COST
+      ITEM.MARGIN.PCT = (ITEM.MARGIN.AMT / ITEM.PRICE) * 100
+   END ELSE
+      ITEM.MARGIN.AMT = 0
+      ITEM.MARGIN.PCT = 0
+   END
+
+   * On order quantity
+   ITEM.ON.ORDER = ITEM.REC<QTY.ON.ORDER>
+   IF ITEM.ON.ORDER = '' THEN ITEM.ON.ORDER = 0
+
+   * Reorder status
+   ITEM.MIN.QTY = ITEM.REC<MIN.QTY>
+   IF ITEM.MIN.QTY = '' THEN ITEM.MIN.QTY = 0
+
+   ITEM.REORDER.QTY = ITEM.REC<REORDER.QTY>
+   IF ITEM.REORDER.QTY = '' THEN ITEM.REORDER.QTY = 0
+
+   REORDER.STATUS = ''
+   BEGIN CASE
+      CASE ITEM.QTY <= 0
+         REORDER.STATUS = 'OUT OF STOCK'
+
+      CASE ITEM.QTY <= ITEM.MIN.QTY
+         REORDER.STATUS = 'REORDER NOW'
+
+      CASE ITEM.QTY <= (ITEM.MIN.QTY * 1.5)
+         REORDER.STATUS = 'LOW STOCK'
+
+      CASE 1
+         REORDER.STATUS = 'OK'
+   END CASE
+
+   * Sales velocity (30-day)
+   SALES.30DAY = ITEM.REC<SALES.30DAY>
+   IF SALES.30DAY = '' THEN SALES.30DAY = 0
+
+   * Calculate days of supply
+   IF SALES.30DAY > 0 THEN
+      DAILY.SALES = SALES.30DAY / 30
+      IF DAILY.SALES > 0 THEN
+         DAYS.SUPPLY = INT(ITEM.QTY / DAILY.SALES)
+      END ELSE
+         DAYS.SUPPLY = 999
+      END
+   END ELSE
+      DAYS.SUPPLY = 999
+   END
+
+   * Last received date
+   LAST.RECEIVED = ITEM.REC<LAST.RECEIVED.DATE>
+
+   * Update totals
+   TOTAL.QTY += ITEM.QTY
+   TOTAL.VALUE += ITEM.EXT.COST
+   TOTAL.ON.ORDER += ITEM.ON.ORDER
+   RETURN
+
+**************************************************************************
+* Store Item Data
+**************************************************************************
+STORE.ITEM.DATA:
+   * Store data row (using attribute marks for columns)
+   DATA.ROW = ITEM.ID
+   DATA.ROW := AM : ITEM.SKU
+   DATA.ROW := AM : ITEM.DESC
+   DATA.ROW := AM : ITEM.CATEGORY
+   DATA.ROW := AM : ITEM.QTY
+   DATA.ROW := AM : ITEM.COST
+   DATA.ROW := AM : ITEM.EXT.COST
+   DATA.ROW := AM : ITEM.PRICE
+   DATA.ROW := AM : ITEM.MARGIN.PCT
+   DATA.ROW := AM : ITEM.ON.ORDER
+   DATA.ROW := AM : REORDER.STATUS
+   DATA.ROW := AM : SALES.30DAY
+   DATA.ROW := AM : DAYS.SUPPLY
+   DATA.ROW := AM : LAST.RECEIVED
+
+   * Add to report data
+   IF REPORT.DATA = '' THEN
+      REPORT.DATA = DATA.ROW
+   END ELSE
+      REPORT.DATA := VM : DATA.ROW
+   END
+   RETURN
+
+**************************************************************************
+* Sort Inventory Data
+**************************************************************************
+SORT.INVENTORY.DATA:
+   IF REPORT.DATA = '' THEN RETURN
+
+   ROW.COUNT = DCOUNT(REPORT.DATA, VM)
+   IF ROW.COUNT <= 1 THEN RETURN
+
+   * Simple bubble sort
+   FOR I = 1 TO ROW.COUNT - 1
+      FOR J = I + 1 TO ROW.COUNT
+         ROW1 = REPORT.DATA<1, I>
+         ROW2 = REPORT.DATA<1, J>
+
+         GOSUB COMPARE.ROWS
+
+         IF SWAP.ROWS THEN
+            * Swap rows
+            REPORT.DATA<1, I> = ROW2
+            REPORT.DATA<1, J> = ROW1
+         END
+      NEXT J
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Compare Rows
+**************************************************************************
+COMPARE.ROWS:
+   SWAP.ROWS = FALSE
+
+   BEGIN CASE
+      CASE SORT.ORDER = 'SKU'
+         SKU1 = ROW1<1, 1, 2>
+         SKU2 = ROW2<1, 1, 2>
+         IF SKU1 > SKU2 THEN SWAP.ROWS = TRUE
+
+      CASE SORT.ORDER = 'DESCRIPTION'
+         DESC1 = ROW1<1, 1, 3>
+         DESC2 = ROW2<1, 1, 3>
+         IF DESC1 > DESC2 THEN SWAP.ROWS = TRUE
+
+      CASE SORT.ORDER = 'QTY'
+         QTY1 = ROW1<1, 1, 5>
+         QTY2 = ROW2<1, 1, 5>
+         IF QTY1 < QTY2 THEN SWAP.ROWS = TRUE  ; Descending
+
+      CASE SORT.ORDER = 'VALUE'
+         VALUE1 = ROW1<1, 1, 7>
+         VALUE2 = ROW2<1, 1, 7>
+         IF VALUE1 < VALUE2 THEN SWAP.ROWS = TRUE  ; Descending
+   END CASE
+   RETURN
+
+**************************************************************************
+* Generate Report Output
+**************************************************************************
+GENERATE.REPORT.OUTPUT:
+   REPORT.OUTPUT = ''
+
+   * Report header
+   GOSUB BUILD.REPORT.HEADER
+
+   * Column headers
+   GOSUB BUILD.COLUMN.HEADERS
+
+   * Detail lines
+   GOSUB BUILD.DETAIL.LINES
+
+   * Report footer
+   GOSUB BUILD.REPORT.FOOTER
+   RETURN
+
+**************************************************************************
+* Build Report Header
+**************************************************************************
+BUILD.REPORT.HEADER:
+   SEPARATOR = CONVERT(' ', '=', SPACE(120))
+
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := '                    ' : REPORT.TITLE : CHAR(10)
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := CHAR(10)
+
+   REPORT.OUTPUT := 'Report Date: ' : OCONV(REPORT.DATE, 'D4/') : CHAR(10)
+   REPORT.OUTPUT := 'Report Time: '
+   CALL UTILS.COMMON('FORMAT.TIME', REPORT.TIME, FMT.TIME)
+   REPORT.OUTPUT := FMT.TIME : CHAR(10)
+   REPORT.OUTPUT := 'Run By: ' : REPORT.USER : CHAR(10)
+
+   IF STORE.ID.FILTER # '' THEN
+      REPORT.OUTPUT := 'Store: ' : STORE.ID.FILTER : CHAR(10)
+   END ELSE
+      REPORT.OUTPUT := 'Store: ALL STORES' : CHAR(10)
+   END
+
+   IF CATEGORY.FILTER # '' THEN
+      REPORT.OUTPUT := 'Category: ' : CATEGORY.FILTER : CHAR(10)
+   END
+
+   REPORT.OUTPUT := CHAR(10) : SEPARATOR : CHAR(10) : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Build Column Headers
+**************************************************************************
+BUILD.COLUMN.HEADERS:
+   HEADER.LINE1 = ''
+   HEADER.LINE1 := 'SKU' : SPACE(12)
+   HEADER.LINE1 := 'Description' : SPACE(24)
+   HEADER.LINE1 := 'Category' : SPACE(7)
+   HEADER.LINE1 := 'Qty' : SPACE(5)
+   HEADER.LINE1 := 'Cost' : SPACE(5)
+   HEADER.LINE1 := 'Ext Cost' : SPACE(3)
+   HEADER.LINE1 := 'Margin%' : SPACE(2)
+   HEADER.LINE1 := 'On Order' : SPACE(1)
+   HEADER.LINE1 := 'Status' : SPACE(9)
+   HEADER.LINE1 := 'Days Supply'
+
+   REPORT.OUTPUT := HEADER.LINE1 : CHAR(10)
+
+   UNDERLINE = CONVERT(' ', '-', SPACE(120))
+   REPORT.OUTPUT := UNDERLINE : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Build Detail Lines
+**************************************************************************
+BUILD.DETAIL.LINES:
+   IF REPORT.DATA = '' THEN RETURN
+
+   ROW.COUNT = DCOUNT(REPORT.DATA, VM)
+
+   FOR I = 1 TO ROW.COUNT
+      DATA.ROW = REPORT.DATA<1, I>
+
+      ITEM.ID = DATA.ROW<1, 1, 1>
+      ITEM.SKU = DATA.ROW<1, 1, 2>
+      ITEM.DESC = DATA.ROW<1, 1, 3>
+      ITEM.CATEGORY = DATA.ROW<1, 1, 4>
+      ITEM.QTY = DATA.ROW<1, 1, 5>
+      ITEM.COST = DATA.ROW<1, 1, 6>
+      ITEM.EXT.COST = DATA.ROW<1, 1, 7>
+      ITEM.PRICE = DATA.ROW<1, 1, 8>
+      ITEM.MARGIN.PCT = DATA.ROW<1, 1, 9>
+      ITEM.ON.ORDER = DATA.ROW<1, 1, 10>
+      REORDER.STATUS = DATA.ROW<1, 1, 11>
+      SALES.30DAY = DATA.ROW<1, 1, 12>
+      DAYS.SUPPLY = DATA.ROW<1, 1, 13>
+
+      * Format data
+      SKU.STR = ITEM.SKU[1,15]
+      DESC.STR = ITEM.DESC[1,35]
+      CAT.STR = ITEM.CATEGORY[1,15]
+
+      QTY.STR = OCONV(ITEM.QTY, 'R(#####)')
+      CALL UTILS.COMMON('FORMAT.AMOUNT', ITEM.COST, FMT.COST)
+      CALL UTILS.COMMON('FORMAT.AMOUNT', ITEM.EXT.COST, FMT.EXT)
+
+      MARGIN.STR = OCONV(ITEM.MARGIN.PCT, 'MD2')
+      MARGIN.STR = MARGIN.STR : '%'
+
+      ORDER.STR = OCONV(ITEM.ON.ORDER, 'R(#####)')
+
+      STATUS.STR = REORDER.STATUS[1,15]
+
+      IF DAYS.SUPPLY >= 999 THEN
+         SUPPLY.STR = '999+'
+      END ELSE
+         SUPPLY.STR = OCONV(DAYS.SUPPLY, 'R(###)')
+      END
+
+      * Build detail line
+      DETAIL.LINE = ''
+      DETAIL.LINE := SKU.STR : SPACE(16 - LEN(SKU.STR))
+      DETAIL.LINE := DESC.STR : SPACE(36 - LEN(DESC.STR))
+      DETAIL.LINE := CAT.STR : SPACE(16 - LEN(CAT.STR))
+      DETAIL.LINE := QTY.STR : SPACE(9 - LEN(QTY.STR))
+      DETAIL.LINE := FMT.COST : SPACE(10 - LEN(FMT.COST))
+      DETAIL.LINE := FMT.EXT : SPACE(12 - LEN(FMT.EXT))
+      DETAIL.LINE := MARGIN.STR : SPACE(10 - LEN(MARGIN.STR))
+      DETAIL.LINE := ORDER.STR : SPACE(10 - LEN(ORDER.STR))
+      DETAIL.LINE := STATUS.STR : SPACE(16 - LEN(STATUS.STR))
+      DETAIL.LINE := SUPPLY.STR
+
+      REPORT.OUTPUT := DETAIL.LINE : CHAR(10)
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Build Report Footer
+**************************************************************************
+BUILD.REPORT.FOOTER:
+   SEPARATOR = CONVERT(' ', '=', SPACE(120))
+
+   REPORT.OUTPUT := CHAR(10) : SEPARATOR : CHAR(10)
+
+   * Totals
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.VALUE, FMT.VALUE)
+
+   REPORT.OUTPUT := 'Total Items: ' : TOTAL.ITEMS : CHAR(10)
+   REPORT.OUTPUT := 'Total Quantity: ' : TOTAL.QTY : CHAR(10)
+   REPORT.OUTPUT := 'Total Value: $' : FMT.VALUE : CHAR(10)
+   REPORT.OUTPUT := 'Total On Order: ' : TOTAL.ON.ORDER : CHAR(10)
+
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := 'End of Report' : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Output Report
+**************************************************************************
+OUTPUT.REPORT:
+   BEGIN CASE
+      CASE OUTPUT.TYPE = 'SCREEN'
+         GOSUB OUTPUT.TO.SCREEN
+
+      CASE OUTPUT.TYPE = 'PRINT'
+         GOSUB OUTPUT.TO.PRINTER
+
+      CASE OUTPUT.TYPE = 'FILE'
+         GOSUB OUTPUT.TO.FILE
+
+      CASE OUTPUT.TYPE = 'EMAIL'
+         GOSUB OUTPUT.TO.EMAIL
+
+      CASE 1
+         GOSUB OUTPUT.TO.SCREEN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Output to Screen
+**************************************************************************
+OUTPUT.TO.SCREEN:
+   * Display to terminal
+   CRT REPORT.OUTPUT
+   RETURN
+
+**************************************************************************
+* Output to Printer
+**************************************************************************
+OUTPUT.TO.PRINTER:
+   * Send to default printer
+   PRINTER ON
+   PRINT REPORT.OUTPUT
+   PRINTER OFF
+   RETURN
+
+**************************************************************************
+* Output to File
+**************************************************************************
+OUTPUT.TO.FILE:
+   * Write to reports directory
+   OPEN 'REPORTS' TO F.REPORTS ELSE
+      EXECUTE 'CREATE.FILE REPORTS 1 101'
+      OPEN 'REPORTS' TO F.REPORTS ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open reports file'
+         RETURN
+      END
+   END
+
+   REPORT.ID = 'INV.STATUS*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   WRITE REPORT.OUTPUT TO F.REPORTS, REPORT.ID ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Cannot write report file'
+      RETURN
+   END
+
+   CRT 'Report saved: ' : REPORT.ID
+   RETURN
+
+**************************************************************************
+* Output to Email
+**************************************************************************
+OUTPUT.TO.EMAIL:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Cannot open email queue'
+      RETURN
+   END
+
+   EMAIL.ID = 'RPT.INV*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'inventory@company.com'
+   EMAIL.REC<2> = 'Inventory Status Report - ' : OCONV(SYSTEM.DATE, 'D4/')
+   EMAIL.REC<3> = REPORT.OUTPUT
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

@@ -1,0 +1,765 @@
+SUBROUTINE EMP.TERMINATE(EMP.ID, TERM.DATE, TERM.REASON, TERM.TYPE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: EMP.TERMINATE
+* Purpose: Process Employee Termination
+* Parameters:
+*   EMP.ID (IN) - Employee ID to terminate
+*   TERM.DATE (IN) - Termination date
+*   TERM.REASON (IN) - Reason for termination
+*   TERM.TYPE (IN) - Termination type (VOLUNTARY/INVOLUNTARY/RETIREMENT)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate employee ID
+IF EMP.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Employee ID is required'
+   RETURN
+END
+
+* Read and lock employee record
+READU EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Employee not found: ' : EMP.ID
+   RETURN
+END
+
+* Check if already terminated
+IF EMP.REC<EMP.STATUS> = 'TERMINATED' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Employee is already terminated'
+   RELEASE F.EMPLOYEES, EMP.ID
+   RETURN
+END
+
+* Validate termination date
+IF TERM.DATE = '' THEN
+   TERM.DATE = SYSTEM.DATE
+END ELSE
+   IF TERM.DATE < EMP.REC<HIRE.DATE> THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Termination date cannot be before hire date'
+      RELEASE F.EMPLOYEES, EMP.ID
+      RETURN
+   END
+END
+
+* Validate termination type
+VALID.TYPES = 'VOLUNTARY':VM:'INVOLUNTARY':VM:'RETIREMENT':VM:'LAYOFF':VM:'DEATH'
+LOCATE TERM.TYPE IN VALID.TYPES<1> USING VM SETTING POS ELSE
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid termination type'
+   RELEASE F.EMPLOYEES, EMP.ID
+   RETURN
+END
+
+* Update employee status
+EMP.REC<EMP.STATUS> = 'TERMINATED'
+EMP.REC<TERM.DATE.FIELD> = TERM.DATE
+EMP.REC<TERM.REASON.FIELD> = TERM.REASON
+EMP.REC<TERM.TYPE.FIELD> = TERM.TYPE
+
+* Deactivate user account
+GOSUB DEACTIVATE.USER.ACCOUNT
+
+* Calculate final compensation
+GOSUB CALCULATE.FINAL.COMPENSATION
+
+* Process benefits termination
+GOSUB PROCESS.BENEFITS.TERMINATION
+
+* Create exit interview
+GOSUB CREATE.EXIT.INTERVIEW
+
+* Process equipment return
+GOSUB CREATE.EQUIPMENT.RETURN.LIST
+
+* Close open timecards
+GOSUB CLOSE.OPEN.TIMECARDS
+
+* Process 401k rollover
+GOSUB PROCESS.401K.ROLLOVER
+
+* Generate termination documents
+GOSUB GENERATE.TERMINATION.DOCS
+
+* Update supervisor assignments
+GOSUB REASSIGN.SUBORDINATES
+
+* Cancel future schedules
+GOSUB CANCEL.FUTURE.SCHEDULES
+
+* Archive employee data
+GOSUB ARCHIVE.EMPLOYEE.DATA
+
+* Update audit fields
+EMP.REC<EMP.MODIFIED.BY> = USER.ID
+EMP.REC<EMP.MODIFIED.DATE> = SYSTEM.DATE
+EMP.REC<EMP.MODIFIED.TIME> = SYSTEM.TIME
+
+* Write updated record
+WRITE EMP.REC TO F.EMPLOYEES, EMP.ID
+
+* Send notifications
+GOSUB SEND.TERMINATION.NOTIFICATIONS
+
+LOG.MSG = 'Employee terminated: ' : EMP.ID : ' - ' : TERM.TYPE
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Deactivate User Account
+**************************************************************************
+DEACTIVATE.USER.ACCOUNT:
+   OPEN 'USERS' TO F.USERS ELSE
+      RETURN
+   END
+
+   USER.ID.VAL = EMP.REC<USER.ID>
+
+   READU USER.REC FROM F.USERS, USER.ID.VAL ELSE
+      RETURN
+   END
+
+   USER.REC<3> = 'INACTIVE'
+   USER.REC<4> = 0  ; Remove access level
+   USER.REC<8> = TERM.DATE
+   USER.REC<9> = 'TERMINATED'
+
+   WRITE USER.REC TO F.USERS, USER.ID.VAL
+
+   LOG.MSG = 'User account deactivated: ' : USER.ID.VAL
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Calculate Final Compensation
+**************************************************************************
+CALCULATE.FINAL.COMPENSATION:
+   OPEN 'FINAL.PAYCHECKS' TO F.FINAL.PAY ELSE
+      EXECUTE 'CREATE.FILE FINAL.PAYCHECKS 1 101'
+      OPEN 'FINAL.PAYCHECKS' TO F.FINAL.PAY ELSE
+         RETURN
+      END
+   END
+
+   FINAL.ID = EMP.ID
+   FINAL.REC = ''
+   FINAL.REC<1> = EMP.ID
+   FINAL.REC<2> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   FINAL.REC<3> = TERM.DATE
+   FINAL.REC<4> = TERM.TYPE
+
+   * Calculate unpaid wages
+   GOSUB CALCULATE.UNPAID.WAGES
+   FINAL.REC<10> = UNPAID.WAGES
+
+   * Calculate PTO payout
+   GOSUB CALCULATE.PTO.PAYOUT
+   FINAL.REC<11> = PTO.PAYOUT
+
+   * Calculate unused sick time (if applicable)
+   GOSUB CALCULATE.SICK.PAYOUT
+   FINAL.REC<12> = SICK.PAYOUT
+
+   * Calculate pro-rated bonus
+   GOSUB CALCULATE.PRORATED.BONUS
+   FINAL.REC<13> = PRORATED.BONUS
+
+   * Calculate commission owed
+   GOSUB CALCULATE.COMMISSION.OWED
+   FINAL.REC<14> = COMMISSION.OWED
+
+   * Calculate severance (if applicable)
+   GOSUB CALCULATE.SEVERANCE
+   FINAL.REC<15> = SEVERANCE.PAY
+
+   * Total final compensation
+   TOTAL.FINAL.PAY = UNPAID.WAGES + PTO.PAYOUT + SICK.PAYOUT
+   TOTAL.FINAL.PAY += PRORATED.BONUS + COMMISSION.OWED + SEVERANCE.PAY
+
+   FINAL.REC<20> = TOTAL.FINAL.PAY
+   FINAL.REC<25> = 'PENDING'
+   FINAL.REC<26> = SYSTEM.DATE
+   FINAL.REC<27> = USER.ID
+
+   WRITE FINAL.REC TO F.FINAL.PAY, FINAL.ID
+   RETURN
+
+**************************************************************************
+* Calculate Unpaid Wages
+**************************************************************************
+CALCULATE.UNPAID.WAGES:
+   UNPAID.WAGES = 0
+
+   OPEN 'TIMECARDS' TO F.TIMECARDS ELSE
+      RETURN
+   END
+
+   * Find last pay period end date
+   LAST.PAY.DATE = SYSTEM.DATE - 14  ; Assume bi-weekly
+
+   SELECT.CMD = 'SELECT TIMECARDS WITH @ID LIKE "' : EMP.ID : '*..."'
+   EXECUTE SELECT.CMD
+
+   TOTAL.HOURS = 0
+   LOOP
+      READNEXT TC.ID ELSE EXIT
+
+      READ TC.REC FROM F.TIMECARDS, TC.ID ELSE CONTINUE
+
+      TC.DATE = TC.REC<1>
+      IF TC.DATE > LAST.PAY.DATE AND TC.DATE <= TERM.DATE THEN
+         HOURS = TC.REC<7>  ; Regular hours
+         OT.HOURS = TC.REC<9>  ; Overtime hours
+         IF HOURS # '' THEN TOTAL.HOURS += HOURS
+         IF OT.HOURS # '' THEN TOTAL.HOURS += (OT.HOURS * 1.5)
+      END
+   REPEAT
+
+   IF EMP.REC<PAY.TYPE> = 'HOURLY' THEN
+      UNPAID.WAGES = TOTAL.HOURS * EMP.REC<PAY.RATE>
+   END ELSE
+      * Salaried - calculate daily rate
+      DAILY.RATE = EMP.REC<PAY.RATE> / 260  ; 52 weeks * 5 days
+      DAYS.WORKED = TOTAL.HOURS / 8
+      UNPAID.WAGES = DAYS.WORKED * DAILY.RATE
+   END
+   RETURN
+
+**************************************************************************
+* Calculate PTO Payout
+**************************************************************************
+CALCULATE.PTO.PAYOUT:
+   PTO.PAYOUT = 0
+
+   PTO.BALANCE = EMP.REC<PTO.BALANCE>
+   IF PTO.BALANCE = '' OR PTO.BALANCE <= 0 THEN RETURN
+
+   * Check if PTO is payable based on termination type
+   IF TERM.TYPE = 'INVOLUNTARY' THEN
+      * Check company policy - some states require PTO payout
+      PAYOUT.REQUIRED = TRUE  ; Assume required
+   END ELSE
+      PAYOUT.REQUIRED = TRUE
+   END
+
+   IF NOT(PAYOUT.REQUIRED) THEN RETURN
+
+   * Calculate hourly rate
+   IF EMP.REC<PAY.TYPE> = 'HOURLY' THEN
+      HOURLY.RATE = EMP.REC<PAY.RATE>
+   END ELSE
+      HOURLY.RATE = EMP.REC<PAY.RATE> / 2080
+   END
+
+   PTO.PAYOUT = PTO.BALANCE * HOURLY.RATE
+   RETURN
+
+**************************************************************************
+* Calculate Sick Payout
+**************************************************************************
+CALCULATE.SICK.PAYOUT:
+   SICK.PAYOUT = 0
+
+   * Sick time typically not paid out unless state requires
+   STATE.CODE = EMP.REC<STATE>
+
+   STATES.REQUIRING.SICK.PAY = 'CA':VM:'MA':VM:'NY'
+   LOCATE STATE.CODE IN STATES.REQUIRING.SICK.PAY<1> USING VM SETTING POS ELSE
+      RETURN
+   END
+
+   SICK.BALANCE = EMP.REC<SICK.BALANCE>
+   IF SICK.BALANCE = '' OR SICK.BALANCE <= 0 THEN RETURN
+
+   IF EMP.REC<PAY.TYPE> = 'HOURLY' THEN
+      HOURLY.RATE = EMP.REC<PAY.RATE>
+   END ELSE
+      HOURLY.RATE = EMP.REC<PAY.RATE> / 2080
+   END
+
+   SICK.PAYOUT = SICK.BALANCE * HOURLY.RATE
+   RETURN
+
+**************************************************************************
+* Calculate Prorated Bonus
+**************************************************************************
+CALCULATE.PRORATED.BONUS:
+   PRORATED.BONUS = 0
+
+   * Check if employee is eligible for bonus
+   IF EMP.REC<BONUS.ELIGIBLE> # 'Y' THEN RETURN
+
+   * Only for voluntary termination or retirement
+   IF TERM.TYPE # 'VOLUNTARY' AND TERM.TYPE # 'RETIREMENT' THEN RETURN
+
+   * Get target annual bonus
+   TARGET.BONUS = EMP.REC<BONUS.TARGET>
+   IF TARGET.BONUS = '' OR TARGET.BONUS <= 0 THEN RETURN
+
+   * Calculate proration based on days worked in year
+   YEAR.START = ICONV('01/01/' : OCONV(SYSTEM.DATE, 'D4/')[7,4], 'D/')
+   DAYS.WORKED = TERM.DATE - YEAR.START
+   DAYS.IN.YEAR = 365
+
+   PRORATED.BONUS = (TARGET.BONUS * DAYS.WORKED) / DAYS.IN.YEAR
+   RETURN
+
+**************************************************************************
+* Calculate Commission Owed
+**************************************************************************
+CALCULATE.COMMISSION.OWED:
+   COMMISSION.OWED = 0
+
+   SELECT.CMD = 'SELECT POS.TRANS WITH SALES.PERSON.ID = "' : EMP.ID : '"'
+   SELECT.CMD := ' AND WITH COMMISSION.PAID = "N"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      COMM.AMT = TRANS.REC<44>
+      IF COMM.AMT # '' THEN
+         COMMISSION.OWED += COMM.AMT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Calculate Severance
+**************************************************************************
+CALCULATE.SEVERANCE:
+   SEVERANCE.PAY = 0
+
+   * Severance typically for layoffs or mutual separation
+   IF TERM.TYPE # 'LAYOFF' AND TERM.TYPE # 'INVOLUNTARY' THEN RETURN
+
+   * Calculate years of service
+   HIRE.DATE = EMP.REC<HIRE.DATE>
+   DAYS.SERVICE = TERM.DATE - HIRE.DATE
+   YEARS.SERVICE = INT(DAYS.SERVICE / 365)
+
+   * Severance formula: 1 week per year of service (minimum 2 weeks)
+   WEEKS.SEVERANCE = YEARS.SERVICE
+   IF WEEKS.SEVERANCE < 2 THEN WEEKS.SEVERANCE = 2
+   IF WEEKS.SEVERANCE > 26 THEN WEEKS.SEVERANCE = 26  ; Cap at 6 months
+
+   * Calculate weekly pay
+   IF EMP.REC<PAY.TYPE> = 'HOURLY' THEN
+      WEEKLY.PAY = EMP.REC<PAY.RATE> * 40
+   END ELSE
+      WEEKLY.PAY = EMP.REC<PAY.RATE> / 52
+   END
+
+   SEVERANCE.PAY = WEEKS.SEVERANCE * WEEKLY.PAY
+   RETURN
+
+**************************************************************************
+* Process Benefits Termination
+**************************************************************************
+PROCESS.BENEFITS.TERMINATION:
+   OPEN 'BENEFITS.TERMS' TO F.BENEFITS.TERMS ELSE
+      EXECUTE 'CREATE.FILE BENEFITS.TERMS 1 101'
+      OPEN 'BENEFITS.TERMS' TO F.BENEFITS.TERMS ELSE
+         RETURN
+      END
+   END
+
+   BENEFIT.TERM.ID = EMP.ID
+   BENEFIT.TERM.REC = ''
+   BENEFIT.TERM.REC<1> = EMP.ID
+   BENEFIT.TERM.REC<2> = TERM.DATE
+   BENEFIT.TERM.REC<3> = EMP.REC<MEDICAL.PLAN>
+   BENEFIT.TERM.REC<4> = EMP.REC<DENTAL.PLAN>
+   BENEFIT.TERM.REC<5> = EMP.REC<VISION.PLAN>
+   BENEFIT.TERM.REC<6> = EMP.REC<K401.PERCENT>
+
+   * Calculate COBRA eligibility end date (18 months)
+   COBRA.END.DATE = TERM.DATE + 548  ; ~18 months
+   BENEFIT.TERM.REC<10> = COBRA.END.DATE
+
+   * COBRA monthly premium
+   GOSUB CALCULATE.COBRA.PREMIUM
+   BENEFIT.TERM.REC<11> = COBRA.PREMIUM
+
+   BENEFIT.TERM.REC<15> = 'PENDING'
+   BENEFIT.TERM.REC<16> = SYSTEM.DATE
+
+   WRITE BENEFIT.TERM.REC TO F.BENEFITS.TERMS, BENEFIT.TERM.ID
+   RETURN
+
+**************************************************************************
+* Calculate COBRA Premium
+**************************************************************************
+CALCULATE.COBRA.PREMIUM:
+   COBRA.PREMIUM = 0
+
+   * Medical
+   IF EMP.REC<MEDICAL.PLAN> # '' THEN
+      BEGIN CASE
+         CASE EMP.REC<MEDICAL.PLAN> = 'BASIC'
+            COBRA.PREMIUM += 400
+         CASE EMP.REC<MEDICAL.PLAN> = 'STANDARD'
+            COBRA.PREMIUM += 650
+         CASE EMP.REC<MEDICAL.PLAN> = 'PREMIUM'
+            COBRA.PREMIUM += 950
+      END CASE
+   END
+
+   * Dental
+   IF EMP.REC<DENTAL.PLAN> # '' THEN
+      COBRA.PREMIUM += 60
+   END
+
+   * Vision
+   IF EMP.REC<VISION.PLAN> # '' THEN
+      COBRA.PREMIUM += 30
+   END
+
+   * Add 2% administrative fee
+   COBRA.PREMIUM = COBRA.PREMIUM * 1.02
+   RETURN
+
+**************************************************************************
+* Create Exit Interview
+**************************************************************************
+CREATE.EXIT.INTERVIEW:
+   OPEN 'EXIT.INTERVIEWS' TO F.EXIT ELSE
+      EXECUTE 'CREATE.FILE EXIT.INTERVIEWS 1 101'
+      OPEN 'EXIT.INTERVIEWS' TO F.EXIT ELSE
+         RETURN
+      END
+   END
+
+   EXIT.ID = EMP.ID
+   EXIT.REC = ''
+   EXIT.REC<1> = EMP.ID
+   EXIT.REC<2> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   EXIT.REC<3> = TERM.DATE
+   EXIT.REC<4> = TERM.TYPE
+   EXIT.REC<5> = TERM.REASON
+   EXIT.REC<6> = EMP.REC<HIRE.DATE>
+   EXIT.REC<7> = EMP.REC<POSITION>
+   EXIT.REC<8> = EMP.REC<DEPARTMENT>
+   EXIT.REC<9> = EMP.REC<SUPERVISOR.ID>
+   EXIT.REC<10> = 'PENDING'  ; Interview status
+   EXIT.REC<11> = SYSTEM.DATE
+
+   WRITE EXIT.REC TO F.EXIT, EXIT.ID
+   RETURN
+
+**************************************************************************
+* Create Equipment Return List
+**************************************************************************
+CREATE.EQUIPMENT.RETURN.LIST:
+   OPEN 'EQUIPMENT.RETURNS' TO F.EQUIP.RETURN ELSE
+      EXECUTE 'CREATE.FILE EQUIPMENT.RETURNS 1 101'
+      OPEN 'EQUIPMENT.RETURNS' TO F.EQUIP.RETURN ELSE
+         RETURN
+      END
+   END
+
+   EQUIP.RETURN.ID = EMP.ID
+   EQUIP.RETURN.REC = ''
+   EQUIP.RETURN.REC<1> = EMP.ID
+   EQUIP.RETURN.REC<2> = TERM.DATE
+
+   * Common items to return
+   ITEM.NUM = 0
+
+   * Badge
+   ITEM.NUM += 1
+   EQUIP.RETURN.REC<10, ITEM.NUM> = 'EMPLOYEE BADGE'
+   EQUIP.RETURN.REC<11, ITEM.NUM> = 'PENDING'
+
+   * Keys
+   ITEM.NUM += 1
+   EQUIP.RETURN.REC<10, ITEM.NUM> = 'STORE KEYS'
+   EQUIP.RETURN.REC<11, ITEM.NUM> = 'PENDING'
+
+   * Uniform
+   ITEM.NUM += 1
+   EQUIP.RETURN.REC<10, ITEM.NUM> = 'UNIFORM'
+   EQUIP.RETURN.REC<11, ITEM.NUM> = 'PENDING'
+
+   * Computer/laptop (if assigned)
+   ITEM.NUM += 1
+   EQUIP.RETURN.REC<10, ITEM.NUM> = 'COMPUTER EQUIPMENT'
+   EQUIP.RETURN.REC<11, ITEM.NUM> = 'PENDING'
+
+   * Mobile device
+   ITEM.NUM += 1
+   EQUIP.RETURN.REC<10, ITEM.NUM> = 'MOBILE DEVICE'
+   EQUIP.RETURN.REC<11, ITEM.NUM> = 'PENDING'
+
+   EQUIP.RETURN.REC<20> = 'PENDING'
+   EQUIP.RETURN.REC<21> = SYSTEM.DATE
+
+   WRITE EQUIP.RETURN.REC TO F.EQUIP.RETURN, EQUIP.RETURN.ID
+   RETURN
+
+**************************************************************************
+* Close Open Timecards
+**************************************************************************
+CLOSE.OPEN.TIMECARDS:
+   OPEN 'TIMECARDS' TO F.TIMECARDS ELSE
+      RETURN
+   END
+
+   SELECT.CMD = 'SELECT TIMECARDS WITH @ID LIKE "' : EMP.ID : '*..."'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TC.ID ELSE EXIT
+
+      READU TC.REC FROM F.TIMECARDS, TC.ID ELSE CONTINUE
+
+      * Check if timecard is open (no clock out)
+      IF TC.REC<3> = '' THEN
+         * Auto clock-out at termination date/time
+         TC.REC<3> = SYSTEM.TIME
+         TC.REC<10> = 'AUTO-CLOSED: TERMINATION'
+
+         * Calculate hours
+         CLOCK.IN = TC.REC<2>
+         CLOCK.OUT = TC.REC<3>
+         HOURS = (CLOCK.OUT - CLOCK.IN) / 3600
+         TC.REC<7> = HOURS
+
+         WRITE TC.REC TO F.TIMECARDS, TC.ID
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Process 401k Rollover
+**************************************************************************
+PROCESS.401K.ROLLOVER:
+   IF EMP.REC<K401.PERCENT> = '' OR EMP.REC<K401.PERCENT> <= 0 THEN RETURN
+
+   OPEN 'K401.ROLLOVERS' TO F.K401 ELSE
+      EXECUTE 'CREATE.FILE K401.ROLLOVERS 1 101'
+      OPEN 'K401.ROLLOVERS' TO F.K401 ELSE
+         RETURN
+      END
+   END
+
+   K401.ID = EMP.ID
+   K401.REC = ''
+   K401.REC<1> = EMP.ID
+   K401.REC<2> = TERM.DATE
+   K401.REC<3> = EMP.REC<K401.PERCENT>
+   K401.REC<4> = EMP.REC<K401.BALANCE>
+   K401.REC<5> = 'PENDING'
+   K401.REC<6> = SYSTEM.DATE
+
+   WRITE K401.REC TO F.K401, K401.ID
+   RETURN
+
+**************************************************************************
+* Generate Termination Documents
+**************************************************************************
+GENERATE.TERMINATION.DOCS:
+   OPEN 'TERM.DOCUMENTS' TO F.TERM.DOCS ELSE
+      EXECUTE 'CREATE.FILE TERM.DOCUMENTS 1 101'
+      OPEN 'TERM.DOCUMENTS' TO F.TERM.DOCS ELSE
+         RETURN
+      END
+   END
+
+   DOC.ID = EMP.ID : '*' : SYSTEM.DATE
+   DOC.REC = ''
+   DOC.REC<1> = EMP.ID
+   DOC.REC<2> = TERM.DATE
+
+   * Document types needed
+   DOC.REC<10, 1> = 'TERMINATION LETTER'
+   DOC.REC<10, 2> = 'COBRA NOTIFICATION'
+   DOC.REC<10, 3> = 'FINAL PAYCHECK STATEMENT'
+   DOC.REC<10, 4> = 'UNEMPLOYMENT INFO'
+   DOC.REC<10, 5> = '401K ROLLOVER NOTICE'
+   DOC.REC<10, 6> = 'REFERENCE POLICY'
+
+   FOR I = 1 TO 6
+      DOC.REC<11, I> = 'PENDING'
+   NEXT I
+
+   DOC.REC<20> = SYSTEM.DATE
+
+   WRITE DOC.REC TO F.TERM.DOCS, DOC.ID
+   RETURN
+
+**************************************************************************
+* Reassign Subordinates
+**************************************************************************
+REASSIGN.SUBORDINATES:
+   * Find employees reporting to terminated employee
+   SELECT.CMD = 'SELECT EMPLOYEES WITH SUPERVISOR.ID = "' : EMP.ID : '"'
+   EXECUTE SELECT.CMD
+
+   * Get next level supervisor
+   NEW.SUPERVISOR = EMP.REC<SUPERVISOR.ID>
+
+   LOOP
+      READNEXT SUB.EMP.ID ELSE EXIT
+
+      READU SUB.REC FROM F.EMPLOYEES, SUB.EMP.ID ELSE CONTINUE
+
+      SUB.REC<SUPERVISOR.ID> = NEW.SUPERVISOR
+      WRITE SUB.REC TO F.EMPLOYEES, SUB.EMP.ID
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Cancel Future Schedules
+**************************************************************************
+CANCEL.FUTURE.SCHEDULES:
+   OPEN 'SCHEDULES' TO F.SCHEDULES ELSE
+      RETURN
+   END
+
+   SELECT.CMD = 'SELECT SCHEDULES WITH @ID LIKE "' : EMP.ID : '*..."'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT SCHED.ID ELSE EXIT
+
+      READU SCHED.REC FROM F.SCHEDULES, SCHED.ID ELSE CONTINUE
+
+      SCHED.DATE = SCHED.REC<1>
+      IF SCHED.DATE > TERM.DATE THEN
+         SCHED.REC<20> = 'CANCELLED'
+         SCHED.REC<21> = 'EMPLOYEE TERMINATED'
+         WRITE SCHED.REC TO F.SCHEDULES, SCHED.ID
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Archive Employee Data
+**************************************************************************
+ARCHIVE.EMPLOYEE.DATA:
+   OPEN 'EMPLOYEE.ARCHIVE' TO F.EMP.ARCHIVE ELSE
+      EXECUTE 'CREATE.FILE EMPLOYEE.ARCHIVE 1 101'
+      OPEN 'EMPLOYEE.ARCHIVE' TO F.EMP.ARCHIVE ELSE
+         RETURN
+      END
+   END
+
+   ARCHIVE.ID = EMP.ID : '*' : TERM.DATE
+   ARCHIVE.REC = EMP.REC
+   ARCHIVE.REC<200> = SYSTEM.DATE  ; Archive date
+   ARCHIVE.REC<201> = USER.ID  ; Archived by
+
+   WRITE ARCHIVE.REC TO F.EMP.ARCHIVE, ARCHIVE.ID
+   RETURN
+
+**************************************************************************
+* Send Termination Notifications
+**************************************************************************
+SEND.TERMINATION.NOTIFICATIONS:
+   GOSUB SEND.EMPLOYEE.NOTIFICATION
+   GOSUB SEND.HR.NOTIFICATION
+   GOSUB SEND.SUPERVISOR.NOTIFICATION
+   GOSUB SEND.IT.NOTIFICATION
+   RETURN
+
+**************************************************************************
+* Send Employee Notification
+**************************************************************************
+SEND.EMPLOYEE.NOTIFICATION:
+   IF EMP.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'TERM*' : EMP.ID : '*' : SYSTEM.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = EMP.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Employment Termination - Important Information'
+   EMAIL.REC<3> = 'Dear ' : EMP.REC<FIRST.NAME> : ',' : AM : AM
+   EMAIL.REC<3> := 'Your employment has been terminated effective '
+   EMAIL.REC<3> := OCONV(TERM.DATE, 'D4/') : '.' : AM : AM
+   EMAIL.REC<3> := 'Important next steps:' : AM
+   EMAIL.REC<3> := '- Schedule exit interview with HR' : AM
+   EMAIL.REC<3> := '- Return all company property' : AM
+   EMAIL.REC<3> := '- Review COBRA benefits information' : AM
+   EMAIL.REC<3> := '- Final paycheck will be processed' : AM : AM
+   EMAIL.REC<3> := 'Please contact HR with any questions.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send HR Notification
+**************************************************************************
+SEND.HR.NOTIFICATION:
+   EMAIL.ID = 'TERM.HR*' : EMP.ID : '*' : SYSTEM.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'hr@company.com'
+   EMAIL.REC<2> = 'Employee Termination - Action Required'
+   EMAIL.REC<3> = 'Employee Terminated:' : AM
+   EMAIL.REC<3> := 'ID: ' : EMP.ID : AM
+   EMAIL.REC<3> := 'Name: ' : EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME> : AM
+   EMAIL.REC<3> := 'Date: ' : OCONV(TERM.DATE, 'D4/') : AM
+   EMAIL.REC<3> := 'Type: ' : TERM.TYPE : AM
+   EMAIL.REC<3> := 'Reason: ' : TERM.REASON
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Supervisor Notification
+**************************************************************************
+SEND.SUPERVISOR.NOTIFICATION:
+   IF EMP.REC<SUPERVISOR.ID> = '' THEN RETURN
+
+   READ SUPER.REC FROM F.EMPLOYEES, EMP.REC<SUPERVISOR.ID> ELSE
+      RETURN
+   END
+
+   IF SUPER.REC<EMP.EMAIL> = '' THEN RETURN
+
+   EMAIL.ID = 'TERM.SUPER*' : EMP.ID : '*' : SYSTEM.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = SUPER.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Team Member Termination Notice'
+   EMAIL.REC<3> = 'Employee ' : EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   EMAIL.REC<3> := ' has been terminated effective ' : OCONV(TERM.DATE, 'D4/') : '.'
+   EMAIL.REC<3> := AM : 'Please update schedules and reassign responsibilities.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send IT Notification
+**************************************************************************
+SEND.IT.NOTIFICATION:
+   EMAIL.ID = 'TERM.IT*' : EMP.ID : '*' : SYSTEM.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'it@company.com'
+   EMAIL.REC<2> = 'Employee Termination - Access Removal'
+   EMAIL.REC<3> = 'Remove system access for:' : AM
+   EMAIL.REC<3> := 'User ID: ' : EMP.REC<USER.ID> : AM
+   EMAIL.REC<3> := 'Employee: ' : EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME> : AM
+   EMAIL.REC<3> := 'Term Date: ' : OCONV(TERM.DATE, 'D4/')
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

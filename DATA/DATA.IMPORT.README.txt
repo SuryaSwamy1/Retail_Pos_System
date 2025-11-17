@@ -1,0 +1,41 @@
+RETAIL POS SYSTEM - DATA IMPORT README
+======================================
+
+This directory contains sample data files for importing into the system.
+
+FILE FORMATS:
+-------------
+All data files use pipe (|) delimited format represented as ] in the files.
+Each line represents one record.
+
+SAMPLE FILES:
+-------------
+1. SAMPLE.CUSTOMERS.txt
+   Format: CUST_ID]LAST_NAME]FIRST_NAME]ADDRESS]CITY]STATE]ZIP]PHONE]EMAIL]JOIN_DATE]LIFETIME_VALUE]STATUS]LOYALTY
+
+2. SAMPLE.INVENTORY.txt
+   Format: INV_ID]SKU]DESCRIPTION]CATEGORY]PRICE]QTY_ON_HAND]REORDER_POINT]MAX_QTY]VENDOR_ID]LOCATION]ACTIVE
+
+3. SAMPLE.EMPLOYEES.txt
+   Format: EMP_ID]FIRST_NAME]LAST_NAME]FULL_NAME]EMAIL]PHONE]HIRE_DATE]HOURLY_RATE]ROLE]STATUS]TYPE
+
+4. SAMPLE.VENDORS.txt
+   Format: VENDOR_ID]NAME]ADDRESS]CITY]STATE]ZIP]EMAIL]PHONE]PAYMENT_TERMS]STATUS]CATEGORY
+
+IMPORT INSTRUCTIONS:
+--------------------
+To import these sample files into the system:
+
+1. Ensure the database files are created
+2. Run the appropriate import utility from the UTILITIES folder
+3. Verify the import with the respective READ programs
+
+Example:
+  EXECUTE UTILS.IMPORT.CUSTOMERS SAMPLE.CUSTOMERS.txt
+
+NOTES:
+------
+- These are sample records for testing and development
+- Modify as needed for your specific requirements
+- Always backup data before importing
+- Validate data format before importing

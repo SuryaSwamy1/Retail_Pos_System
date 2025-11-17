@@ -1,0 +1,534 @@
+SUBROUTINE MENU.INVENTORY()
+**************************************************************************
+* Program: MENU.INVENTORY
+* Purpose: Inventory Management Menu
+* Description: Inventory operations menu
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize menu
+GOSUB INITIALIZE.MENU
+
+* Inventory menu loop
+LOOP
+   * Display menu
+   GOSUB DISPLAY.INVENTORY.MENU
+
+   * Get user selection
+   GOSUB GET.USER.SELECTION
+
+   * Process selection
+   GOSUB PROCESS.SELECTION
+
+   * Check if return requested
+   IF RETURN.REQUESTED = 'Y' THEN EXIT
+REPEAT
+
+RETURN
+
+**************************************************************************
+* Initialize Menu
+**************************************************************************
+INITIALIZE.MENU:
+   RETURN.REQUESTED = 'N'
+   RETURN
+
+**************************************************************************
+* Display Inventory Menu
+**************************************************************************
+DISPLAY.INVENTORY.MENU:
+   CRT @(-1)  ; Clear screen
+
+   * Header
+   CRT ''
+   CRT '========================================='
+   CRT '       INVENTORY MANAGEMENT MENU        '
+   CRT '========================================='
+   CRT ''
+   CRT 'Store: ' : STORE.ID
+   CRT 'Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   CRT ''
+   CRT '-----------------------------------------'
+   CRT 'INVENTORY OPERATIONS'
+   CRT '-----------------------------------------'
+   CRT ''
+   CRT '1. Create New Item'
+   CRT '2. View/Read Item'
+   CRT '3. Update Item'
+   CRT '4. Adjust Inventory'
+   CRT '5. Transfer Inventory'
+   CRT ''
+   CRT '6. Inventory Status Report'
+   CRT '7. Reorder Report'
+   CRT '8. Search Items'
+   CRT ''
+   CRT 'R. Return to Main Menu'
+   CRT ''
+   CRT '========================================='
+   CRT ''
+   RETURN
+
+**************************************************************************
+* Get User Selection
+**************************************************************************
+GET.USER.SELECTION:
+   INPUT.PROMPT = 'Enter selection: '
+   CRT INPUT.PROMPT:
+   INPUT USER.SELECTION
+
+   USER.SELECTION = TRIM(USER.SELECTION)
+   USER.SELECTION = UPCASE(USER.SELECTION)
+   RETURN
+
+**************************************************************************
+* Process Selection
+**************************************************************************
+PROCESS.SELECTION:
+   BEGIN CASE
+      CASE USER.SELECTION = '1'
+         GOSUB CREATE.ITEM
+
+      CASE USER.SELECTION = '2'
+         GOSUB READ.ITEM
+
+      CASE USER.SELECTION = '3'
+         GOSUB UPDATE.ITEM
+
+      CASE USER.SELECTION = '4'
+         GOSUB ADJUST.INVENTORY
+
+      CASE USER.SELECTION = '5'
+         GOSUB TRANSFER.INVENTORY
+
+      CASE USER.SELECTION = '6'
+         GOSUB INVENTORY.STATUS
+
+      CASE USER.SELECTION = '7'
+         GOSUB REORDER.REPORT
+
+      CASE USER.SELECTION = '8'
+         GOSUB SEARCH.ITEMS
+
+      CASE USER.SELECTION = 'R'
+         RETURN.REQUESTED = 'Y'
+
+      CASE 1
+         CRT ''
+         CRT 'Invalid selection. Please try again.'
+         CRT ''
+         GOSUB PAUSE
+   END CASE
+   RETURN
+
+**************************************************************************
+* Create Item
+**************************************************************************
+CREATE.ITEM:
+   CRT ''
+   CRT '--- Create New Inventory Item ---'
+   CRT ''
+
+   ITEM.REC = ''
+
+   CRT 'Item Name: ':
+   INPUT ITEM.NAME
+   ITEM.REC<ITEM.NAME> = ITEM.NAME
+
+   CRT 'Description: ':
+   INPUT ITEM.DESC
+   ITEM.REC<ITEM.DESC> = ITEM.DESC
+
+   CRT 'SKU: ':
+   INPUT SKU
+   ITEM.REC<SKU> = SKU
+
+   CRT 'UPC: ':
+   INPUT UPC
+   ITEM.REC<UPC> = UPC
+
+   CRT 'Category: ':
+   INPUT CATEGORY
+   ITEM.REC<CATEGORY> = CATEGORY
+
+   CRT 'Cost: ':
+   INPUT COST
+   ITEM.REC<AVG.COST> = COST
+
+   CRT 'Selling Price: ':
+   INPUT PRICE
+   ITEM.REC<SELLING.PRICE> = PRICE
+
+   CRT 'Initial Quantity: ':
+   INPUT QTY
+   INITIAL.QTY = QTY
+
+   * Call INV.CREATE
+   CALL INV.CREATE(ITEM.REC, INITIAL.QTY, STORE.ID, ITEM.ID, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Item created successfully: ' : ITEM.ID
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Read Item
+**************************************************************************
+READ.ITEM:
+   CRT ''
+   CRT '--- View Inventory Item ---'
+   CRT ''
+
+   CRT 'Item ID: ':
+   INPUT ITEM.ID
+   ITEM.ID = TRIM(ITEM.ID)
+
+   IF ITEM.ID = '' THEN RETURN
+
+   * Call INV.READ
+   CALL INV.READ(ITEM.ID, ITEM.REC, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT '========================================='
+      CRT 'Item ID: ' : ITEM.ID
+      CRT '========================================='
+      CRT 'Name: ' : ITEM.REC<ITEM.NAME>
+      CRT 'Description: ' : ITEM.REC<ITEM.DESC>
+      CRT 'SKU: ' : ITEM.REC<SKU>
+      CRT 'UPC: ' : ITEM.REC<UPC>
+      CRT 'Category: ' : ITEM.REC<CATEGORY>
+      CRT 'Status: ' : ITEM.REC<ITEM.STATUS>
+      CRT ''
+      CRT 'Cost: $' : ITEM.REC<AVG.COST>
+      CRT 'Selling Price: $' : ITEM.REC<SELLING.PRICE>
+      CRT 'MSRP: $' : ITEM.REC<MSRP>
+      CRT ''
+      CRT 'Quantity on Hand: ' : ITEM.REC<QTY.ON.HAND, 1>
+      CRT 'Quantity Committed: ' : ITEM.REC<QTY.COMMITTED, 1>
+      CRT 'Quantity on Order: ' : ITEM.REC<QTY.ON.ORDER, 1>
+      CRT ''
+      CRT 'Reorder Point: ' : ITEM.REC<REORDER.POINT>
+      CRT 'Reorder Quantity: ' : ITEM.REC<REORDER.QTY>
+      CRT '========================================='
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Update Item
+**************************************************************************
+UPDATE.ITEM:
+   CRT ''
+   CRT '--- Update Inventory Item ---'
+   CRT ''
+
+   CRT 'Item ID: ':
+   INPUT ITEM.ID
+   ITEM.ID = TRIM(ITEM.ID)
+
+   IF ITEM.ID = '' THEN RETURN
+
+   * Read current item
+   READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+      CRT 'Item not found'
+      GOSUB PAUSE
+      RETURN
+   END
+
+   CRT ''
+   CRT 'Current Name: ' : ITEM.REC<ITEM.NAME>
+   CRT 'New Name (or ENTER to keep): ':
+   INPUT NEW.NAME
+   IF NEW.NAME # '' THEN ITEM.REC<ITEM.NAME> = NEW.NAME
+
+   CRT ''
+   CRT 'Current Selling Price: $' : ITEM.REC<SELLING.PRICE>
+   CRT 'New Selling Price (or ENTER to keep): ':
+   INPUT NEW.PRICE
+   IF NEW.PRICE # '' THEN ITEM.REC<SELLING.PRICE> = NEW.PRICE
+
+   CRT ''
+   CRT 'Current Reorder Point: ' : ITEM.REC<REORDER.POINT>
+   CRT 'New Reorder Point (or ENTER to keep): ':
+   INPUT NEW.REORDER
+   IF NEW.REORDER # '' THEN ITEM.REC<REORDER.POINT> = NEW.REORDER
+
+   * Call INV.UPDATE
+   CALL INV.UPDATE(ITEM.ID, ITEM.REC, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Item updated successfully'
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Adjust Inventory
+**************************************************************************
+ADJUST.INVENTORY:
+   CRT ''
+   CRT '--- Adjust Inventory ---'
+   CRT ''
+
+   CRT 'Item ID: ':
+   INPUT ITEM.ID
+   ITEM.ID = TRIM(ITEM.ID)
+
+   IF ITEM.ID = '' THEN RETURN
+
+   CRT 'Adjustment Quantity (+ or -): ':
+   INPUT ADJ.QTY
+
+   CRT 'Reason:'
+   CRT '  1. Physical Count'
+   CRT '  2. Damage'
+   CRT '  3. Theft'
+   CRT '  4. Expired'
+   CRT '  5. Other'
+   CRT 'Select reason: ':
+   INPUT REASON.CHOICE
+
+   BEGIN CASE
+      CASE REASON.CHOICE = '1'
+         ADJ.REASON = 'PHYSICAL.COUNT'
+      CASE REASON.CHOICE = '2'
+         ADJ.REASON = 'DAMAGE'
+      CASE REASON.CHOICE = '3'
+         ADJ.REASON = 'THEFT'
+      CASE REASON.CHOICE = '4'
+         ADJ.REASON = 'EXPIRED'
+      CASE REASON.CHOICE = '5'
+         ADJ.REASON = 'OTHER'
+      CASE 1
+         CRT 'Invalid reason'
+         GOSUB PAUSE
+         RETURN
+   END CASE
+
+   * Call INV.ADJUST
+   CALL INV.ADJUST(ITEM.ID, STORE.ID, ADJ.QTY, ADJ.REASON, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Inventory adjusted successfully'
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Transfer Inventory
+**************************************************************************
+TRANSFER.INVENTORY:
+   CRT ''
+   CRT '--- Transfer Inventory ---'
+   CRT ''
+
+   CRT 'Item ID: ':
+   INPUT ITEM.ID
+   ITEM.ID = TRIM(ITEM.ID)
+
+   IF ITEM.ID = '' THEN RETURN
+
+   CRT 'From Store ID: ':
+   INPUT FROM.STORE
+   FROM.STORE = TRIM(FROM.STORE)
+
+   CRT 'To Store ID: ':
+   INPUT TO.STORE
+   TO.STORE = TRIM(TO.STORE)
+
+   CRT 'Transfer Quantity: ':
+   INPUT TRANSFER.QTY
+
+   * Call INV.TRANSFER
+   CALL INV.TRANSFER(ITEM.ID, FROM.STORE, TO.STORE, TRANSFER.QTY, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Inventory transferred successfully'
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Inventory Status
+**************************************************************************
+INVENTORY.STATUS:
+   CRT ''
+   CRT '--- Inventory Status Report ---'
+   CRT ''
+
+   * Call inventory status report
+   CALL RPT.INVENTORY.STATUS('', REPORT.REC, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      * Display report
+      REPORT.LINES = DCOUNT(REPORT.REC, AM)
+      FOR I = 1 TO REPORT.LINES
+         CRT REPORT.REC<I>
+         IF MOD(I, 20) = 0 THEN GOSUB PAUSE
+      NEXT I
+      CRT ''
+   END ELSE
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Reorder Report
+**************************************************************************
+REORDER.REPORT:
+   CRT ''
+   CRT '--- Reorder Report ---'
+   CRT ''
+
+   * Run batch reorder to generate report
+   CALL BATCH.REORDER('N', REORDER.RESULT, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      RESULT.LINES = DCOUNT(REORDER.RESULT, AM)
+      FOR I = 1 TO RESULT.LINES
+         CRT REORDER.RESULT<I>
+         IF MOD(I, 20) = 0 THEN GOSUB PAUSE
+      NEXT I
+      CRT ''
+   END ELSE
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Search Items
+**************************************************************************
+SEARCH.ITEMS:
+   CRT ''
+   CRT '--- Search Items ---'
+   CRT ''
+
+   CRT 'Search by:'
+   CRT '  1. Name'
+   CRT '  2. Category'
+   CRT '  3. SKU'
+   CRT 'Select option: ':
+   INPUT SEARCH.OPTION
+
+   BEGIN CASE
+      CASE SEARCH.OPTION = '1'
+         CRT 'Item name (partial): ':
+         INPUT SEARCH.VALUE
+         SEARCH.FIELD = 'NAME'
+
+      CASE SEARCH.OPTION = '2'
+         CRT 'Category: ':
+         INPUT SEARCH.VALUE
+         SEARCH.FIELD = 'CATEGORY'
+
+      CASE SEARCH.OPTION = '3'
+         CRT 'SKU: ':
+         INPUT SEARCH.VALUE
+         SEARCH.FIELD = 'SKU'
+
+      CASE 1
+         CRT 'Invalid option'
+         GOSUB PAUSE
+         RETURN
+   END CASE
+
+   * Simple search implementation
+   SELECT.CMD = 'SELECT INVENTORY'
+   EXECUTE SELECT.CMD
+
+   FOUND.COUNT = 0
+
+   CRT ''
+   CRT 'Search Results:'
+   CRT '----------------------------------------'
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      MATCH = 'N'
+
+      BEGIN CASE
+         CASE SEARCH.FIELD = 'NAME'
+            IF INDEX(UPCASE(ITEM.REC<ITEM.NAME>), UPCASE(SEARCH.VALUE), 1) > 0 THEN
+               MATCH = 'Y'
+            END
+
+         CASE SEARCH.FIELD = 'CATEGORY'
+            IF ITEM.REC<CATEGORY> = SEARCH.VALUE THEN
+               MATCH = 'Y'
+            END
+
+         CASE SEARCH.FIELD = 'SKU'
+            IF ITEM.REC<SKU> = SEARCH.VALUE THEN
+               MATCH = 'Y'
+            END
+      END CASE
+
+      IF MATCH = 'Y' THEN
+         CRT ITEM.ID : ' - ' : ITEM.REC<ITEM.NAME> : ' (QTY: ' : ITEM.REC<QTY.ON.HAND, 1> : ')'
+         FOUND.COUNT += 1
+
+         IF MOD(FOUND.COUNT, 15) = 0 THEN GOSUB PAUSE
+      END
+   REPEAT
+
+   CRT ''
+   CRT 'Total items found: ' : FOUND.COUNT
+   CRT ''
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Pause
+**************************************************************************
+PAUSE:
+   CRT 'Press ENTER to continue...':
+   INPUT DUMMY
+   RETURN
+
+END

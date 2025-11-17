@@ -1,0 +1,374 @@
+SUBROUTINE CASH.DRAWER.CLOSE(DRAWER.ID, ACTUAL.CASH, DENOMINATION.COUNTS, RECONCILIATION.REC, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: CASH.DRAWER.CLOSE
+* Purpose: Close and Reconcile Cash Drawer
+* Parameters:
+*   DRAWER.ID (IN) - Drawer session ID
+*   ACTUAL.CASH (IN) - Actual cash counted
+*   DENOMINATION.COUNTS (IN) - Cash denomination breakdown
+*   RECONCILIATION.REC (OUT) - Reconciliation report
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+RECONCILIATION.REC = ''
+
+* Validate drawer ID
+IF DRAWER.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Drawer ID is required'
+   RETURN
+END
+
+* Validate actual cash
+IF ACTUAL.CASH = '' OR NOT(NUM(ACTUAL.CASH)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Actual cash amount must be numeric'
+   RETURN
+END
+
+IF ACTUAL.CASH < 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Actual cash cannot be negative'
+   RETURN
+END
+
+* Open cash drawer file
+OPEN 'CASH.DRAWERS' TO F.CASH.DRAWERS ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Cannot open cash drawer file'
+   RETURN
+END
+
+* Read and lock drawer
+READU DRAWER.REC FROM F.CASH.DRAWERS, DRAWER.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Drawer not found'
+   RETURN
+END
+
+* Check drawer status
+DRAWER.STATUS = DRAWER.REC<7>
+IF DRAWER.STATUS # 'OPEN' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Drawer is not open (Status: ' : DRAWER.STATUS : ')'
+   RELEASE F.CASH.DRAWERS, DRAWER.ID
+   RETURN
+END
+
+* Calculate expected cash
+GOSUB CALCULATE.EXPECTED.CASH
+
+* Calculate variance
+VARIANCE = ACTUAL.CASH - EXPECTED.CASH
+
+* Validate denomination breakdown if provided
+IF DENOMINATION.COUNTS # '' THEN
+   GOSUB VALIDATE.DENOMINATIONS
+   IF ERROR.CODE # ERR.SUCCESS THEN
+      RELEASE F.CASH.DRAWERS, DRAWER.ID
+      RETURN
+   END
+END
+
+* Update drawer record
+GOSUB UPDATE.DRAWER.RECORD
+
+* Write updated drawer
+WRITE DRAWER.REC TO F.CASH.DRAWERS, DRAWER.ID
+
+* Create closing transaction
+GOSUB CREATE.CLOSING.TRANSACTION
+
+* Create reconciliation audit
+GOSUB CREATE.RECONCILIATION.AUDIT
+
+* Generate reconciliation report
+GOSUB GENERATE.RECONCILIATION.REPORT
+
+* Check for significant variance
+GOSUB CHECK.VARIANCE.ALERT
+
+LOG.MSG = 'Cash drawer closed: ' : DRAWER.ID : ' - Variance: $' : VARIANCE
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Calculate Expected Cash
+**************************************************************************
+CALCULATE.EXPECTED.CASH:
+   OPENING.AMT = DRAWER.REC<6>
+   IF OPENING.AMT = '' THEN OPENING.AMT = 0
+
+   CASH.SALES = DRAWER.REC<8>
+   IF CASH.SALES = '' THEN CASH.SALES = 0
+
+   CASH.REFUNDS = DRAWER.REC<9>
+   IF CASH.REFUNDS = '' THEN CASH.REFUNDS = 0
+
+   EXPECTED.CASH = OPENING.AMT + CASH.SALES - CASH.REFUNDS
+   RETURN
+
+**************************************************************************
+* Validate Denominations
+**************************************************************************
+VALIDATE.DENOMINATIONS:
+   * Denomination counts format: 100:count^50:count^20:count^etc
+   * Valid denominations: 100, 50, 20, 10, 5, 1, 0.25, 0.10, 0.05, 0.01
+
+   CALC.TOTAL = 0
+   DENOM.COUNT = DCOUNT(DENOMINATION.COUNTS, VM)
+
+   FOR I = 1 TO DENOM.COUNT
+      DENOM.SPEC = DENOMINATION.COUNTS<1, I>
+
+      DENOM.VALUE = FIELD(DENOM.SPEC, ':', 1)
+      DENOM.QTY = FIELD(DENOM.SPEC, ':', 2)
+
+      IF NOT(NUM(DENOM.VALUE)) OR NOT(NUM(DENOM.QTY)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid denomination specification'
+         RETURN
+      END
+
+      CALC.TOTAL += (DENOM.VALUE * DENOM.QTY)
+   NEXT I
+
+   * Verify calculated total matches actual cash (within 1 cent)
+   DIFF = ABS(CALC.TOTAL - ACTUAL.CASH)
+   IF DIFF > 0.01 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Denomination total does not match actual cash'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Update Drawer Record
+**************************************************************************
+UPDATE.DRAWER.RECORD:
+   * Update status
+   DRAWER.REC<7> = 'CLOSED'
+
+   * Update actual cash
+   DRAWER.REC<12> = ACTUAL.CASH
+
+   * Update variance
+   DRAWER.REC<13> = VARIANCE
+
+   * Update close date/time
+   DRAWER.REC<14> = SYSTEM.DATE
+   DRAWER.REC<15> = SYSTEM.TIME
+   DRAWER.REC<16> = USER.ID
+
+   * Store denomination breakdown
+   DRAWER.REC<19> = DENOMINATION.COUNTS
+   RETURN
+
+**************************************************************************
+* Create Closing Transaction
+**************************************************************************
+CREATE.CLOSING.TRANSACTION:
+   OPEN 'CASH.TRANS' TO F.CASH.TRANS ELSE
+      EXECUTE 'CREATE.FILE CASH.TRANS 1 101'
+      OPEN 'CASH.TRANS' TO F.CASH.TRANS ELSE RETURN
+   END
+
+   TRANS.ID = DRAWER.ID : '*CLOSE*' : SYSTEM.TIME
+
+   TRANS.REC = ''
+   TRANS.REC<1> = DRAWER.ID
+   TRANS.REC<2> = 'CLOSE'
+   TRANS.REC<3> = SYSTEM.DATE
+   TRANS.REC<4> = SYSTEM.TIME
+   TRANS.REC<5> = ACTUAL.CASH
+   TRANS.REC<6> = USER.ID
+   TRANS.REC<7> = ''  ; POS transaction ID
+   TRANS.REC<8> = 'Closing drawer - Variance: $' : VARIANCE
+   TRANS.REC<9> = EXPECTED.CASH
+   TRANS.REC<10> = VARIANCE
+
+   WRITE TRANS.REC TO F.CASH.TRANS, TRANS.ID
+   RETURN
+
+**************************************************************************
+* Create Reconciliation Audit
+**************************************************************************
+CREATE.RECONCILIATION.AUDIT:
+   OPEN 'CASH.AUDIT' TO F.CASH.AUDIT ELSE
+      EXECUTE 'CREATE.FILE CASH.AUDIT 1 101'
+      OPEN 'CASH.AUDIT' TO F.CASH.AUDIT ELSE RETURN
+   END
+
+   AUDIT.ID = DRAWER.ID : '*CLOSE'
+
+   AUDIT.REC = ''
+   AUDIT.REC<1> = DRAWER.ID
+   AUDIT.REC<2> = 'CLOSE'
+   AUDIT.REC<3> = USER.ID
+   AUDIT.REC<4> = SYSTEM.DATE
+   AUDIT.REC<5> = SYSTEM.TIME
+   AUDIT.REC<6> = EXPECTED.CASH
+   AUDIT.REC<7> = ACTUAL.CASH
+   AUDIT.REC<8> = VARIANCE
+   AUDIT.REC<9> = STORE.ID
+   AUDIT.REC<10> = DRAWER.REC<3>  ; Original cashier
+   AUDIT.REC<11> = DENOMINATION.COUNTS
+
+   WRITE AUDIT.REC TO F.CASH.AUDIT, AUDIT.ID
+   RETURN
+
+**************************************************************************
+* Generate Reconciliation Report
+**************************************************************************
+GENERATE.RECONCILIATION.REPORT:
+   RECONCILIATION.REC = ''
+
+   RECONCILIATION.REC<1> = '========================================='
+   RECONCILIATION.REC<2> = '     CASH DRAWER RECONCILIATION         '
+   RECONCILIATION.REC<3> = '========================================='
+   RECONCILIATION.REC<4> = ''
+   RECONCILIATION.REC<5> = 'Drawer ID: ' : DRAWER.ID
+   RECONCILIATION.REC<6> = 'Store: ' : DRAWER.REC<2>
+   RECONCILIATION.REC<7> = 'Cashier: ' : DRAWER.REC<3>
+   RECONCILIATION.REC<8> = ''
+   RECONCILIATION.REC<9> = 'Opened: ' : OCONV(DRAWER.REC<4>, 'D4/') : ' ' : OCONV(DRAWER.REC<5>, 'MTS')
+   RECONCILIATION.REC<10> = 'Closed: ' : OCONV(SYSTEM.DATE, 'D4/') : ' ' : OCONV(SYSTEM.TIME, 'MTS')
+   RECONCILIATION.REC<11> = 'Closed By: ' : USER.ID
+   RECONCILIATION.REC<12> = ''
+   RECONCILIATION.REC<13> = '-----------------------------------------'
+   RECONCILIATION.REC<14> = 'CASH RECONCILIATION'
+   RECONCILIATION.REC<15> = '-----------------------------------------'
+   RECONCILIATION.REC<16> = 'Opening Amount: $' : OPENING.AMT
+   RECONCILIATION.REC<17> = 'Cash Sales: $' : CASH.SALES
+   RECONCILIATION.REC<18> = 'Cash Refunds: $' : CASH.REFUNDS
+   RECONCILIATION.REC<19> = ''
+   RECONCILIATION.REC<20> = 'Expected Cash: $' : EXPECTED.CASH
+   RECONCILIATION.REC<21> = 'Actual Cash: $' : ACTUAL.CASH
+   RECONCILIATION.REC<22> = ''
+
+   IF VARIANCE > 0 THEN
+      VARIANCE.TYPE = 'OVERAGE'
+   END ELSE IF VARIANCE < 0 THEN
+      VARIANCE.TYPE = 'SHORTAGE'
+   END ELSE
+      VARIANCE.TYPE = 'BALANCED'
+   END
+
+   RECONCILIATION.REC<23> = 'Variance: $' : VARIANCE : ' (' : VARIANCE.TYPE : ')'
+   RECONCILIATION.REC<24> = ''
+
+   * Add denomination breakdown if provided
+   IF DENOMINATION.COUNTS # '' THEN
+      RECONCILIATION.REC<25> = '-----------------------------------------'
+      RECONCILIATION.REC<26> = 'DENOMINATION BREAKDOWN'
+      RECONCILIATION.REC<27> = '-----------------------------------------'
+
+      LINE.NUM = 28
+      DENOM.COUNT = DCOUNT(DENOMINATION.COUNTS, VM)
+
+      FOR I = 1 TO DENOM.COUNT
+         DENOM.SPEC = DENOMINATION.COUNTS<1, I>
+
+         DENOM.VALUE = FIELD(DENOM.SPEC, ':', 1)
+         DENOM.QTY = FIELD(DENOM.SPEC, ':', 2)
+
+         DENOM.TOTAL = DENOM.VALUE * DENOM.QTY
+
+         RECONCILIATION.REC<LINE.NUM> = '$' : DENOM.VALUE : ' x ' : DENOM.QTY : ' = $' : DENOM.TOTAL
+         LINE.NUM += 1
+      NEXT I
+
+      RECONCILIATION.REC<LINE.NUM> = ''
+      LINE.NUM += 1
+   END ELSE
+      LINE.NUM = 25
+   END
+
+   * Add statistics
+   TRANS.COUNT = DRAWER.REC<10>
+   IF TRANS.COUNT = '' THEN TRANS.COUNT = 0
+
+   RECONCILIATION.REC<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   RECONCILIATION.REC<LINE.NUM> = 'TRANSACTION STATISTICS'
+   LINE.NUM += 1
+   RECONCILIATION.REC<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   RECONCILIATION.REC<LINE.NUM> = 'Total Transactions: ' : TRANS.COUNT
+   LINE.NUM += 1
+
+   IF TRANS.COUNT > 0 THEN
+      AVG.TRANS = CASH.SALES / TRANS.COUNT
+      RECONCILIATION.REC<LINE.NUM> = 'Average Transaction: $' : AVG.TRANS
+      LINE.NUM += 1
+   END
+
+   RECONCILIATION.REC<LINE.NUM> = ''
+   LINE.NUM += 1
+   RECONCILIATION.REC<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   RECONCILIATION.REC<LINE.NUM> = '           END OF REPORT                 '
+   LINE.NUM += 1
+   RECONCILIATION.REC<LINE.NUM> = '========================================='
+
+   RETURN
+
+**************************************************************************
+* Check Variance Alert
+**************************************************************************
+CHECK.VARIANCE.ALERT:
+   * Alert if variance exceeds threshold
+   ABS.VARIANCE = ABS(VARIANCE)
+
+   * Threshold: $10 or 1% of expected cash
+   THRESHOLD = 10
+   IF EXPECTED.CASH > 1000 THEN
+      PCT.THRESHOLD = EXPECTED.CASH * 0.01
+      IF PCT.THRESHOLD > THRESHOLD THEN THRESHOLD = PCT.THRESHOLD
+   END
+
+   IF ABS.VARIANCE > THRESHOLD THEN
+      GOSUB SEND.VARIANCE.ALERT
+   END
+   RETURN
+
+**************************************************************************
+* Send Variance Alert
+**************************************************************************
+SEND.VARIANCE.ALERT:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   OPEN 'SYSTEM.PARAMS' TO F.PARAMS ELSE RETURN
+
+   READ PARAM.REC FROM F.PARAMS, 'EMAIL.ADDRESSES' ELSE RETURN
+
+   MANAGER.EMAIL = PARAM.REC<2>  ; Store manager email
+   IF MANAGER.EMAIL = '' THEN RETURN
+
+   EMAIL.ID = 'CASH.VARIANCE*' : DRAWER.ID
+
+   EMAIL.REC = ''
+   EMAIL.REC<1> = MANAGER.EMAIL
+   EMAIL.REC<2> = 'ALERT: Cash Drawer Variance - ' : DRAWER.ID
+
+   EMAIL.REC<3> = 'Significant cash variance detected:' : AM : AM
+   EMAIL.REC<3> := 'Drawer ID: ' : DRAWER.ID : AM
+   EMAIL.REC<3> := 'Store: ' : DRAWER.REC<2> : AM
+   EMAIL.REC<3> := 'Cashier: ' : DRAWER.REC<3> : AM : AM
+   EMAIL.REC<3> := 'Expected Cash: $' : EXPECTED.CASH : AM
+   EMAIL.REC<3> := 'Actual Cash: $' : ACTUAL.CASH : AM
+   EMAIL.REC<3> := 'Variance: $' : VARIANCE : ' (' : VARIANCE.TYPE : ')' : AM : AM
+   EMAIL.REC<3> := 'Closed By: ' : USER.ID : AM
+   EMAIL.REC<3> := 'Close Time: ' : OCONV(SYSTEM.DATE, 'D4/') : ' ' : OCONV(SYSTEM.TIME, 'MTS')
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

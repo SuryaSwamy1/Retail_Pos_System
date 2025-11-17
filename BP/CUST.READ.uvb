@@ -1,0 +1,86 @@
+SUBROUTINE CUST.READ(CUST.ID.IN, CUST.REC.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: CUST.READ
+* Purpose: Read Customer Record with Full Details
+* Parameters:
+*   CUST.ID.IN (IN) - Customer ID to read
+*   CUST.REC.OUT (OUT) - Customer record
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+CUST.REC.OUT = ''
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate input
+IF CUST.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Customer ID is required'
+   RETURN
+END
+
+* Read customer record with record locking
+READU CUST.REC.OUT FROM F.CUSTOMERS, CUST.ID.IN LOCKED
+   * Record is locked by another user
+   ERROR.CODE = ERR.RECORD.LOCKED
+   ERROR.MSG = 'Customer record is locked by another user'
+   RETURN
+END ELSE
+   * Record does not exist
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Customer not found: ' : CUST.ID.IN
+   RETURN
+END
+
+* Release the lock (we only needed it for reading)
+RELEASE F.CUSTOMERS, CUST.ID.IN
+
+* Enhance record with calculated fields
+GOSUB CALCULATE.DERIVED.FIELDS
+
+RETURN
+
+**************************************************************************
+* Calculate Derived Fields
+**************************************************************************
+CALCULATE.DERIVED.FIELDS:
+   * Calculate available credit
+   AVAILABLE.CREDIT = CUST.REC.OUT<CREDIT.LIMIT> - CUST.REC.OUT<CREDIT.BALANCE>
+
+   * Calculate credit utilization percentage
+   IF CUST.REC.OUT<CREDIT.LIMIT> > 0 THEN
+      CREDIT.UTIL.PCT = (CUST.REC.OUT<CREDIT.BALANCE> / CUST.REC.OUT<CREDIT.LIMIT>) * 100
+   END ELSE
+      CREDIT.UTIL.PCT = 0
+   END
+
+   * Calculate days since last purchase
+   IF CUST.REC.OUT<LAST.PURCHASE.DATE> # '' THEN
+      DAYS.SINCE.PURCHASE = SYSTEM.DATE - CUST.REC.OUT<LAST.PURCHASE.DATE>
+   END ELSE
+      DAYS.SINCE.PURCHASE = -1  ; Never purchased
+   END
+
+   * Calculate net purchases (purchases - returns)
+   NET.PURCHASES = CUST.REC.OUT<TOTAL.PURCHASES> - CUST.REC.OUT<TOTAL.RETURNS>
+
+   * Calculate return rate
+   IF CUST.REC.OUT<TOTAL.PURCHASES> > 0 THEN
+      RETURN.RATE = (CUST.REC.OUT<TOTAL.RETURNS> / CUST.REC.OUT<TOTAL.PURCHASES>) * 100
+   END ELSE
+      RETURN.RATE = 0
+   END
+
+   * Append calculated fields to record (using high attribute numbers)
+   CUST.REC.OUT<100> = AVAILABLE.CREDIT
+   CUST.REC.OUT<101> = CREDIT.UTIL.PCT
+   CUST.REC.OUT<102> = DAYS.SINCE.PURCHASE
+   CUST.REC.OUT<103> = NET.PURCHASES
+   CUST.REC.OUT<104> = RETURN.RATE
+   RETURN
+
+END

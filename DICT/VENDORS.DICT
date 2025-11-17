@@ -1,0 +1,72 @@
+* VENDORS Dictionary Definitions
+* MultiValue Database Schema for Vendor Master File
+
+* Field Definitions
+FIELD~VENDOR.ID~1~Vendor ID~Primary Key
+FIELD~VENDOR.NAME~2~Vendor Name~
+FIELD~VENDOR.TYPE~3~Vendor Type~M=Manufacturer, D=Distributor, W=Wholesaler
+FIELD~CONTACT.NAME~4~Primary Contact Name~
+FIELD~CONTACT.TITLE~5~Contact Title~
+FIELD~PHONE~6~Phone Numbers~Multivalued
+FIELD~FAX~7~Fax Number~
+FIELD~EMAIL~8~Email Address~
+FIELD~WEBSITE~9~Website URL~
+FIELD~ADDRESS.LINE1~10~Address Line 1~
+FIELD~ADDRESS.LINE2~11~Address Line 2~
+FIELD~CITY~12~City~
+FIELD~STATE~13~State~
+FIELD~ZIP~14~ZIP Code~
+FIELD~COUNTRY~15~Country~
+FIELD~TAX.ID~16~Tax ID Number~
+FIELD~PAYMENT.TERMS~17~Payment Terms~NET30, NET60, NET90, 2/10NET30
+FIELD~DISCOUNT.TERMS~18~Discount Terms~
+FIELD~FREIGHT.TERMS~19~Freight Terms~FOB, PREPAID, COLLECT
+FIELD~MIN.ORDER.AMT~20~Minimum Order Amount~
+FIELD~LEAD.TIME~21~Standard Lead Time Days~
+FIELD~CURRENCY~22~Currency Code~
+FIELD~ACCOUNT.NUMBER~23~Our Account Number with Vendor~
+FIELD~BUYER~24~Assigned Buyer~
+FIELD~STATUS~25~Status~A=Active, I=Inactive, H=Hold
+FIELD~RATING~26~Vendor Rating~1-5 stars
+FIELD~1099.VENDOR~27~1099 Vendor Flag~Y/N
+FIELD~LAST.PO.DATE~28~Last Purchase Order Date~
+FIELD~LAST.PO.NUMBER~29~Last Purchase Order Number~
+FIELD~LAST.RECEIPT.DATE~30~Last Receipt Date~
+FIELD~YTD.PURCHASES~31~Year-to-Date Purchases~
+FIELD~LAST.YEAR.PURCHASES~32~Last Year Total Purchases~
+FIELD~LIFETIME.PURCHASES~33~Lifetime Total Purchases~
+FIELD~RETURN.RATE~34~Return Rate Percentage~
+FIELD~ON.TIME.PCT~35~On-Time Delivery Percentage~
+FIELD~QUALITY.RATING~36~Quality Rating~1-10
+FIELD~PRICE.RATING~37~Price Competitiveness~1-10
+FIELD~SERVICE.RATING~38~Service Rating~1-10
+FIELD~EDI.CAPABLE~39~EDI Capable Flag~Y/N
+FIELD~EDI.ID~40~EDI Identifier~
+FIELD~DROP.SHIP~41~Drop Ship Capable~Y/N
+FIELD~NOTES~42~Notes~Multivalued
+FIELD~CONTACTS~43~Additional Contact Names~Multivalued
+FIELD~CONTACT.PHONES~44~Contact Phone Numbers~Multivalued
+FIELD~CONTACT.EMAILS~45~Contact Email Addresses~Multivalued
+FIELD~CERTIFICATIONS~46~Certifications~Multivalued (ISO, etc)
+FIELD~INSURANCE.EXP~47~Insurance Expiration Date~
+FIELD~W9.DATE~48~W9 Form Date~
+FIELD~CREATED.BY~49~Created By User~
+FIELD~CREATED.DATE~50~Created Date~
+FIELD~CREATED.TIME~51~Created Time~
+FIELD~MODIFIED.BY~52~Modified By User~
+FIELD~MODIFIED.DATE~53~Modified Date~
+FIELD~MODIFIED.TIME~54~Modified Time~
+
+* Index Definitions
+INDEX~VENDOR.NAME.IDX~VENDOR.NAME~Vendor Name Index
+INDEX~VENDOR.TYPE.IDX~VENDOR.TYPE~Vendor Type Index
+INDEX~STATUS.IDX~STATUS~Status Index
+INDEX~BUYER.IDX~BUYER~Buyer Index
+
+* Correlatives and Derived Fields
+CORR~FULL.ADDRESS~ADDRESS.LINE1:" ":ADDRESS.LINE2:" ":CITY:", ":STATE:" ":ZIP
+CORR~OVERALL.RATING~(QUALITY.RATING + PRICE.RATING + SERVICE.RATING) / 3
+CORR~PERFORMANCE.SCORE~(ON.TIME.PCT * 0.4) + (OVERALL.RATING * 10 * 0.6)
+CORR~DAYS.SINCE.PO~DATE() - LAST.PO.DATE
+CORR~DAYS.SINCE.RECEIPT~DATE() - LAST.RECEIPT.DATE
+CORR~ACTIVE.VENDOR~IF STATUS = 'A' THEN 'Y' ELSE 'N'

@@ -1,0 +1,581 @@
+SUBROUTINE EMP.TIMECARD(EMP.ID, ACTION, TC.DATE, TC.TIME, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: EMP.TIMECARD
+* Purpose: Employee Timecard Management (Clock In/Out, Breaks)
+* Parameters:
+*   EMP.ID (IN) - Employee ID
+*   ACTION (IN) - Action to perform:
+*                 CLOCK.IN, CLOCK.OUT, BREAK.START, BREAK.END
+*   TC.DATE (IN) - Date for timecard (optional, defaults to today)
+*   TC.TIME (IN) - Time for action (optional, defaults to now)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate employee ID
+IF EMP.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Employee ID is required'
+   RETURN
+END
+
+* Verify employee exists and is active
+READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Employee not found'
+   RETURN
+END
+
+IF EMP.REC<EMP.STATUS> # STATUS.ACTIVE THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Employee is not active'
+   RETURN
+END
+
+* Default date and time if not provided
+IF TC.DATE = '' THEN TC.DATE = SYSTEM.DATE
+IF TC.TIME = '' THEN TC.TIME = SYSTEM.TIME
+
+* Validate action
+VALID.ACTIONS = 'CLOCK.IN':VM:'CLOCK.OUT':VM:'BREAK.START':VM:'BREAK.END'
+LOCATE ACTION IN VALID.ACTIONS<1> USING VM SETTING POS ELSE
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid action: ' : ACTION
+   RETURN
+END
+
+* Open timecards file
+OPEN 'TIMECARDS' TO F.TIMECARDS ELSE
+   EXECUTE 'CREATE.FILE TIMECARDS 1 101'
+   OPEN 'TIMECARDS' TO F.TIMECARDS ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Cannot open timecards file'
+      RETURN
+   END
+END
+
+* Process action
+BEGIN CASE
+   CASE ACTION = 'CLOCK.IN'
+      GOSUB PROCESS.CLOCK.IN
+
+   CASE ACTION = 'CLOCK.OUT'
+      GOSUB PROCESS.CLOCK.OUT
+
+   CASE ACTION = 'BREAK.START'
+      GOSUB PROCESS.BREAK.START
+
+   CASE ACTION = 'BREAK.END'
+      GOSUB PROCESS.BREAK.END
+END CASE
+
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Log timecard action
+LOG.MSG = 'Timecard ' : ACTION : ': ' : EMP.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Process Clock In
+**************************************************************************
+PROCESS.CLOCK.IN:
+   * Check if already clocked in today
+   TC.ID = EMP.ID : '*' : TC.DATE
+
+   READ TC.REC FROM F.TIMECARDS, TC.ID THEN
+      * Timecard exists - check if already clocked in
+      IF TC.REC<2> # '' AND TC.REC<3> = '' THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Employee is already clocked in'
+         RETURN
+      END
+
+      * Previous shift was completed, start new shift
+      IF TC.REC<3> # '' THEN
+         GOSUB CREATE.NEW.TIMECARD
+         RETURN
+      END
+   END
+
+   * Create new timecard for the day
+   GOSUB CREATE.NEW.TIMECARD
+   RETURN
+
+**************************************************************************
+* Create New Timecard
+**************************************************************************
+CREATE.NEW.TIMECARD:
+   TC.ID = EMP.ID : '*' : TC.DATE
+
+   * Check if this is second+ shift for the day
+   READ EXISTING.TC FROM F.TIMECARDS, TC.ID THEN
+      * Append shift number
+      SHIFT.NUM = 2
+      LOOP
+         TC.ID = EMP.ID : '*' : TC.DATE : '*' : SHIFT.NUM
+         READ EXISTING.TC FROM F.TIMECARDS, TC.ID ELSE EXIT
+         SHIFT.NUM += 1
+      REPEAT
+   END
+
+   TC.REC = ''
+   TC.REC<1> = TC.DATE
+   TC.REC<2> = TC.TIME  ; Clock in time
+   TC.REC<3> = ''  ; Clock out time
+   TC.REC<4> = ''  ; Break start time
+   TC.REC<5> = ''  ; Break end time
+   TC.REC<6> = 0  ; Total break minutes
+   TC.REC<7> = 0  ; Regular hours
+   TC.REC<8> = 0  ; PTO hours
+   TC.REC<9> = 0  ; Overtime hours
+   TC.REC<10> = ''  ; Notes
+   TC.REC<11> = EMP.REC<PRIMARY.STORE>  ; Store
+   TC.REC<12> = 'OPEN'  ; Status
+   TC.REC<13> = SYSTEM.DATE  ; Created date
+   TC.REC<14> = USER.ID  ; Created by
+
+   * Check if employee is scheduled
+   GOSUB CHECK.SCHEDULE
+   TC.REC<15> = SCHEDULED.FLAG
+   TC.REC<16> = SCHEDULED.START
+   TC.REC<17> = SCHEDULED.END
+
+   * Check for early/late arrival
+   IF SCHEDULED.FLAG = 'Y' THEN
+      GOSUB CHECK.ARRIVAL.TIME
+      TC.REC<18> = ARRIVAL.STATUS
+      TC.REC<19> = VARIANCE.MINUTES
+   END
+
+   WRITE TC.REC TO F.TIMECARDS, TC.ID
+   RETURN
+
+**************************************************************************
+* Check Schedule
+**************************************************************************
+CHECK.SCHEDULE:
+   SCHEDULED.FLAG = 'N'
+   SCHEDULED.START = ''
+   SCHEDULED.END = ''
+
+   OPEN 'SCHEDULES' TO F.SCHEDULES ELSE
+      RETURN
+   END
+
+   * Get week start for schedule
+   WEEK.START = TC.DATE - MOD(TC.DATE, 7)
+   SCHEDULE.ID = EMP.ID : '*' : WEEK.START
+
+   READ SCHEDULE.REC FROM F.SCHEDULES, SCHEDULE.ID ELSE
+      RETURN
+   END
+
+   * Get day of week (0=Sunday)
+   DAY.NUM = MOD(TC.DATE, 7) + 1
+
+   SCHEDULED.START = SCHEDULE.REC<10, DAY.NUM>
+   SCHEDULED.END = SCHEDULE.REC<11, DAY.NUM>
+
+   IF SCHEDULED.START # '' THEN
+      SCHEDULED.FLAG = 'Y'
+   END
+   RETURN
+
+**************************************************************************
+* Check Arrival Time
+**************************************************************************
+CHECK.ARRIVAL.TIME:
+   ARRIVAL.STATUS = 'ON.TIME'
+   VARIANCE.MINUTES = 0
+
+   IF SCHEDULED.START = '' THEN RETURN
+
+   * Calculate variance in minutes
+   TIME.DIFF = TC.TIME - SCHEDULED.START
+   VARIANCE.MINUTES = INT(TIME.DIFF / 60)
+
+   BEGIN CASE
+      CASE VARIANCE.MINUTES < -15
+         ARRIVAL.STATUS = 'EARLY'
+
+      CASE VARIANCE.MINUTES >= -15 AND VARIANCE.MINUTES <= 15
+         ARRIVAL.STATUS = 'ON.TIME'
+
+      CASE VARIANCE.MINUTES > 15 AND VARIANCE.MINUTES <= 30
+         ARRIVAL.STATUS = 'LATE'
+
+      CASE VARIANCE.MINUTES > 30
+         ARRIVAL.STATUS = 'VERY.LATE'
+         GOSUB SEND.LATE.ALERT
+   END CASE
+   RETURN
+
+**************************************************************************
+* Send Late Alert
+**************************************************************************
+SEND.LATE.ALERT:
+   * Notify supervisor
+   IF EMP.REC<SUPERVISOR.ID> = '' THEN RETURN
+
+   READ SUPER.REC FROM F.EMPLOYEES, EMP.REC<SUPERVISOR.ID> ELSE
+      RETURN
+   END
+
+   IF SUPER.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'LATE*' : EMP.ID : '*' : TC.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = SUPER.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Employee Late Alert'
+   EMAIL.REC<3> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   EMAIL.REC<3> := ' clocked in ' : VARIANCE.MINUTES : ' minutes late.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Process Clock Out
+**************************************************************************
+PROCESS.CLOCK.OUT:
+   * Find open timecard for today
+   GOSUB FIND.OPEN.TIMECARD
+   IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+   * Update clock out time
+   TC.REC<3> = TC.TIME
+
+   * Calculate total break time
+   TOTAL.BREAK.MINS = TC.REC<6>
+
+   * Calculate worked time
+   GOSUB CALCULATE.HOURS.WORKED
+
+   * Check for overtime
+   GOSUB CHECK.OVERTIME
+
+   * Check if leaving early
+   IF SCHEDULED.END # '' THEN
+      GOSUB CHECK.EARLY.DEPARTURE
+   END
+
+   * Update status
+   TC.REC<12> = 'CLOSED'
+
+   * Write updated timecard
+   WRITE TC.REC TO F.TIMECARDS, OPEN.TC.ID
+
+   * Update employee YTD hours
+   GOSUB UPDATE.YTD.HOURS
+   RETURN
+
+**************************************************************************
+* Find Open Timecard
+**************************************************************************
+FIND.OPEN.TIMECARD:
+   OPEN.TC.ID = ''
+
+   * Try simple ID first
+   TC.ID = EMP.ID : '*' : TC.DATE
+
+   READ TC.REC FROM F.TIMECARDS, TC.ID THEN
+      IF TC.REC<12> = 'OPEN' THEN
+         OPEN.TC.ID = TC.ID
+         SCHEDULED.END = TC.REC<17>
+         RETURN
+      END
+   END
+
+   * Search for any open timecard for today (multi-shift)
+   SELECT.CMD = 'SELECT TIMECARDS WITH @ID LIKE "' : EMP.ID : '*' : TC.DATE : '..."'
+   SELECT.CMD := ' AND WITH STATUS = "OPEN"'
+   EXECUTE SELECT.CMD
+
+   READNEXT OPEN.TC.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'No open timecard found'
+      RETURN
+   END
+
+   READ TC.REC FROM F.TIMECARDS, OPEN.TC.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Cannot read timecard'
+      RETURN
+   END
+
+   SCHEDULED.END = TC.REC<17>
+   RETURN
+
+**************************************************************************
+* Calculate Hours Worked
+**************************************************************************
+CALCULATE.HOURS.WORKED:
+   CLOCK.IN = TC.REC<2>
+   CLOCK.OUT = TC.REC<3>
+
+   * Calculate total minutes
+   TOTAL.MINUTES = (CLOCK.OUT - CLOCK.IN) / 60
+
+   * Subtract break time
+   BREAK.MINUTES = TC.REC<6>
+   IF BREAK.MINUTES = '' THEN BREAK.MINUTES = 0
+
+   WORKED.MINUTES = TOTAL.MINUTES - BREAK.MINUTES
+
+   * Convert to hours (decimal)
+   HOURS.WORKED = WORKED.MINUTES / 60
+
+   * Round to 2 decimals
+   CALL UTILS.COMMON('ROUND.AMOUNT', HOURS.WORKED, 2, HOURS.WORKED)
+
+   TC.REC<7> = HOURS.WORKED
+   RETURN
+
+**************************************************************************
+* Check Overtime
+**************************************************************************
+CHECK.OVERTIME:
+   OT.HOURS = 0
+
+   * Get total hours worked today (including this shift)
+   DAILY.HOURS = HOURS.WORKED
+
+   * Check other shifts today
+   SELECT.CMD = 'SELECT TIMECARDS WITH @ID LIKE "' : EMP.ID : '*' : TC.DATE : '..."'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT OTHER.TC.ID ELSE EXIT
+
+      IF OTHER.TC.ID = OPEN.TC.ID THEN CONTINUE
+
+      READ OTHER.TC FROM F.TIMECARDS, OTHER.TC.ID ELSE CONTINUE
+
+      OTHER.HOURS = OTHER.TC<7>
+      IF OTHER.HOURS # '' THEN
+         DAILY.HOURS += OTHER.HOURS
+      END
+   REPEAT
+
+   * Check for daily overtime (>8 hours)
+   IF DAILY.HOURS > 8 THEN
+      OT.HOURS = DAILY.HOURS - 8
+   END
+
+   * Check for weekly overtime (>40 hours)
+   GOSUB CHECK.WEEKLY.OVERTIME
+   IF WEEKLY.OT > OT.HOURS THEN
+      OT.HOURS = WEEKLY.OT
+   END
+
+   TC.REC<9> = OT.HOURS
+
+   * Adjust regular hours
+   IF OT.HOURS > 0 THEN
+      TC.REC<7> = HOURS.WORKED - OT.HOURS
+   END
+   RETURN
+
+**************************************************************************
+* Check Weekly Overtime
+**************************************************************************
+CHECK.WEEKLY.OVERTIME:
+   WEEKLY.OT = 0
+
+   * Get week start (Sunday)
+   WEEK.START = TC.DATE - MOD(TC.DATE, 7)
+   WEEK.END = WEEK.START + 6
+
+   WEEKLY.HOURS = 0
+
+   SELECT.CMD = 'SELECT TIMECARDS WITH @ID LIKE "' : EMP.ID : '*..."'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT WK.TC.ID ELSE EXIT
+
+      READ WK.TC FROM F.TIMECARDS, WK.TC.ID ELSE CONTINUE
+
+      WK.DATE = WK.TC<1>
+      IF WK.DATE >= WEEK.START AND WK.DATE <= WEEK.END THEN
+         REG.HRS = WK.TC<7>
+         OT.HRS = WK.TC<9>
+         IF REG.HRS # '' THEN WEEKLY.HOURS += REG.HRS
+         IF OT.HRS # '' THEN WEEKLY.HOURS += OT.HRS
+      END
+   REPEAT
+
+   * Add current shift
+   WEEKLY.HOURS += HOURS.WORKED
+
+   IF WEEKLY.HOURS > 40 THEN
+      WEEKLY.OT = WEEKLY.HOURS - 40
+   END
+   RETURN
+
+**************************************************************************
+* Check Early Departure
+**************************************************************************
+CHECK.EARLY.DEPARTURE:
+   IF SCHEDULED.END = '' THEN RETURN
+
+   TIME.DIFF = TC.TIME - SCHEDULED.END
+   VARIANCE.MINUTES = INT(TIME.DIFF / 60)
+
+   IF VARIANCE.MINUTES < -30 THEN
+      TC.REC<20> = 'EARLY.DEPARTURE'
+      TC.REC<21> = ABS(VARIANCE.MINUTES)
+      GOSUB SEND.EARLY.DEPARTURE.ALERT
+   END
+   RETURN
+
+**************************************************************************
+* Send Early Departure Alert
+**************************************************************************
+SEND.EARLY.DEPARTURE.ALERT:
+   IF EMP.REC<SUPERVISOR.ID> = '' THEN RETURN
+
+   READ SUPER.REC FROM F.EMPLOYEES, EMP.REC<SUPERVISOR.ID> ELSE
+      RETURN
+   END
+
+   IF SUPER.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'EARLY*' : EMP.ID : '*' : TC.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = SUPER.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Employee Early Departure Alert'
+   EMAIL.REC<3> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   EMAIL.REC<3> := ' clocked out ' : ABS(VARIANCE.MINUTES) : ' minutes early.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Update YTD Hours
+**************************************************************************
+UPDATE.YTD.HOURS:
+   READU EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+      RETURN
+   END
+
+   YTD.HRS = EMP.REC<YTD.HOURS>
+   IF YTD.HRS = '' THEN YTD.HRS = 0
+
+   YTD.HRS += HOURS.WORKED
+   EMP.REC<YTD.HOURS> = YTD.HRS
+
+   WRITE EMP.REC TO F.EMPLOYEES, EMP.ID
+   RETURN
+
+**************************************************************************
+* Process Break Start
+**************************************************************************
+PROCESS.BREAK.START:
+   * Find open timecard
+   GOSUB FIND.OPEN.TIMECARD
+   IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+   * Check if already on break
+   IF TC.REC<4> # '' AND TC.REC<5> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Employee is already on break'
+      RETURN
+   END
+
+   * Record break start time
+   TC.REC<4> = TC.TIME
+   TC.REC<12> = 'ON.BREAK'
+
+   WRITE TC.REC TO F.TIMECARDS, OPEN.TC.ID
+   RETURN
+
+**************************************************************************
+* Process Break End
+**************************************************************************
+PROCESS.BREAK.END:
+   * Find open timecard
+   GOSUB FIND.OPEN.TIMECARD
+   IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+   * Check if on break
+   IF TC.REC<4> = '' OR TC.REC<5> # '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Employee is not on break'
+      RETURN
+   END
+
+   * Record break end time
+   TC.REC<5> = TC.TIME
+
+   * Calculate break duration in minutes
+   BREAK.START = TC.REC<4>
+   BREAK.END = TC.REC<5>
+   BREAK.MINS = (BREAK.END - BREAK.START) / 60
+
+   * Add to total break time
+   TOTAL.BREAK = TC.REC<6>
+   IF TOTAL.BREAK = '' THEN TOTAL.BREAK = 0
+   TOTAL.BREAK += BREAK.MINS
+
+   TC.REC<6> = TOTAL.BREAK
+
+   * Check for excessive break time
+   IF BREAK.MINS > 60 THEN
+      TC.REC<22> = 'LONG.BREAK'
+      TC.REC<23> = BREAK.MINS
+      GOSUB SEND.LONG.BREAK.ALERT
+   END
+
+   * Reset break tracking for next break
+   TC.REC<4> = ''
+   TC.REC<5> = ''
+   TC.REC<12> = 'OPEN'
+
+   WRITE TC.REC TO F.TIMECARDS, OPEN.TC.ID
+   RETURN
+
+**************************************************************************
+* Send Long Break Alert
+**************************************************************************
+SEND.LONG.BREAK.ALERT:
+   IF EMP.REC<SUPERVISOR.ID> = '' THEN RETURN
+
+   READ SUPER.REC FROM F.EMPLOYEES, EMP.REC<SUPERVISOR.ID> ELSE
+      RETURN
+   END
+
+   IF SUPER.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'LONGBREAK*' : EMP.ID : '*' : TC.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = SUPER.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Employee Long Break Alert'
+   EMAIL.REC<3> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   EMAIL.REC<3> := ' took a ' : INT(BREAK.MINS) : ' minute break.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

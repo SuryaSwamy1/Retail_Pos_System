@@ -1,0 +1,365 @@
+SUBROUTINE PRICE.MARKDOWN(CATEGORY, MARKDOWN.PCT, REASON, EFFECTIVE.DATE, MARKDOWN.SUMMARY, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: PRICE.MARKDOWN
+* Purpose: Mass Markdown Processing
+* Parameters:
+*   CATEGORY (IN) - Category to markdown (or '' for all)
+*   MARKDOWN.PCT (IN) - Markdown percentage
+*   REASON (IN) - Reason for markdown
+*   EFFECTIVE.DATE (IN) - When markdown becomes effective
+*   MARKDOWN.SUMMARY (OUT) - Summary of markdown operation
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+MARKDOWN.SUMMARY = ''
+
+* Validate markdown percentage
+IF MARKDOWN.PCT = '' OR NOT(NUM(MARKDOWN.PCT)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Markdown percentage must be numeric'
+   RETURN
+END
+
+IF MARKDOWN.PCT <= 0 OR MARKDOWN.PCT > 75 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Markdown percentage must be between 1 and 75'
+   RETURN
+END
+
+* Validate reason
+GOSUB VALIDATE.MARKDOWN.REASON
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Validate effective date
+IF EFFECTIVE.DATE = '' THEN EFFECTIVE.DATE = SYSTEM.DATE
+
+IF EFFECTIVE.DATE < SYSTEM.DATE THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Effective date cannot be in the past'
+   RETURN
+END
+
+* Check authorization for mass markdown
+GOSUB CHECK.MARKDOWN.AUTHORIZATION
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Initialize counters
+GOSUB INITIALIZE.COUNTERS
+
+* Process markdown
+GOSUB PROCESS.MARKDOWN
+
+* Create markdown batch record
+GOSUB CREATE.MARKDOWN.BATCH
+
+* Generate summary
+GOSUB GENERATE.MARKDOWN.SUMMARY
+
+LOG.MSG = 'Mass markdown: ' : MARKDOWN.PCT : '% on ' : CATEGORY : ' - ' : ITEMS.PROCESSED : ' items'
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate Markdown Reason
+**************************************************************************
+VALIDATE.MARKDOWN.REASON:
+   VALID.REASONS = 'END.OF.SEASON':VM:'CLEARANCE':VM:'OVERSTOCK'
+   VALID.REASONS := VM:'DAMAGED':VM:'OBSOLETE':VM:'SLOW.MOVING'
+   VALID.REASONS := VM:'PROMOTIONAL':VM:'COMPETITIVE':VM:'OTHER'
+
+   LOCATE REASON IN VALID.REASONS<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid markdown reason'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Check Markdown Authorization
+**************************************************************************
+CHECK.MARKDOWN.AUTHORIZATION:
+   * Mass markdowns require higher authorization
+   * < 20% = Level 7+
+   * 20-40% = Level 9+
+   * > 40% = Level 10+
+
+   USER.LEVEL = 5  ; Default
+
+   * Get user's security level
+   READ USER.REC FROM F.EMPLOYEES, USER.ID ELSE
+      USER.LEVEL = 1
+   END
+   USER.LEVEL = USER.REC<SECURITY.LEVEL>
+   IF USER.LEVEL = '' THEN USER.LEVEL = 1
+
+   BEGIN CASE
+      CASE USER.LEVEL >= 10
+         * Unlimited authorization
+         RETURN
+
+      CASE USER.LEVEL >= 9
+         IF MARKDOWN.PCT > 40 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Markdown exceeds authorization limit'
+            RETURN
+         END
+
+      CASE USER.LEVEL >= 7
+         IF MARKDOWN.PCT > 20 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Markdown exceeds authorization limit'
+            RETURN
+         END
+
+      CASE 1
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Insufficient authorization for mass markdown'
+         RETURN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Initialize Counters
+**************************************************************************
+INITIALIZE.COUNTERS:
+   ITEMS.PROCESSED = 0
+   ITEMS.SKIPPED = 0
+   ITEMS.ERROR = 0
+   TOTAL.OLD.VALUE = 0
+   TOTAL.NEW.VALUE = 0
+   TOTAL.MARKDOWN.AMT = 0
+   RETURN
+
+**************************************************************************
+* Process Markdown
+**************************************************************************
+PROCESS.MARKDOWN:
+   * Build selection criteria
+   IF CATEGORY # '' THEN
+      SELECT.CMD = 'SELECT INVENTORY WITH CATEGORY = "' : CATEGORY : '"'
+   END ELSE
+      SELECT.CMD = 'SELECT INVENTORY'
+   END
+
+   SELECT.CMD := ' AND WITH ITEM.STATUS = "ACTIVE"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+         ITEMS.ERROR += 1
+         CONTINUE
+      END
+
+      * Get current price
+      CURRENT.PRICE = ITEM.REC<SELLING.PRICE>
+      IF CURRENT.PRICE = '' OR CURRENT.PRICE <= 0 THEN
+         RELEASE F.INVENTORY, ITEM.ID
+         ITEMS.SKIPPED += 1
+         CONTINUE
+      END
+
+      * Calculate new price
+      MARKDOWN.AMT = CURRENT.PRICE * (MARKDOWN.PCT / 100)
+      NEW.PRICE = CURRENT.PRICE - MARKDOWN.AMT
+
+      * Round to 2 decimal places
+      NEW.PRICE = INT((NEW.PRICE * 100) + 0.5) / 100
+
+      * Check minimum price (cost + 10%)
+      AVG.COST = ITEM.REC<AVG.COST>
+      IF AVG.COST = '' THEN AVG.COST = 0
+
+      MIN.PRICE = AVG.COST * 1.1
+
+      IF NEW.PRICE < MIN.PRICE AND AVG.COST > 0 THEN
+         * Skip items that would go below minimum
+         RELEASE F.INVENTORY, ITEM.ID
+         ITEMS.SKIPPED += 1
+         CONTINUE
+      END
+
+      * Update totals
+      TOTAL.OLD.VALUE += CURRENT.PRICE
+      TOTAL.NEW.VALUE += NEW.PRICE
+      TOTAL.MARKDOWN.AMT += MARKDOWN.AMT
+
+      * Apply markdown
+      IF EFFECTIVE.DATE = SYSTEM.DATE THEN
+         * Immediate markdown
+         ITEM.REC<SELLING.PRICE> = NEW.PRICE
+         ITEM.REC<LAST.PRICE.CHANGE> = SYSTEM.DATE
+         ITEM.REC<MODIFIED.BY> = USER.ID
+         ITEM.REC<MODIFIED.DATE> = SYSTEM.DATE
+         ITEM.REC<MODIFIED.TIME> = SYSTEM.TIME
+
+         WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+      END ELSE
+         * Schedule markdown
+         GOSUB SCHEDULE.ITEM.MARKDOWN
+         RELEASE F.INVENTORY, ITEM.ID
+      END
+
+      * Create price history
+      GOSUB CREATE.MARKDOWN.HISTORY
+
+      ITEMS.PROCESSED += 1
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Schedule Item Markdown
+**************************************************************************
+SCHEDULE.ITEM.MARKDOWN:
+   OPEN 'PRICE.SCHEDULE' TO F.PRICE.SCHEDULE ELSE
+      EXECUTE 'CREATE.FILE PRICE.SCHEDULE 1 101'
+      OPEN 'PRICE.SCHEDULE' TO F.PRICE.SCHEDULE ELSE RETURN
+   END
+
+   SCHEDULE.ID = ITEM.ID : '*' : EFFECTIVE.DATE
+
+   * Check if already scheduled
+   READ EXISTING.REC FROM F.PRICE.SCHEDULE, SCHEDULE.ID THEN
+      * Update existing schedule
+      EXISTING.REC<3> = NEW.PRICE
+      WRITE EXISTING.REC TO F.PRICE.SCHEDULE, SCHEDULE.ID
+      RETURN
+   END
+
+   SCHEDULE.REC = ''
+   SCHEDULE.REC<1> = ITEM.ID
+   SCHEDULE.REC<2> = CURRENT.PRICE
+   SCHEDULE.REC<3> = NEW.PRICE
+   SCHEDULE.REC<4> = EFFECTIVE.DATE
+   SCHEDULE.REC<5> = 'PENDING'
+   SCHEDULE.REC<6> = 'MARKDOWN*' : REASON
+   SCHEDULE.REC<7> = USER.ID
+   SCHEDULE.REC<8> = SYSTEM.DATE
+   SCHEDULE.REC<9> = SYSTEM.TIME
+   SCHEDULE.REC<10> = MARKDOWN.PCT
+
+   WRITE SCHEDULE.REC TO F.PRICE.SCHEDULE, SCHEDULE.ID
+   RETURN
+
+**************************************************************************
+* Create Markdown History
+**************************************************************************
+CREATE.MARKDOWN.HISTORY:
+   OPEN 'PRICE.HISTORY' TO F.PRICE.HIST ELSE
+      EXECUTE 'CREATE.FILE PRICE.HISTORY 1 101'
+      OPEN 'PRICE.HISTORY' TO F.PRICE.HIST ELSE RETURN
+   END
+
+   HISTORY.ID = ITEM.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+
+   HISTORY.REC = ''
+   HISTORY.REC<1> = ITEM.ID
+   HISTORY.REC<2> = CURRENT.PRICE
+   HISTORY.REC<3> = NEW.PRICE
+   HISTORY.REC<4> = MARKDOWN.AMT * -1  ; Negative for markdown
+   HISTORY.REC<5> = MARKDOWN.PCT * -1
+   HISTORY.REC<6> = 'MARKDOWN*' : REASON
+   HISTORY.REC<7> = EFFECTIVE.DATE
+   HISTORY.REC<8> = USER.ID
+   HISTORY.REC<9> = SYSTEM.DATE
+   HISTORY.REC<10> = SYSTEM.TIME
+
+   IF EFFECTIVE.DATE = SYSTEM.DATE THEN
+      HISTORY.REC<11> = 'APPLIED'
+   END ELSE
+      HISTORY.REC<11> = 'SCHEDULED'
+   END
+
+   WRITE HISTORY.REC TO F.PRICE.HIST, HISTORY.ID
+   RETURN
+
+**************************************************************************
+* Create Markdown Batch
+**************************************************************************
+CREATE.MARKDOWN.BATCH:
+   OPEN 'MARKDOWN.BATCHES' TO F.MARKDOWN.BATCH ELSE
+      EXECUTE 'CREATE.FILE MARKDOWN.BATCHES 1 101'
+      OPEN 'MARKDOWN.BATCHES' TO F.MARKDOWN.BATCH ELSE RETURN
+   END
+
+   BATCH.ID = 'MDN*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+
+   BATCH.REC = ''
+   BATCH.REC<1> = BATCH.ID
+   BATCH.REC<2> = SYSTEM.DATE
+   BATCH.REC<3> = SYSTEM.TIME
+   BATCH.REC<4> = USER.ID
+   BATCH.REC<5> = CATEGORY
+   BATCH.REC<6> = MARKDOWN.PCT
+   BATCH.REC<7> = REASON
+   BATCH.REC<8> = EFFECTIVE.DATE
+   BATCH.REC<9> = ITEMS.PROCESSED
+   BATCH.REC<10> = ITEMS.SKIPPED
+   BATCH.REC<11> = ITEMS.ERROR
+   BATCH.REC<12> = TOTAL.OLD.VALUE
+   BATCH.REC<13> = TOTAL.NEW.VALUE
+   BATCH.REC<14> = TOTAL.MARKDOWN.AMT
+
+   IF EFFECTIVE.DATE = SYSTEM.DATE THEN
+      BATCH.REC<15> = 'APPLIED'
+   END ELSE
+      BATCH.REC<15> = 'SCHEDULED'
+   END
+
+   WRITE BATCH.REC TO F.MARKDOWN.BATCH, BATCH.ID
+   RETURN
+
+**************************************************************************
+* Generate Markdown Summary
+**************************************************************************
+GENERATE.MARKDOWN.SUMMARY:
+   MARKDOWN.SUMMARY = ''
+
+   MARKDOWN.SUMMARY<1> = '========================================='
+   MARKDOWN.SUMMARY<2> = '      MASS MARKDOWN SUMMARY             '
+   MARKDOWN.SUMMARY<3> = '========================================='
+   MARKDOWN.SUMMARY<4> = ''
+   MARKDOWN.SUMMARY<5> = 'Markdown Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   MARKDOWN.SUMMARY<6> = 'Effective Date: ' : OCONV(EFFECTIVE.DATE, 'D4/')
+   MARKDOWN.SUMMARY<7> = 'Category: ' : (IF CATEGORY # '' THEN CATEGORY ELSE 'ALL')
+   MARKDOWN.SUMMARY<8> = 'Markdown Percentage: ' : MARKDOWN.PCT : '%'
+   MARKDOWN.SUMMARY<9> = 'Reason: ' : REASON
+   MARKDOWN.SUMMARY<10> = 'Processed By: ' : USER.ID
+   MARKDOWN.SUMMARY<11> = ''
+   MARKDOWN.SUMMARY<12> = '-----------------------------------------'
+   MARKDOWN.SUMMARY<13> = 'RESULTS'
+   MARKDOWN.SUMMARY<14> = '-----------------------------------------'
+   MARKDOWN.SUMMARY<15> = 'Items Processed: ' : ITEMS.PROCESSED
+   MARKDOWN.SUMMARY<16> = 'Items Skipped: ' : ITEMS.SKIPPED
+   MARKDOWN.SUMMARY<17> = 'Items with Errors: ' : ITEMS.ERROR
+   MARKDOWN.SUMMARY<18> = ''
+   MARKDOWN.SUMMARY<19> = 'Total Old Value: $' : TOTAL.OLD.VALUE
+   MARKDOWN.SUMMARY<20> = 'Total New Value: $' : TOTAL.NEW.VALUE
+   MARKDOWN.SUMMARY<21> = 'Total Markdown: $' : TOTAL.MARKDOWN.AMT
+   MARKDOWN.SUMMARY<22> = ''
+
+   IF EFFECTIVE.DATE = SYSTEM.DATE THEN
+      MARKDOWN.SUMMARY<23> = 'Status: APPLIED IMMEDIATELY'
+   END ELSE
+      MARKDOWN.SUMMARY<24> = 'Status: SCHEDULED FOR ' : OCONV(EFFECTIVE.DATE, 'D4/')
+   END
+
+   LINE.NUM = 25
+   MARKDOWN.SUMMARY<LINE.NUM> = ''
+   LINE.NUM += 1
+   MARKDOWN.SUMMARY<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   MARKDOWN.SUMMARY<LINE.NUM> = '           END OF SUMMARY                '
+   LINE.NUM += 1
+   MARKDOWN.SUMMARY<LINE.NUM> = '========================================='
+
+   RETURN
+
+END

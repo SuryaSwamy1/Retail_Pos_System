@@ -1,0 +1,693 @@
+SUBROUTINE BATCH.EOM(RUN.MODE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: BATCH.EOM
+* Purpose: End of Month Processing
+* Parameters:
+*   RUN.MODE (IN) - Execution mode (TEST/LIVE)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+IF RUN.MODE = '' THEN RUN.MODE = 'TEST'
+
+* Initialize batch
+GOSUB INITIALIZE.BATCH
+
+* Close accounting period
+GOSUB CLOSE.ACCOUNTING.PERIOD
+
+* Calculate monthly inventory valuation
+GOSUB CALCULATE.INVENTORY.VALUATION
+
+* Process monthly sales commissions
+GOSUB PROCESS.MONTHLY.COMMISSIONS
+
+* Generate monthly sales reports
+GOSUB GENERATE.MONTHLY.REPORTS
+
+* Archive old transactions
+GOSUB ARCHIVE.OLD.TRANSACTIONS
+
+* Calculate customer loyalty tier changes
+GOSUB PROCESS.LOYALTY.TIER.CHANGES
+
+* Update sales forecasts
+GOSUB UPDATE.SALES.FORECASTS
+
+* Expire old promotions
+GOSUB EXPIRE.OLD.PROMOTIONS
+
+* Generate month-end financial reports
+GOSUB GENERATE.FINANCIAL.REPORTS
+
+* Send month-end notifications
+GOSUB SEND.EOM.NOTIFICATIONS
+
+* Create batch log
+GOSUB CREATE.BATCH.LOG
+
+LOG.MSG = 'End of month batch completed - Mode: ' : RUN.MODE
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Initialize Batch
+**************************************************************************
+INITIALIZE.BATCH:
+   BATCH.ID = 'EOM*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   BATCH.START.TIME = SYSTEM.TIME
+   BATCH.DATE = SYSTEM.DATE
+
+   * Determine processing month
+   PREV.MONTH.STR = OCONV(SYSTEM.DATE - 1, 'D4/')[1,7]
+   MONTH.START = ICONV('01/' : PREV.MONTH.STR, 'D/')
+
+   * Get last day of previous month
+   CURRENT.MONTH = ICONV('01/' : OCONV(SYSTEM.DATE, 'D4/')[1,7], 'D/')
+   MONTH.END = CURRENT.MONTH - 1
+
+   * Initialize counters
+   TRANSACTIONS.PROCESSED = 0
+   COMMISSIONS.PAID = 0
+   CUSTOMERS.UPDATED = 0
+   INVENTORY.ITEMS = 0
+   TOTAL.INVENTORY.VALUE = 0
+   REPORTS.GENERATED = 0
+
+   RETURN
+
+**************************************************************************
+* Close Accounting Period
+**************************************************************************
+CLOSE.ACCOUNTING.PERIOD:
+   IF RUN.MODE # 'LIVE' THEN RETURN
+
+   OPEN 'ACCOUNTING.PERIODS' TO F.ACCT.PERIODS ELSE
+      EXECUTE 'CREATE.FILE ACCOUNTING.PERIODS 1 101'
+      OPEN 'ACCOUNTING.PERIODS' TO F.ACCT.PERIODS ELSE RETURN
+   END
+
+   PERIOD.ID = OCONV(MONTH.END, 'D4-YM')
+
+   PERIOD.REC = ''
+   PERIOD.REC<1> = PERIOD.ID
+   PERIOD.REC<2> = MONTH.START
+   PERIOD.REC<3> = MONTH.END
+   PERIOD.REC<4> = 'CLOSED'
+   PERIOD.REC<5> = SYSTEM.DATE
+   PERIOD.REC<6> = SYSTEM.TIME
+   PERIOD.REC<7> = USER.ID
+
+   WRITE PERIOD.REC TO F.ACCT.PERIODS, PERIOD.ID
+   RETURN
+
+**************************************************************************
+* Calculate Inventory Valuation
+**************************************************************************
+CALCULATE.INVENTORY.VALUATION:
+   OPEN 'INVENTORY.VALUATIONS' TO F.INV.VAL ELSE
+      EXECUTE 'CREATE.FILE INVENTORY.VALUATIONS 1 101'
+      OPEN 'INVENTORY.VALUATIONS' TO F.INV.VAL ELSE RETURN
+   END
+
+   SELECT.CMD = 'SELECT INVENTORY WITH STATUS = "ACTIVE"'
+   EXECUTE SELECT.CMD
+
+   TOTAL.QTY = 0
+   TOTAL.COST.VALUE = 0
+   TOTAL.RETAIL.VALUE = 0
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      INVENTORY.ITEMS += 1
+
+      * Calculate total quantity
+      ITEM.QTY = 0
+      QTY.LIST = ITEM.REC<QTY.ON.HAND>
+
+      IF QTY.LIST # '' THEN
+         QTY.COUNT = DCOUNT(QTY.LIST, VM)
+         FOR I = 1 TO QTY.COUNT
+            QTY.AMT = QTY.LIST<1, I>
+            IF QTY.AMT # '' THEN
+               ITEM.QTY += QTY.AMT
+            END
+         NEXT I
+      END
+
+      * Get costs and prices
+      AVG.COST = ITEM.REC<AVG.COST>
+      IF AVG.COST = '' THEN AVG.COST = 0
+
+      RETAIL.PRICE = ITEM.REC<PRICE.LEVEL1>
+      IF RETAIL.PRICE = '' THEN RETAIL.PRICE = 0
+
+      * Calculate values
+      COST.VALUE = ITEM.QTY * AVG.COST
+      RETAIL.VALUE = ITEM.QTY * RETAIL.PRICE
+
+      TOTAL.QTY += ITEM.QTY
+      TOTAL.COST.VALUE += COST.VALUE
+      TOTAL.RETAIL.VALUE += RETAIL.VALUE
+   REPEAT
+
+   * Store valuation snapshot
+   VAL.ID = OCONV(MONTH.END, 'D4-YM')
+   VAL.REC = ''
+   VAL.REC<1> = VAL.ID
+   VAL.REC<2> = MONTH.END
+   VAL.REC<3> = INVENTORY.ITEMS
+   VAL.REC<4> = TOTAL.QTY
+   VAL.REC<5> = TOTAL.COST.VALUE
+   VAL.REC<6> = TOTAL.RETAIL.VALUE
+   VAL.REC<7> = TOTAL.RETAIL.VALUE - TOTAL.COST.VALUE  ; Potential profit
+   VAL.REC<8> = SYSTEM.DATE
+   VAL.REC<9> = SYSTEM.TIME
+
+   IF RUN.MODE = 'LIVE' THEN
+      WRITE VAL.REC TO F.INV.VAL, VAL.ID
+   END
+
+   TOTAL.INVENTORY.VALUE = TOTAL.COST.VALUE
+   RETURN
+
+**************************************************************************
+* Process Monthly Commissions
+**************************************************************************
+PROCESS.MONTHLY.COMMISSIONS:
+   OPEN 'COMMISSION.PAYMENTS' TO F.COMM.PAY ELSE
+      EXECUTE 'CREATE.FILE COMMISSION.PAYMENTS 1 101'
+      OPEN 'COMMISSION.PAYMENTS' TO F.COMM.PAY ELSE RETURN
+   END
+
+   * Get all active sales employees
+   SELECT.CMD = 'SELECT EMPLOYEES WITH STATUS = "ACTIVE"'
+   SELECT.CMD := ' AND WITH COMMISSION.RATE # ""'
+   EXECUTE SELECT.CMD
+
+   TOTAL.COMMISSION.PAID = 0
+
+   LOOP
+      READNEXT EMP.ID ELSE EXIT
+
+      READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE CONTINUE
+
+      * Calculate commission for month
+      GOSUB CALCULATE.EMPLOYEE.COMMISSION
+
+      IF COMMISSION.AMT > 0 THEN
+         * Create commission payment record
+         COMM.PAY.ID = EMP.ID : '*' : OCONV(MONTH.END, 'D4-YM')
+         COMM.PAY.REC = ''
+         COMM.PAY.REC<1> = EMP.ID
+         COMM.PAY.REC<2> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+         COMM.PAY.REC<3> = MONTH.START
+         COMM.PAY.REC<4> = MONTH.END
+         COMM.PAY.REC<5> = SALES.AMT
+         COMM.PAY.REC<6> = COMMISSION.AMT
+         COMM.PAY.REC<7> = SYSTEM.DATE
+         COMM.PAY.REC<8> = 'PENDING'
+
+         IF RUN.MODE = 'LIVE' THEN
+            WRITE COMM.PAY.REC TO F.COMM.PAY, COMM.PAY.ID
+         END
+
+         COMMISSIONS.PAID += 1
+         TOTAL.COMMISSION.PAID += COMMISSION.AMT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Calculate Employee Commission
+**************************************************************************
+CALCULATE.EMPLOYEE.COMMISSION:
+   COMMISSION.AMT = 0
+   SALES.AMT = 0
+
+   * Get sales for employee in month
+   SELECT.CMD = 'SELECT POS.TRANS WITH SALES.PERSON.ID = "' : EMP.ID : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE >= "' : MONTH.START : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE <= "' : MONTH.END : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      TRANS.TOTAL = TRANS.REC<TOTAL>
+      IF TRANS.TOTAL # '' THEN
+         SALES.AMT += TRANS.TOTAL
+      END
+   REPEAT
+
+   * Calculate commission
+   COMM.RATE = EMP.REC<COMMISSION.RATE>
+   IF COMM.RATE = '' THEN COMM.RATE = 0
+
+   COMMISSION.AMT = SALES.AMT * (COMM.RATE / 100)
+   RETURN
+
+**************************************************************************
+* Generate Monthly Reports
+**************************************************************************
+GENERATE.MONTHLY.REPORTS:
+   * Generate key monthly reports
+
+   * 1. Monthly sales summary
+   GOSUB GENERATE.MONTHLY.SALES.REPORT
+   REPORTS.GENERATED += 1
+
+   * 2. Top customers report
+   GOSUB GENERATE.TOP.CUSTOMERS.REPORT
+   REPORTS.GENERATED += 1
+
+   * 3. Top items report
+   GOSUB GENERATE.TOP.ITEMS.REPORT
+   REPORTS.GENERATED += 1
+
+   * 4. Employee performance
+   GOSUB GENERATE.EMPLOYEE.PERFORMANCE
+   REPORTS.GENERATED += 1
+   RETURN
+
+**************************************************************************
+* Generate Monthly Sales Report
+**************************************************************************
+GENERATE.MONTHLY.SALES.REPORT:
+   REPORT.PARAMS = ''
+   REPORT.PARAMS<1> = MONTH.START
+   REPORT.PARAMS<2> = MONTH.END
+
+   IF RUN.MODE = 'LIVE' THEN
+      CALL RPT.SALES.DAILY(REPORT.PARAMS, 'FILE', RPT.ERROR, RPT.MSG)
+   END
+   RETURN
+
+**************************************************************************
+* Generate Top Customers Report
+**************************************************************************
+GENERATE.TOP.CUSTOMERS.REPORT:
+   REPORT.PARAMS = ''
+   REPORT.PARAMS<1> = MONTH.START
+   REPORT.PARAMS<2> = MONTH.END
+   REPORT.PARAMS<5> = 'SALES'
+
+   IF RUN.MODE = 'LIVE' THEN
+      CALL RPT.CUSTOMER.ANALYSIS(REPORT.PARAMS, 'FILE', RPT.ERROR, RPT.MSG)
+   END
+   RETURN
+
+**************************************************************************
+* Generate Top Items Report
+**************************************************************************
+GENERATE.TOP.ITEMS.REPORT:
+   REPORT.PARAMS = ''
+   REPORT.PARAMS<1> = MONTH.START
+   REPORT.PARAMS<2> = MONTH.END
+   REPORT.PARAMS<5> = 50  ; Top 50 items
+   REPORT.PARAMS<6> = 'REVENUE'
+
+   IF RUN.MODE = 'LIVE' THEN
+      CALL RPT.SALES.BY.ITEM(REPORT.PARAMS, 'FILE', RPT.ERROR, RPT.MSG)
+   END
+   RETURN
+
+**************************************************************************
+* Generate Employee Performance
+**************************************************************************
+GENERATE.EMPLOYEE.PERFORMANCE:
+   OPEN 'REPORTS' TO F.REPORTS ELSE RETURN
+
+   REPORT.DATA = 'EMPLOYEE PERFORMANCE - ' : OCONV(MONTH.END, 'D4-MY')
+   REPORT.DATA := CHAR(10) : CHAR(10)
+
+   SELECT.CMD = 'SELECT EMPLOYEES WITH STATUS = "ACTIVE"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT EMP.ID ELSE EXIT
+
+      READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE CONTINUE
+
+      * Get employee stats
+      GOSUB GET.EMPLOYEE.STATS
+
+      EMP.NAME = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+      REPORT.DATA := EMP.NAME : ': '
+      REPORT.DATA := 'Sales=' : EMP.SALES.AMT
+      REPORT.DATA := ', Trans=' : EMP.TRANS.COUNT
+      REPORT.DATA := CHAR(10)
+   NEXT
+
+   IF RUN.MODE = 'LIVE' THEN
+      REPORT.ID = 'EMP.PERF*' : OCONV(MONTH.END, 'D4-YM')
+      WRITE REPORT.DATA TO F.REPORTS, REPORT.ID
+   END
+   RETURN
+
+**************************************************************************
+* Get Employee Stats
+**************************************************************************
+GET.EMPLOYEE.STATS:
+   EMP.SALES.AMT = 0
+   EMP.TRANS.COUNT = 0
+
+   SELECT.CMD = 'SELECT POS.TRANS WITH CASHIER.ID = "' : EMP.ID : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE >= "' : MONTH.START : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE <= "' : MONTH.END : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+      EMP.TRANS.COUNT += 1
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      TRANS.AMT = TRANS.REC<TOTAL>
+      IF TRANS.AMT # '' THEN
+         EMP.SALES.AMT += TRANS.AMT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Archive Old Transactions
+**************************************************************************
+ARCHIVE.OLD.TRANSACTIONS:
+   * Archive transactions older than 12 months
+
+   ARCHIVE.DATE = SYSTEM.DATE - 365
+
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE < "' : ARCHIVE.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   OPEN 'POS.TRANS.ARCHIVE' TO F.ARCHIVE ELSE
+      EXECUTE 'CREATE.FILE POS.TRANS.ARCHIVE 1 101'
+      OPEN 'POS.TRANS.ARCHIVE' TO F.ARCHIVE ELSE RETURN
+   END
+
+   ARCHIVED.COUNT = 0
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Write to archive
+      IF RUN.MODE = 'LIVE' THEN
+         WRITE TRANS.REC TO F.ARCHIVE, TRANS.ID
+
+         * Delete from active file
+         DELETE F.POS.TRANS, TRANS.ID
+      END
+
+      ARCHIVED.COUNT += 1
+   REPEAT
+
+   TRANSACTIONS.PROCESSED = ARCHIVED.COUNT
+   RETURN
+
+**************************************************************************
+* Process Loyalty Tier Changes
+**************************************************************************
+PROCESS.LOYALTY.TIER.CHANGES:
+   SELECT.CMD = 'SELECT CUSTOMERS WITH LOYALTY.STATUS = "ACTIVE"'
+   EXECUTE SELECT.CMD
+
+   TIER.CHANGES = 0
+
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE CONTINUE
+
+      CURRENT.TIER = CUST.REC<LOYALTY.TIER>
+      LIFETIME.POINTS = CUST.REC<LOYALTY.LIFETIME.POINTS>
+      IF LIFETIME.POINTS = '' THEN LIFETIME.POINTS = 0
+
+      * Determine appropriate tier
+      NEW.TIER = ''
+      BEGIN CASE
+         CASE LIFETIME.POINTS >= 50000
+            NEW.TIER = 'PLATINUM'
+         CASE LIFETIME.POINTS >= 15000
+            NEW.TIER = 'GOLD'
+         CASE LIFETIME.POINTS >= 5000
+            NEW.TIER = 'SILVER'
+         CASE 1
+            NEW.TIER = 'BRONZE'
+      END CASE
+
+      * Check for tier change
+      IF NEW.TIER # CURRENT.TIER THEN
+         IF RUN.MODE = 'LIVE' THEN
+            GOSUB UPDATE.CUSTOMER.TIER
+         END
+         TIER.CHANGES += 1
+      END
+
+      CUSTOMERS.UPDATED += 1
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Update Customer Tier
+**************************************************************************
+UPDATE.CUSTOMER.TIER:
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+
+   OLD.TIER = CUST.REC<LOYALTY.TIER>
+   CUST.REC<LOYALTY.TIER> = NEW.TIER
+   CUST.REC<LOYALTY.TIER.DATE> = SYSTEM.DATE
+
+   * Update benefits
+   BEGIN CASE
+      CASE NEW.TIER = 'BRONZE'
+         CUST.REC<LOYALTY.DISCOUNT.PCT> = 5
+         CUST.REC<LOYALTY.POINTS.MULTIPLIER> = 1
+
+      CASE NEW.TIER = 'SILVER'
+         CUST.REC<LOYALTY.DISCOUNT.PCT> = 10
+         CUST.REC<LOYALTY.POINTS.MULTIPLIER> = 1.5
+
+      CASE NEW.TIER = 'GOLD'
+         CUST.REC<LOYALTY.DISCOUNT.PCT> = 15
+         CUST.REC<LOYALTY.POINTS.MULTIPLIER> = 2
+
+      CASE NEW.TIER = 'PLATINUM'
+         CUST.REC<LOYALTY.DISCOUNT.PCT> = 20
+         CUST.REC<LOYALTY.POINTS.MULTIPLIER> = 3
+   END CASE
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+   RETURN
+
+**************************************************************************
+* Update Sales Forecasts
+**************************************************************************
+UPDATE.SALES.FORECASTS:
+   OPEN 'SALES.FORECASTS' TO F.FORECASTS ELSE
+      EXECUTE 'CREATE.FILE SALES.FORECASTS 1 101'
+      OPEN 'SALES.FORECASTS' TO F.FORECASTS ELSE RETURN
+   END
+
+   * Calculate sales trends for forecasting
+   SELECT.CMD = 'SELECT INVENTORY WITH STATUS = "ACTIVE"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Get sales history
+      SALES.30DAY = ITEM.REC<SALES.30DAY>
+      SALES.60DAY = ITEM.REC<SALES.60DAY>
+      SALES.90DAY = ITEM.REC<SALES.90DAY>
+
+      IF SALES.30DAY = '' THEN SALES.30DAY = 0
+      IF SALES.60DAY = '' THEN SALES.60DAY = 0
+      IF SALES.90DAY = '' THEN SALES.90DAY = 0
+
+      * Calculate forecast
+      FORECAST.NEXT.MONTH = SALES.30DAY * 1.1  ; 10% growth assumption
+
+      FORECAST.REC = ''
+      FORECAST.REC<1> = ITEM.ID
+      FORECAST.REC<2> = MONTH.END
+      FORECAST.REC<3> = FORECAST.NEXT.MONTH
+      FORECAST.REC<4> = SALES.30DAY
+      FORECAST.REC<5> = SYSTEM.DATE
+
+      IF RUN.MODE = 'LIVE' THEN
+         FORECAST.ID = ITEM.ID : '*' : OCONV(MONTH.END, 'D4-YM')
+         WRITE FORECAST.REC TO F.FORECASTS, FORECAST.ID
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Expire Old Promotions
+**************************************************************************
+EXPIRE.OLD.PROMOTIONS:
+   SELECT.CMD = 'SELECT PROMOTIONS WITH STATUS = "ACTIVE"'
+   SELECT.CMD := ' AND WITH END.DATE < "' : SYSTEM.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   EXPIRED.COUNT = 0
+
+   LOOP
+      READNEXT PROMO.ID ELSE EXIT
+
+      IF RUN.MODE = 'LIVE' THEN
+         READU PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE CONTINUE
+
+         PROMO.REC<PROMO.STATUS> = 'EXPIRED'
+         WRITE PROMO.REC TO F.PROMOTIONS, PROMO.ID
+      END
+
+      EXPIRED.COUNT += 1
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Generate Financial Reports
+**************************************************************************
+GENERATE.FINANCIAL.REPORTS:
+   OPEN 'FINANCIAL.REPORTS' TO F.FIN.RPTS ELSE
+      EXECUTE 'CREATE.FILE FINANCIAL.REPORTS 1 101'
+      OPEN 'FINANCIAL.REPORTS' TO F.FIN.RPTS ELSE RETURN
+   END
+
+   * Compile financial summary
+   FIN.SUMMARY = ''
+   FIN.SUMMARY<1> = OCONV(MONTH.END, 'D4-MY')
+   FIN.SUMMARY<2> = MONTH.START
+   FIN.SUMMARY<3> = MONTH.END
+
+   * Get total sales
+   GOSUB GET.MONTHLY.SALES
+   FIN.SUMMARY<4> = MONTHLY.SALES
+
+   * Get total costs
+   FIN.SUMMARY<5> = TOTAL.COST.VALUE
+
+   * Gross profit
+   GROSS.PROFIT = MONTHLY.SALES - TOTAL.COST.VALUE
+   FIN.SUMMARY<6> = GROSS.PROFIT
+
+   * Additional metrics
+   FIN.SUMMARY<10> = TOTAL.INVENTORY.VALUE
+   FIN.SUMMARY<11> = TOTAL.COMMISSION.PAID
+
+   IF RUN.MODE = 'LIVE' THEN
+      FIN.ID = 'FIN.SUMMARY*' : OCONV(MONTH.END, 'D4-YM')
+      WRITE FIN.SUMMARY TO F.FIN.RPTS, FIN.ID
+   END
+   RETURN
+
+**************************************************************************
+* Get Monthly Sales
+**************************************************************************
+GET.MONTHLY.SALES:
+   MONTHLY.SALES = 0
+
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE >= "' : MONTH.START : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE <= "' : MONTH.END : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      TRANS.AMT = TRANS.REC<TOTAL>
+      IF TRANS.AMT # '' THEN
+         MONTHLY.SALES += TRANS.AMT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Send EOM Notifications
+**************************************************************************
+SEND.EOM.NOTIFICATIONS:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   EMAIL.ID = 'EOM.BATCH*' : BATCH.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'management@company.com'
+   EMAIL.REC<2> = 'End of Month Processing - ' : OCONV(MONTH.END, 'D4-MY')
+
+   EMAIL.BODY = 'End of Month Processing Summary' : AM : AM
+   EMAIL.BODY := 'Mode: ' : RUN.MODE : AM
+   EMAIL.BODY := 'Period: ' : OCONV(MONTH.START, 'D4/')
+   EMAIL.BODY := ' to ' : OCONV(MONTH.END, 'D4/') : AM : AM
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', MONTHLY.SALES, FMT.SALES)
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.INVENTORY.VALUE, FMT.INV)
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.COMMISSION.PAID, FMT.COMM)
+
+   EMAIL.BODY := 'Monthly Sales: $' : FMT.SALES : AM
+   EMAIL.BODY := 'Inventory Value: $' : FMT.INV : AM
+   EMAIL.BODY := 'Commissions Paid: $' : FMT.COMM : AM : AM
+
+   EMAIL.BODY := 'Transactions Archived: ' : TRANSACTIONS.PROCESSED : AM
+   EMAIL.BODY := 'Commission Payments: ' : COMMISSIONS.PAID : AM
+   EMAIL.BODY := 'Customers Updated: ' : CUSTOMERS.UPDATED : AM
+   EMAIL.BODY := 'Reports Generated: ' : REPORTS.GENERATED : AM
+
+   EMAIL.REC<3> = EMAIL.BODY
+   EMAIL.REC<4> = 'PENDING'
+
+   IF RUN.MODE = 'LIVE' THEN
+      WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   END
+   RETURN
+
+**************************************************************************
+* Create Batch Log
+**************************************************************************
+CREATE.BATCH.LOG:
+   OPEN 'BATCH.LOGS' TO F.BATCH.LOGS ELSE
+      EXECUTE 'CREATE.FILE BATCH.LOGS 1 101'
+      OPEN 'BATCH.LOGS' TO F.BATCH.LOGS ELSE RETURN
+   END
+
+   BATCH.END.TIME = SYSTEM.TIME
+   ELAPSED.TIME = BATCH.END.TIME - BATCH.START.TIME
+
+   BATCH.LOG = ''
+   BATCH.LOG<1> = BATCH.ID
+   BATCH.LOG<2> = 'EOM'
+   BATCH.LOG<3> = RUN.MODE
+   BATCH.LOG<4> = BATCH.DATE
+   BATCH.LOG<5> = BATCH.START.TIME
+   BATCH.LOG<6> = BATCH.END.TIME
+   BATCH.LOG<7> = ELAPSED.TIME
+   BATCH.LOG<8> = MONTH.START
+   BATCH.LOG<9> = MONTH.END
+   BATCH.LOG<10> = TRANSACTIONS.PROCESSED
+   BATCH.LOG<11> = COMMISSIONS.PAID
+   BATCH.LOG<12> = CUSTOMERS.UPDATED
+   BATCH.LOG<13> = REPORTS.GENERATED
+   BATCH.LOG<14> = TOTAL.INVENTORY.VALUE
+   BATCH.LOG<15> = 'SUCCESS'
+
+   IF RUN.MODE = 'LIVE' THEN
+      WRITE BATCH.LOG TO F.BATCH.LOGS, BATCH.ID
+   END
+   RETURN
+
+END

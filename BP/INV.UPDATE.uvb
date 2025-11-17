@@ -1,0 +1,469 @@
+SUBROUTINE INV.UPDATE(ITEM.ID.IN, ITEM.REC.IN, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: INV.UPDATE
+* Purpose: Update Inventory Item Record
+* Parameters:
+*   ITEM.ID.IN (IN) - Item ID to update
+*   ITEM.REC.IN (IN) - Item record with updated fields
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate input
+IF ITEM.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Item ID is required'
+   RETURN
+END
+
+* Read existing record with lock
+READU OLD.ITEM.REC FROM F.INVENTORY, ITEM.ID.IN LOCKED
+   * Record is locked by another user
+   ERROR.CODE = ERR.RECORD.LOCKED
+   ERROR.MSG = 'Item record is locked by another user'
+   RETURN
+END ELSE
+   * Record does not exist
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Item not found: ' : ITEM.ID.IN
+   RETURN
+END
+
+* Preserve audit trail fields from original record
+ORIG.CREATED.BY = OLD.ITEM.REC<ITEM.CREATED.BY>
+ORIG.CREATED.DATE = OLD.ITEM.REC<ITEM.CREATED.DATE>
+ORIG.CREATED.TIME = OLD.ITEM.REC<ITEM.CREATED.TIME>
+
+* Validate updated data
+ITEM.REC = ITEM.REC.IN
+GOSUB VALIDATE.ITEM.UPDATE
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.INVENTORY, ITEM.ID.IN
+   RETURN
+END
+
+* Update audit fields
+ITEM.REC<ITEM.CREATED.BY> = ORIG.CREATED.BY
+ITEM.REC<ITEM.CREATED.DATE> = ORIG.CREATED.DATE
+ITEM.REC<ITEM.CREATED.TIME> = ORIG.CREATED.TIME
+ITEM.REC<ITEM.MODIFIED.BY> = USER.ID
+ITEM.REC<ITEM.MODIFIED.DATE> = SYSTEM.DATE
+ITEM.REC<ITEM.MODIFIED.TIME> = SYSTEM.TIME
+
+* Check for SKU/UPC changes
+IF OLD.ITEM.REC<SKU> # ITEM.REC<SKU> OR OLD.ITEM.REC<UPC> # ITEM.REC<UPC> THEN
+   GOSUB CHECK.DUPLICATE.CODES
+   IF ERROR.CODE # ERR.SUCCESS THEN
+      RELEASE F.INVENTORY, ITEM.ID.IN
+      RETURN
+   END
+END
+
+* Check for cost changes - maintain cost history
+IF OLD.ITEM.REC<COST> # ITEM.REC<COST> THEN
+   GOSUB PROCESS.COST.CHANGE
+END
+
+* Check for price changes - maintain price history
+IF OLD.ITEM.REC<PRICE.LEVEL1> # ITEM.REC<PRICE.LEVEL1> THEN
+   GOSUB PROCESS.PRICE.CHANGE
+END
+
+* Check for status changes
+IF OLD.ITEM.REC<ITEM.STATUS> # ITEM.REC<ITEM.STATUS> THEN
+   GOSUB PROCESS.STATUS.CHANGE
+END
+
+* Recalculate average cost if needed
+GOSUB UPDATE.AVERAGE.COST
+
+* Write updated record
+WRITE ITEM.REC TO F.INVENTORY, ITEM.ID.IN ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write item record'
+   RETURN
+END
+
+* Log item update
+LOG.MSG = 'Inventory item updated: ' : ITEM.ID.IN : ' - ' : ITEM.REC<ITEM.DESC>
+LOG.MSG := ' by user: ' : USER.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+* Create audit trail entry
+GOSUB CREATE.AUDIT.TRAIL
+
+* Update web catalog if web-enabled
+IF ITEM.REC<WEB.ENABLED> = 'Y' THEN
+   GOSUB UPDATE.WEB.CATALOG
+END
+
+RETURN
+
+**************************************************************************
+* Validate Item Update
+**************************************************************************
+VALIDATE.ITEM.UPDATE:
+   * Check item description
+   IF ITEM.REC<ITEM.DESC> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Item description is required'
+      RETURN
+   END
+
+   * Check SKU
+   IF ITEM.REC<SKU> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'SKU is required'
+      RETURN
+   END
+
+   * Validate category
+   IF ITEM.REC<CATEGORY> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Category is required'
+      RETURN
+   END
+
+   * Validate unit of measure
+   IF ITEM.REC<UNIT.OF.MEASURE> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Unit of measure is required'
+      RETURN
+   END
+
+   * Validate numeric fields
+   IF ITEM.REC<COST> # '' THEN
+      IF NOT(NUM(ITEM.REC<COST>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Cost must be numeric'
+         RETURN
+      END
+      IF ITEM.REC<COST> < 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Cost cannot be negative'
+         RETURN
+      END
+   END
+
+   * Validate prices
+   FOR LEVEL = 1 TO 5
+      PRICE.FIELD = PRICE.LEVEL1 + (LEVEL - 1)
+      IF ITEM.REC<PRICE.FIELD> # '' THEN
+         IF NOT(NUM(ITEM.REC<PRICE.FIELD>)) THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Price level ' : LEVEL : ' must be numeric'
+            RETURN
+         END
+         IF ITEM.REC<PRICE.FIELD> < 0 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Price level ' : LEVEL : ' cannot be negative'
+            RETURN
+         END
+         * Check against minimum price
+         IF ITEM.REC<MIN.PRICE> # '' THEN
+            IF ITEM.REC<PRICE.FIELD> < ITEM.REC<MIN.PRICE> THEN
+               ERROR.CODE = ERR.INVALID.PRICE
+               ERROR.MSG = 'Price level ' : LEVEL : ' below minimum price'
+               RETURN
+            END
+         END
+      END
+   NEXT LEVEL
+
+   * Validate status
+   VALID.STATUS = STATUS.ACTIVE:VM:STATUS.INACTIVE:VM:'D'  ; D = Discontinued
+   IF ITEM.REC<ITEM.STATUS> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Item status is required'
+      RETURN
+   END
+   LOCATE ITEM.REC<ITEM.STATUS> IN VALID.STATUS<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid item status'
+      RETURN
+   END
+
+   * Validate reorder quantities
+   IF ITEM.REC<REORDER.QTY> # '' THEN
+      IF NOT(NUM(ITEM.REC<REORDER.QTY>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Reorder quantity must be numeric'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Check for Duplicate Codes
+**************************************************************************
+CHECK.DUPLICATE.CODES:
+   * Check for duplicate SKU
+   IF ITEM.REC<SKU> # OLD.ITEM.REC<SKU> THEN
+      SELECT.CMD = 'SELECT INVENTORY WITH SKU = "' : ITEM.REC<SKU> : '"'
+      EXECUTE SELECT.CMD
+      READNEXT EXISTING.ID ELSE
+         * No duplicate
+      END
+      IF EXISTING.ID # '' AND EXISTING.ID # ITEM.ID.IN THEN
+         ERROR.CODE = ERR.DUPLICATE.KEY
+         ERROR.MSG = 'SKU already exists: ' : ITEM.REC<SKU>
+         RETURN
+      END
+   END
+
+   * Check for duplicate UPC if changed
+   IF ITEM.REC<UPC> # '' AND ITEM.REC<UPC> # OLD.ITEM.REC<UPC> THEN
+      SELECT.CMD = 'SELECT INVENTORY WITH UPC = "' : ITEM.REC<UPC> : '"'
+      EXECUTE SELECT.CMD
+      READNEXT EXISTING.ID ELSE
+         * No duplicate
+      END
+      IF EXISTING.ID # '' AND EXISTING.ID # ITEM.ID.IN THEN
+         ERROR.CODE = ERR.DUPLICATE.KEY
+         ERROR.MSG = 'UPC already exists: ' : ITEM.REC<UPC>
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Process Cost Change
+**************************************************************************
+PROCESS.COST.CHANGE:
+   OLD.COST = OLD.ITEM.REC<COST>
+   NEW.COST = ITEM.REC<COST>
+
+   * Update last cost
+   ITEM.REC<LAST.COST> = OLD.COST
+
+   * Calculate cost change percentage
+   IF OLD.COST > 0 THEN
+      COST.CHANGE.PCT = ((NEW.COST - OLD.COST) / OLD.COST) * 100
+   END ELSE
+      COST.CHANGE.PCT = 0
+   END
+
+   * Log cost change
+   COST.LOG = 'Cost changed for item ' : ITEM.ID.IN
+   COST.LOG := ': ' : OLD.COST : ' -> ' : NEW.COST
+   COST.LOG := ' (' : OCONV(COST.CHANGE.PCT, 'MD2') : '%)'
+   CALL UTILS.COMMON('LOG.ERROR', COST.LOG, 'INFO')
+
+   * Add note to item record
+   NOTE.TEXT = 'Cost changed from ' : OLD.COST : ' to ' : NEW.COST
+   NOTE.TEXT := ' on ' : OCONV(SYSTEM.DATE, 'D4/')
+   NOTE.TEXT := ' by ' : USER.ID
+   NOTE.COUNT = DCOUNT(ITEM.REC<ITEM.NOTES>, VM)
+   ITEM.REC<ITEM.NOTES, NOTE.COUNT + 1> = NOTE.TEXT
+
+   * Create cost history record
+   GOSUB CREATE.COST.HISTORY
+   RETURN
+
+**************************************************************************
+* Create Cost History Record
+**************************************************************************
+CREATE.COST.HISTORY:
+   * Open cost history file
+   OPEN 'COST.HISTORY' TO F.COST.HISTORY ELSE
+      EXECUTE 'CREATE.FILE COST.HISTORY 1 101'
+      OPEN 'COST.HISTORY' TO F.COST.HISTORY ELSE
+         RETURN
+      END
+   END
+
+   * Create history record
+   HIST.ID = ITEM.ID.IN : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   HIST.REC = ''
+   HIST.REC<1> = ITEM.ID.IN
+   HIST.REC<2> = OLD.COST
+   HIST.REC<3> = NEW.COST
+   HIST.REC<4> = COST.CHANGE.PCT
+   HIST.REC<5> = SYSTEM.DATE
+   HIST.REC<6> = SYSTEM.TIME
+   HIST.REC<7> = USER.ID
+   HIST.REC<8> = 'Manual update'
+
+   WRITE HIST.REC TO F.COST.HISTORY, HIST.ID
+   RETURN
+
+**************************************************************************
+* Process Price Change
+**************************************************************************
+PROCESS.PRICE.CHANGE:
+   OLD.PRICE = OLD.ITEM.REC<PRICE.LEVEL1>
+   NEW.PRICE = ITEM.REC<PRICE.LEVEL1>
+
+   * Calculate price change percentage
+   IF OLD.PRICE > 0 THEN
+      PRICE.CHANGE.PCT = ((NEW.PRICE - OLD.PRICE) / OLD.PRICE) * 100
+   END ELSE
+      PRICE.CHANGE.PCT = 0
+   END
+
+   * Log price change
+   PRICE.LOG = 'Price changed for item ' : ITEM.ID.IN
+   PRICE.LOG := ': ' : OLD.PRICE : ' -> ' : NEW.PRICE
+   PRICE.LOG := ' (' : OCONV(PRICE.CHANGE.PCT, 'MD2') : '%)'
+   CALL UTILS.COMMON('LOG.ERROR', PRICE.LOG, 'INFO')
+
+   * Add note to item record
+   NOTE.TEXT = 'Price changed from ' : OLD.PRICE : ' to ' : NEW.PRICE
+   NOTE.TEXT := ' on ' : OCONV(SYSTEM.DATE, 'D4/')
+   NOTE.TEXT := ' by ' : USER.ID
+   NOTE.COUNT = DCOUNT(ITEM.REC<ITEM.NOTES>, VM)
+   ITEM.REC<ITEM.NOTES, NOTE.COUNT + 1> = NOTE.TEXT
+
+   * Create price history record
+   GOSUB CREATE.PRICE.HISTORY
+
+   * Check if price is below cost (negative margin)
+   IF NEW.PRICE < ITEM.REC<COST> THEN
+      WARN.MSG = 'WARNING: Price (' : NEW.PRICE : ') is below cost ('
+      WARN.MSG := ITEM.REC<COST> : ') for item ' : ITEM.ID.IN
+      CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+   END
+   RETURN
+
+**************************************************************************
+* Create Price History Record
+**************************************************************************
+CREATE.PRICE.HISTORY:
+   * Open price history file
+   OPEN 'PRICE.HISTORY' TO F.PRICE.HISTORY ELSE
+      EXECUTE 'CREATE.FILE PRICE.HISTORY 1 101'
+      OPEN 'PRICE.HISTORY' TO F.PRICE.HISTORY ELSE
+         RETURN
+      END
+   END
+
+   * Create history record
+   HIST.ID = ITEM.ID.IN : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   HIST.REC = ''
+   HIST.REC<1> = ITEM.ID.IN
+   HIST.REC<2> = OLD.PRICE
+   HIST.REC<3> = NEW.PRICE
+   HIST.REC<4> = PRICE.CHANGE.PCT
+   HIST.REC<5> = SYSTEM.DATE
+   HIST.REC<6> = SYSTEM.TIME
+   HIST.REC<7> = USER.ID
+   HIST.REC<8> = 'Manual update'
+
+   WRITE HIST.REC TO F.PRICE.HISTORY, HIST.ID
+   RETURN
+
+**************************************************************************
+* Process Status Change
+**************************************************************************
+PROCESS.STATUS.CHANGE:
+   OLD.STATUS = OLD.ITEM.REC<ITEM.STATUS>
+   NEW.STATUS = ITEM.REC<ITEM.STATUS>
+
+   * Log status change
+   STATUS.LOG = 'Status changed for item ' : ITEM.ID.IN
+   STATUS.LOG := ': ' : OLD.STATUS : ' -> ' : NEW.STATUS
+   CALL UTILS.COMMON('LOG.ERROR', STATUS.LOG, 'INFO')
+
+   * Add note to item record
+   NOTE.TEXT = 'Status changed from ' : OLD.STATUS : ' to ' : NEW.STATUS
+   NOTE.TEXT := ' on ' : OCONV(SYSTEM.DATE, 'D4/')
+   NOTE.TEXT := ' by ' : USER.ID
+   NOTE.COUNT = DCOUNT(ITEM.REC<ITEM.NOTES>, VM)
+   ITEM.REC<ITEM.NOTES, NOTE.COUNT + 1> = NOTE.TEXT
+
+   * If discontinuing item, check for remaining inventory
+   IF NEW.STATUS = 'D' THEN
+      GOSUB CHECK.DISCONTINUE.INVENTORY
+   END
+   RETURN
+
+**************************************************************************
+* Check Discontinue Inventory
+**************************************************************************
+CHECK.DISCONTINUE.INVENTORY:
+   * Calculate total on-hand quantity
+   TOTAL.OH = 0
+   QTY.COUNT = DCOUNT(ITEM.REC<QTY.ON.HAND>, VM)
+   FOR I = 1 TO QTY.COUNT
+      QTY = ITEM.REC<QTY.ON.HAND, I>
+      IF QTY = '' THEN QTY = 0
+      TOTAL.OH += QTY
+   NEXT I
+
+   IF TOTAL.OH > 0 THEN
+      WARN.MSG = 'Item ' : ITEM.ID.IN : ' discontinued with '
+      WARN.MSG := TOTAL.OH : ' units remaining in inventory'
+      CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+   END
+   RETURN
+
+**************************************************************************
+* Update Average Cost
+**************************************************************************
+UPDATE.AVERAGE.COST:
+   * Recalculate average cost based on current cost and last cost
+   IF ITEM.REC<AVG.COST> = '' OR ITEM.REC<AVG.COST> = 0 THEN
+      * No average cost, use current cost
+      ITEM.REC<AVG.COST> = ITEM.REC<COST>
+   END ELSE
+      * Weighted average: 70% current avg, 30% new cost
+      NEW.AVG = (ITEM.REC<AVG.COST> * 0.7) + (ITEM.REC<COST> * 0.3)
+      CALL UTILS.COMMON('ROUND.AMOUNT', NEW.AVG, ROUNDED.AVG)
+      ITEM.REC<AVG.COST> = ROUNDED.AVG
+   END
+   RETURN
+
+**************************************************************************
+* Create Audit Trail Entry
+**************************************************************************
+CREATE.AUDIT.TRAIL:
+   * Compare old and new records to identify changes
+   CHANGES = ''
+   CHANGE.COUNT = 0
+
+   * Check each field for changes
+   FOR FIELD.NUM = 1 TO 74
+      OLD.VALUE = OLD.ITEM.REC<FIELD.NUM>
+      NEW.VALUE = ITEM.REC<FIELD.NUM>
+
+      IF OLD.VALUE # NEW.VALUE THEN
+         CHANGE.COUNT += 1
+         CHANGES<CHANGE.COUNT> = FIELD.NUM : '|' : OLD.VALUE : '|' : NEW.VALUE
+      END
+   NEXT FIELD.NUM
+
+   * Write audit trail if there were changes
+   IF CHANGE.COUNT > 0 THEN
+      AUDIT.ID = ITEM.ID.IN : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+      AUDIT.REC = ''
+      AUDIT.REC<1> = ITEM.ID.IN
+      AUDIT.REC<2> = 'UPDATE'
+      AUDIT.REC<3> = USER.ID
+      AUDIT.REC<4> = SYSTEM.DATE
+      AUDIT.REC<5> = SYSTEM.TIME
+      AUDIT.REC<6> = CHANGES
+
+      * Write to audit file (if exists)
+      OPEN 'AUDIT.TRAIL' TO F.AUDIT THEN
+         WRITE AUDIT.REC TO F.AUDIT, AUDIT.ID
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Update Web Catalog
+**************************************************************************
+UPDATE.WEB.CATALOG:
+   * In production, this would update e-commerce platform
+   * For now, just log the action
+   WEB.LOG = 'Web catalog update triggered for item: ' : ITEM.ID.IN
+   CALL UTILS.COMMON('LOG.ERROR', WEB.LOG, 'INFO')
+   RETURN
+
+END

@@ -1,0 +1,241 @@
+SUBROUTINE CASH.DRAWER.OPEN(CASHIER.ID, OPENING.AMOUNT, DRAWER.ID, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: CASH.DRAWER.OPEN
+* Purpose: Open Cash Drawer for Shift
+* Parameters:
+*   CASHIER.ID (IN) - Cashier opening drawer
+*   OPENING.AMOUNT (IN) - Starting cash amount
+*   DRAWER.ID (OUT) - Generated drawer session ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+DRAWER.ID = ''
+
+* Validate cashier ID
+IF CASHIER.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Cashier ID is required'
+   RETURN
+END
+
+* Validate opening amount
+IF OPENING.AMOUNT = '' OR NOT(NUM(OPENING.AMOUNT)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Opening amount must be numeric'
+   RETURN
+END
+
+IF OPENING.AMOUNT < 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Opening amount cannot be negative'
+   RETURN
+END
+
+* Validate cashier exists
+READ CASHIER.REC FROM F.EMPLOYEES, CASHIER.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Cashier not found'
+   RETURN
+END
+
+* Check if cashier already has open drawer
+GOSUB CHECK.EXISTING.DRAWER
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Open cash drawer file
+OPEN 'CASH.DRAWERS' TO F.CASH.DRAWERS ELSE
+   EXECUTE 'CREATE.FILE CASH.DRAWERS 1 101'
+   OPEN 'CASH.DRAWERS' TO F.CASH.DRAWERS ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Cannot open cash drawer file'
+      RETURN
+   END
+END
+
+* Generate drawer ID
+GOSUB GENERATE.DRAWER.ID
+
+* Build drawer record
+GOSUB BUILD.DRAWER.RECORD
+
+* Write drawer record
+WRITE DRAWER.REC TO F.CASH.DRAWERS, DRAWER.ID ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write drawer record'
+   RETURN
+END
+
+* Create opening transaction
+GOSUB CREATE.OPENING.TRANSACTION
+
+* Create audit record
+GOSUB CREATE.OPENING.AUDIT
+
+LOG.MSG = 'Cash drawer opened: ' : DRAWER.ID : ' - Cashier: ' : CASHIER.ID : ' - Amount: $' : OPENING.AMOUNT
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Check Existing Drawer
+**************************************************************************
+CHECK.EXISTING.DRAWER:
+   SELECT.CMD = 'SELECT CASH.DRAWERS WITH CASHIER.ID = "' : CASHIER.ID : '"'
+   SELECT.CMD := ' AND WITH STATUS = "OPEN"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT EXISTING.DRAWER.ID ELSE EXIT
+
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Cashier already has an open drawer: ' : EXISTING.DRAWER.ID
+      RETURN
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Generate Drawer ID
+**************************************************************************
+GENERATE.DRAWER.ID:
+   * Format: DRW-YYYYMMDD-STORE-XXX
+   DATE.STR = OCONV(SYSTEM.DATE, 'D4-YMD')
+   DATE.STR = CONVERT('-', '', DATE.STR)
+
+   SEQ.KEY = 'DRAWER-SEQ*' : STORE.ID : '*' : SYSTEM.DATE
+
+   OPEN 'DRAWER.SEQUENCES' TO F.DRAWER.SEQ ELSE
+      EXECUTE 'CREATE.FILE DRAWER.SEQUENCES 1 1'
+      OPEN 'DRAWER.SEQUENCES' TO F.DRAWER.SEQ ELSE
+         DRAWER.ID = 'DRW-' : DATE.STR : '-' : STORE.ID : '-' : RND(999)
+         RETURN
+      END
+   END
+
+   READU SEQ.REC FROM F.DRAWER.SEQ, SEQ.KEY ELSE
+      SEQ.NUM = 1
+   END
+   SEQ.NUM = SEQ.REC<1>
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.DRAWER.SEQ, SEQ.KEY
+
+   SEQ.STR = OCONV(SEQ.NUM, 'R(0)#3')
+   DRAWER.ID = 'DRW-' : DATE.STR : '-' : STORE.ID : '-' : SEQ.STR
+   RETURN
+
+**************************************************************************
+* Build Drawer Record
+**************************************************************************
+BUILD.DRAWER.RECORD:
+   DRAWER.REC = ''
+
+   * Field 1: Drawer ID
+   DRAWER.REC<1> = DRAWER.ID
+
+   * Field 2: Store ID
+   DRAWER.REC<2> = STORE.ID
+
+   * Field 3: Cashier ID
+   DRAWER.REC<3> = CASHIER.ID
+
+   * Field 4: Open date
+   DRAWER.REC<4> = SYSTEM.DATE
+
+   * Field 5: Open time
+   DRAWER.REC<5> = SYSTEM.TIME
+
+   * Field 6: Opening amount
+   DRAWER.REC<6> = OPENING.AMOUNT
+
+   * Field 7: Status (OPEN, CLOSED, RECONCILED)
+   DRAWER.REC<7> = 'OPEN'
+
+   * Field 8: Cash sales total
+   DRAWER.REC<8> = 0
+
+   * Field 9: Cash refunds total
+   DRAWER.REC<9> = 0
+
+   * Field 10: Transaction count
+   DRAWER.REC<10> = 0
+
+   * Field 11: Expected cash (opening + sales - refunds)
+   DRAWER.REC<11> = OPENING.AMOUNT
+
+   * Field 12: Actual cash (set at close)
+   DRAWER.REC<12> = 0
+
+   * Field 13: Variance (actual - expected)
+   DRAWER.REC<13> = 0
+
+   * Field 14: Close date
+   DRAWER.REC<14> = ''
+
+   * Field 15: Close time
+   DRAWER.REC<15> = ''
+
+   * Field 16: Closed by
+   DRAWER.REC<16> = ''
+
+   * Field 17: Created by
+   DRAWER.REC<17> = USER.ID
+
+   * Field 18: Created date
+   DRAWER.REC<18> = SYSTEM.DATE
+   RETURN
+
+**************************************************************************
+* Create Opening Transaction
+**************************************************************************
+CREATE.OPENING.TRANSACTION:
+   OPEN 'CASH.TRANS' TO F.CASH.TRANS ELSE
+      EXECUTE 'CREATE.FILE CASH.TRANS 1 101'
+      OPEN 'CASH.TRANS' TO F.CASH.TRANS ELSE RETURN
+   END
+
+   TRANS.ID = DRAWER.ID : '*OPEN*' : SYSTEM.TIME
+
+   TRANS.REC = ''
+   TRANS.REC<1> = DRAWER.ID
+   TRANS.REC<2> = 'OPEN'
+   TRANS.REC<3> = SYSTEM.DATE
+   TRANS.REC<4> = SYSTEM.TIME
+   TRANS.REC<5> = OPENING.AMOUNT
+   TRANS.REC<6> = CASHIER.ID
+   TRANS.REC<7> = ''  ; POS transaction ID
+   TRANS.REC<8> = 'Opening drawer'
+
+   WRITE TRANS.REC TO F.CASH.TRANS, TRANS.ID
+   RETURN
+
+**************************************************************************
+* Create Opening Audit
+**************************************************************************
+CREATE.OPENING.AUDIT:
+   OPEN 'CASH.AUDIT' TO F.CASH.AUDIT ELSE
+      EXECUTE 'CREATE.FILE CASH.AUDIT 1 101'
+      OPEN 'CASH.AUDIT' TO F.CASH.AUDIT ELSE RETURN
+   END
+
+   AUDIT.ID = DRAWER.ID : '*OPEN'
+
+   AUDIT.REC = ''
+   AUDIT.REC<1> = DRAWER.ID
+   AUDIT.REC<2> = 'OPEN'
+   AUDIT.REC<3> = CASHIER.ID
+   AUDIT.REC<4> = SYSTEM.DATE
+   AUDIT.REC<5> = SYSTEM.TIME
+   AUDIT.REC<6> = OPENING.AMOUNT
+   AUDIT.REC<7> = STORE.ID
+   AUDIT.REC<8> = USER.ID
+
+   WRITE AUDIT.REC TO F.CASH.AUDIT, AUDIT.ID
+   RETURN
+
+END

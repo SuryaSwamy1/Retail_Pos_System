@@ -1,0 +1,401 @@
+SUBROUTINE CUST.SEARCH(SEARCH.CRITERIA, SEARCH.RESULTS, RESULT.COUNT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: CUST.SEARCH
+* Purpose: Search for Customers Based on Various Criteria
+* Parameters:
+*   SEARCH.CRITERIA (IN) - Dynamic array with search parameters
+*     <1> = Search Type (NAME, PHONE, EMAIL, LOYALTY.ID, ALL)
+*     <2> = Search Value
+*     <3> = Additional filters (STATUS, TYPE, STORE, etc.)
+*     <4> = Sort field
+*     <5> = Sort direction (ASC/DESC)
+*     <6> = Max results (default 100)
+*   SEARCH.RESULTS (OUT) - Dynamic array of customer IDs
+*   RESULT.COUNT (OUT) - Number of results found
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+SEARCH.RESULTS = ''
+RESULT.COUNT = 0
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Parse search criteria
+SEARCH.TYPE = SEARCH.CRITERIA<1>
+SEARCH.VALUE = SEARCH.CRITERIA<2>
+FILTERS = SEARCH.CRITERIA<3>
+SORT.FIELD = SEARCH.CRITERIA<4>
+SORT.DIR = SEARCH.CRITERIA<5>
+MAX.RESULTS = SEARCH.CRITERIA<6>
+
+* Set defaults
+IF SEARCH.TYPE = '' THEN SEARCH.TYPE = 'NAME'
+IF SORT.DIR = '' THEN SORT.DIR = 'ASC'
+IF MAX.RESULTS = '' OR MAX.RESULTS = 0 THEN MAX.RESULTS = 100
+
+* Validate search type
+VALID.TYPES = 'NAME':VM:'PHONE':VM:'EMAIL':VM:'LOYALTY.ID':VM:'ALL':VM:'ADVANCED'
+LOCATE SEARCH.TYPE IN VALID.TYPES<1> USING VM SETTING POS ELSE
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid search type: ' : SEARCH.TYPE
+   RETURN
+END
+
+* Build select statement based on search type
+BEGIN CASE
+   CASE SEARCH.TYPE = 'NAME'
+      GOSUB SEARCH.BY.NAME
+   CASE SEARCH.TYPE = 'PHONE'
+      GOSUB SEARCH.BY.PHONE
+   CASE SEARCH.TYPE = 'EMAIL'
+      GOSUB SEARCH.BY.EMAIL
+   CASE SEARCH.TYPE = 'LOYALTY.ID'
+      GOSUB SEARCH.BY.LOYALTY.ID
+   CASE SEARCH.TYPE = 'ALL'
+      GOSUB SEARCH.ALL.CUSTOMERS
+   CASE SEARCH.TYPE = 'ADVANCED'
+      GOSUB ADVANCED.SEARCH
+END CASE
+
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Apply additional filters
+IF FILTERS # '' THEN
+   GOSUB APPLY.FILTERS
+END
+
+* Sort results
+IF SORT.FIELD # '' THEN
+   GOSUB SORT.RESULTS
+END
+
+* Limit results
+IF RESULT.COUNT > MAX.RESULTS THEN
+   SEARCH.RESULTS = SEARCH.RESULTS<1, 1, MAX.RESULTS>
+   RESULT.COUNT = MAX.RESULTS
+END
+
+RETURN
+
+**************************************************************************
+* Search by Customer Name
+**************************************************************************
+SEARCH.BY.NAME:
+   IF SEARCH.VALUE = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Search value is required'
+      RETURN
+   END
+
+   * Convert to uppercase for case-insensitive search
+   SEARCH.VALUE.UPPER = OCONV(SEARCH.VALUE, 'MCU')
+
+   * Build select statement
+   SELECT.CMD = 'SELECT CUSTOMERS WITH CUST.NAME LIKE "...' : SEARCH.VALUE.UPPER : '..."'
+
+   * Execute select
+   EXECUTE SELECT.CMD
+
+   * Read results
+   RESULT.COUNT = 0
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      RESULT.COUNT += 1
+      SEARCH.RESULTS<RESULT.COUNT> = CUST.ID
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Search by Phone Number
+**************************************************************************
+SEARCH.BY.PHONE:
+   IF SEARCH.VALUE = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Phone number is required'
+      RETURN
+   END
+
+   * Clean phone number (remove formatting)
+   PHONE.CLEAN = ''
+   FOR I = 1 TO LEN(SEARCH.VALUE)
+      CHAR = SEARCH.VALUE[I,1]
+      IF CHAR GE '0' AND CHAR LE '9' THEN
+         PHONE.CLEAN := CHAR
+      END
+   NEXT I
+
+   * Search for phone number (partial match)
+   SELECT.CMD = 'SELECT CUSTOMERS WITH PHONE LIKE "...' : PHONE.CLEAN : '..."'
+
+   EXECUTE SELECT.CMD
+
+   RESULT.COUNT = 0
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      * Verify phone match (may need to check multivalued phone field)
+      READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE CONTINUE
+
+      PHONE.COUNT = DCOUNT(CUST.REC<PHONE>, VM)
+      FOUND = FALSE
+
+      FOR P = 1 TO PHONE.COUNT
+         CUST.PHONE = CUST.REC<PHONE, P>
+         * Clean customer phone
+         CUST.PHONE.CLEAN = ''
+         FOR I = 1 TO LEN(CUST.PHONE)
+            CHAR = CUST.PHONE[I,1]
+            IF CHAR GE '0' AND CHAR LE '9' THEN
+               CUST.PHONE.CLEAN := CHAR
+            END
+         NEXT I
+
+         * Check if search value is in customer phone
+         IF INDEX(CUST.PHONE.CLEAN, PHONE.CLEAN, 1) > 0 THEN
+            FOUND = TRUE
+            EXIT
+         END
+      NEXT P
+
+      IF FOUND THEN
+         RESULT.COUNT += 1
+         SEARCH.RESULTS<RESULT.COUNT> = CUST.ID
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Search by Email
+**************************************************************************
+SEARCH.BY.EMAIL:
+   IF SEARCH.VALUE = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Email address is required'
+      RETURN
+   END
+
+   * Convert to lowercase for case-insensitive search
+   SEARCH.VALUE.LOWER = OCONV(SEARCH.VALUE, 'MCL')
+
+   SELECT.CMD = 'SELECT CUSTOMERS WITH EMAIL LIKE "...' : SEARCH.VALUE.LOWER : '..."'
+
+   EXECUTE SELECT.CMD
+
+   RESULT.COUNT = 0
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      RESULT.COUNT += 1
+      SEARCH.RESULTS<RESULT.COUNT> = CUST.ID
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Search by Loyalty ID
+**************************************************************************
+SEARCH.BY.LOYALTY.ID:
+   IF SEARCH.VALUE = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Loyalty ID is required'
+      RETURN
+   END
+
+   SELECT.CMD = 'SELECT CUSTOMERS WITH LOYALTY.ID = "' : SEARCH.VALUE : '"'
+
+   EXECUTE SELECT.CMD
+
+   RESULT.COUNT = 0
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      RESULT.COUNT += 1
+      SEARCH.RESULTS<RESULT.COUNT> = CUST.ID
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Search All Active Customers
+**************************************************************************
+SEARCH.ALL.CUSTOMERS:
+   SELECT.CMD = 'SELECT CUSTOMERS WITH STATUS = "' : STATUS.ACTIVE : '"'
+
+   EXECUTE SELECT.CMD
+
+   RESULT.COUNT = 0
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      RESULT.COUNT += 1
+      SEARCH.RESULTS<RESULT.COUNT> = CUST.ID
+
+      * Limit to prevent excessive results
+      IF RESULT.COUNT >= MAX.RESULTS THEN EXIT
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Advanced Search with Multiple Criteria
+**************************************************************************
+ADVANCED.SEARCH:
+   * Parse advanced search criteria
+   * Format: Field1=Value1^Field2=Value2^...
+   CRITERIA.LIST = SEARCH.VALUE
+   CRITERIA.COUNT = DCOUNT(CRITERIA.LIST, '^')
+
+   * Build complex select statement
+   SELECT.CMD = 'SELECT CUSTOMERS'
+
+   FOR C = 1 TO CRITERIA.COUNT
+      CRITERION = CRITERIA.LIST<1, 1, C>
+      FIELD.NAME = FIELD(CRITERION, '=', 1)
+      FIELD.VALUE = FIELD(CRITERION, '=', 2)
+      OPERATOR = FIELD(CRITERION, '=', 3)  ; Optional operator
+
+      IF OPERATOR = '' THEN OPERATOR = '='
+
+      IF C = 1 THEN
+         SELECT.CMD := ' WITH '
+      END ELSE
+         SELECT.CMD := ' AND '
+      END
+
+      SELECT.CMD := FIELD.NAME : ' ' : OPERATOR : ' "' : FIELD.VALUE : '"'
+   NEXT C
+
+   EXECUTE SELECT.CMD
+
+   RESULT.COUNT = 0
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      RESULT.COUNT += 1
+      SEARCH.RESULTS<RESULT.COUNT> = CUST.ID
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Apply Additional Filters
+**************************************************************************
+APPLY.FILTERS:
+   * Parse filters (STATUS=A^TYPE=R^STORE=001)
+   FILTER.COUNT = DCOUNT(FILTERS, '^')
+   FILTERED.RESULTS = ''
+   FILTERED.COUNT = 0
+
+   * Process each result
+   FOR R = 1 TO RESULT.COUNT
+      CUST.ID = SEARCH.RESULTS<R>
+      READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE CONTINUE
+
+      * Check all filters
+      PASS.FILTERS = TRUE
+
+      FOR F = 1 TO FILTER.COUNT
+         FILTER = FILTERS<1, 1, F>
+         FILTER.FIELD = FIELD(FILTER, '=', 1)
+         FILTER.VALUE = FIELD(FILTER, '=', 2)
+
+         * Get customer field value based on filter field name
+         BEGIN CASE
+            CASE FILTER.FIELD = 'STATUS'
+               CUST.VALUE = CUST.REC<CUST.STATUS>
+            CASE FILTER.FIELD = 'TYPE'
+               CUST.VALUE = CUST.REC<CUST.TYPE>
+            CASE FILTER.FIELD = 'STORE'
+               CUST.VALUE = CUST.REC<PREFERRED.STORE>
+            CASE FILTER.FIELD = 'TIER'
+               CUST.VALUE = CUST.REC<LOYALTY.TIER>
+            CASE FILTER.FIELD = 'SALESREP'
+               CUST.VALUE = CUST.REC<SALES.REP>
+            CASE 1
+               CUST.VALUE = ''
+         END CASE
+
+         * Check if value matches filter
+         IF CUST.VALUE # FILTER.VALUE THEN
+            PASS.FILTERS = FALSE
+            EXIT
+         END
+      NEXT F
+
+      * Add to filtered results if passed all filters
+      IF PASS.FILTERS THEN
+         FILTERED.COUNT += 1
+         FILTERED.RESULTS<FILTERED.COUNT> = CUST.ID
+      END
+   NEXT R
+
+   * Replace results with filtered results
+   SEARCH.RESULTS = FILTERED.RESULTS
+   RESULT.COUNT = FILTERED.COUNT
+   RETURN
+
+**************************************************************************
+* Sort Results
+**************************************************************************
+SORT.RESULTS:
+   * Create array of sort keys and IDs
+   DIM SORT.ARRAY(RESULT.COUNT, 2)
+
+   FOR I = 1 TO RESULT.COUNT
+      CUST.ID = SEARCH.RESULTS<I>
+      READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE CONTINUE
+
+      * Get sort field value
+      BEGIN CASE
+         CASE SORT.FIELD = 'NAME'
+            SORT.KEY = CUST.REC<CUST.NAME>
+         CASE SORT.FIELD = 'DATE'
+            SORT.KEY = CUST.REC<CUST.CREATED.DATE>
+         CASE SORT.FIELD = 'PURCHASES'
+            SORT.KEY = CUST.REC<TOTAL.PURCHASES>
+         CASE SORT.FIELD = 'POINTS'
+            SORT.KEY = CUST.REC<LOYALTY.POINTS>
+         CASE 1
+            SORT.KEY = CUST.ID
+      END CASE
+
+      SORT.ARRAY(I, 1) = SORT.KEY
+      SORT.ARRAY(I, 2) = CUST.ID
+   NEXT I
+
+   * Sort the array (simple bubble sort for demo)
+   FOR I = 1 TO RESULT.COUNT - 1
+      FOR J = I + 1 TO RESULT.COUNT
+         COMPARE.RESULT = 0
+
+         IF SORT.DIR = 'ASC' THEN
+            IF SORT.ARRAY(I, 1) > SORT.ARRAY(J, 1) THEN
+               COMPARE.RESULT = 1
+            END
+         END ELSE
+            IF SORT.ARRAY(I, 1) < SORT.ARRAY(J, 1) THEN
+               COMPARE.RESULT = 1
+            END
+         END
+
+         IF COMPARE.RESULT = 1 THEN
+            * Swap elements
+            TEMP.KEY = SORT.ARRAY(I, 1)
+            TEMP.ID = SORT.ARRAY(I, 2)
+            SORT.ARRAY(I, 1) = SORT.ARRAY(J, 1)
+            SORT.ARRAY(I, 2) = SORT.ARRAY(J, 2)
+            SORT.ARRAY(J, 1) = TEMP.KEY
+            SORT.ARRAY(J, 2) = TEMP.ID
+         END
+      NEXT J
+   NEXT I
+
+   * Rebuild results in sorted order
+   SEARCH.RESULTS = ''
+   FOR I = 1 TO RESULT.COUNT
+      SEARCH.RESULTS<I> = SORT.ARRAY(I, 2)
+   NEXT I
+   RETURN
+
+END

@@ -1,0 +1,101 @@
+* INVENTORY Dictionary Definitions
+* MultiValue Database Schema for Product/Inventory Master File
+
+* Field Definitions
+FIELD~ITEM.ID~1~Item ID~Primary Key
+FIELD~SKU~2~Stock Keeping Unit~Unique
+FIELD~UPC~3~UPC Barcode~Universal Product Code
+FIELD~ITEM.DESC~4~Item Description~
+FIELD~ITEM.DESC.LONG~5~Long Description~
+FIELD~CATEGORY~6~Product Category~
+FIELD~SUBCATEGORY~7~Product Subcategory~
+FIELD~BRAND~8~Brand Name~
+FIELD~MANUFACTURER~9~Manufacturer~
+FIELD~MANUFACTURER.PART~10~Manufacturer Part Number~
+FIELD~UNIT.OF.MEASURE~11~Unit of Measure~EA, CS, DZ, LB, etc
+FIELD~PACK.SIZE~12~Pack Size~Units per case
+FIELD~COST~13~Standard Cost~
+FIELD~LAST.COST~14~Last Purchase Cost~
+FIELD~AVG.COST~15~Average Cost~
+FIELD~PRICE.LEVEL1~16~Retail Price Level 1~
+FIELD~PRICE.LEVEL2~17~Retail Price Level 2~
+FIELD~PRICE.LEVEL3~18~Retail Price Level 3~
+FIELD~PRICE.LEVEL4~19~Wholesale Price Level 4~
+FIELD~PRICE.LEVEL5~20~Wholesale Price Level 5~
+FIELD~MSRP~21~Manufacturer Suggested Retail Price~
+FIELD~MIN.PRICE~22~Minimum Allowed Price~
+FIELD~QTY.ON.HAND~23~Quantity On Hand~Multivalued by store
+FIELD~QTY.ALLOCATED~24~Quantity Allocated~Multivalued by store
+FIELD~QTY.AVAILABLE~25~Quantity Available~Calculated
+FIELD~QTY.ON.ORDER~26~Quantity On Purchase Order~
+FIELD~REORDER.POINT~27~Reorder Point~Multivalued by store
+FIELD~REORDER.QTY~28~Reorder Quantity~
+FIELD~MAX.STOCK.LEVEL~29~Maximum Stock Level~
+FIELD~MIN.STOCK.LEVEL~30~Minimum Stock Level~
+FIELD~LEAD.TIME~31~Lead Time Days~
+FIELD~PREFERRED.VENDOR~32~Preferred Vendor ID~
+FIELD~VENDOR.ITEM~33~Vendor Item Number~
+FIELD~TAXABLE~34~Taxable Flag~Y/N
+FIELD~TAX.CODE~35~Tax Code~
+FIELD~SERIALIZED~36~Serialized Item Flag~Y/N
+FIELD~LOT.CONTROLLED~37~Lot Controlled Flag~Y/N
+FIELD~PERISHABLE~38~Perishable Item Flag~Y/N
+FIELD~SHELF.LIFE.DAYS~39~Shelf Life in Days~
+FIELD~WEIGHT~40~Weight~
+FIELD~WEIGHT.UOM~41~Weight Unit of Measure~LB, KG
+FIELD~LENGTH~42~Length~
+FIELD~WIDTH~43~Width~
+FIELD~HEIGHT~44~Height~
+FIELD~DIMENSION.UOM~45~Dimension Unit of Measure~IN, CM
+FIELD~CUBE~46~Cubic Feet/Meters~
+FIELD~LOCATION~47~Primary Warehouse Location~Multivalued by store
+FIELD~BIN.LOCATION~48~Bin Location~Multivalued by store
+FIELD~STATUS~49~Item Status~A=Active, I=Inactive, D=Discontinued
+FIELD~SALE.START.DATE~50~Sale Start Date~
+FIELD~SALE.END.DATE~51~Sale End Date~
+FIELD~SALE.PRICE~52~Sale Price~
+FIELD~PROMO.CODE~53~Current Promotion Code~
+FIELD~COMMISSION.PCT~54~Commission Percentage~
+FIELD~COMMISSIONABLE~55~Commissionable Flag~Y/N
+FIELD~WEB.ENABLED~56~Web Enabled Flag~Y/N
+FIELD~WEB.DESC~57~Web Description~
+FIELD~IMAGE.URL~58~Image URL~Multivalued
+FIELD~VENDOR.LIST~59~Alternate Vendors~Multivalued
+FIELD~VENDOR.COST~60~Vendor Costs~Multivalued (correlated with 59)
+FIELD~SUBSTITUTE.ITEMS~61~Substitute Item IDs~Multivalued
+FIELD~RELATED.ITEMS~62~Related Item IDs~Multivalued
+FIELD~KIT.FLAG~63~Kit Item Flag~Y/N
+FIELD~KIT.COMPONENTS~64~Kit Component Items~Multivalued
+FIELD~KIT.QTY~65~Kit Component Quantities~Multivalued
+FIELD~NOTES~66~Notes~Multivalued
+FIELD~LAST.SALE.DATE~67~Last Sale Date~
+FIELD~LAST.RECEIPT.DATE~68~Last Receipt Date~
+FIELD~CREATED.BY~69~Created By User~
+FIELD~CREATED.DATE~70~Created Date~
+FIELD~CREATED.TIME~71~Created Time~
+FIELD~MODIFIED.BY~72~Modified By User~
+FIELD~MODIFIED.DATE~73~Modified Date~
+FIELD~MODIFIED.TIME~74~Modified Time~
+
+* Index Definitions
+INDEX~SKU.IDX~SKU~SKU Index
+INDEX~UPC.IDX~UPC~UPC Barcode Index
+INDEX~CATEGORY.IDX~CATEGORY~Category Index
+INDEX~BRAND.IDX~BRAND~Brand Index
+INDEX~VENDOR.IDX~PREFERRED.VENDOR~Vendor Index
+INDEX~STATUS.IDX~STATUS~Status Index
+INDEX~DESC.IDX~ITEM.DESC~Description Index
+
+* Correlatives and Derived Fields
+CORR~QTY.AVAILABLE.CALC~QTY.ON.HAND - QTY.ALLOCATED
+CORR~TOTAL.QTY.ON.HAND~SUM(QTY.ON.HAND)
+CORR~TOTAL.QTY.ALLOCATED~SUM(QTY.ALLOCATED)
+CORR~TOTAL.QTY.AVAILABLE~TOTAL.QTY.ON.HAND - TOTAL.QTY.ALLOCATED
+CORR~INVENTORY.VALUE~TOTAL.QTY.ON.HAND * AVG.COST
+CORR~MARKUP.PCT~((PRICE.LEVEL1 - COST) / COST) * 100
+CORR~MARGIN.PCT~((PRICE.LEVEL1 - COST) / PRICE.LEVEL1) * 100
+CORR~NEEDS.REORDER~IF TOTAL.QTY.AVAILABLE <= REORDER.POINT THEN 'Y' ELSE 'N'
+CORR~DAYS.SINCE.SALE~DATE() - LAST.SALE.DATE
+CORR~DAYS.SINCE.RECEIPT~DATE() - LAST.RECEIPT.DATE
+CORR~ON.SALE~IF DATE() >= SALE.START.DATE AND DATE() <= SALE.END.DATE THEN 'Y' ELSE 'N'
+CORR~CURRENT.PRICE~IF ON.SALE THEN SALE.PRICE ELSE PRICE.LEVEL1

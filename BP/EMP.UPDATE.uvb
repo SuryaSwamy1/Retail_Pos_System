@@ -1,0 +1,671 @@
+SUBROUTINE EMP.UPDATE(EMP.ID, FIELD.UPDATES, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: EMP.UPDATE
+* Purpose: Update Employee Record
+* Parameters:
+*   EMP.ID (IN) - Employee ID to update
+*   FIELD.UPDATES (IN) - Multivalued list of field updates
+*                        Format: FIELD.NAME]FIELD.VALUE
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate employee ID
+IF EMP.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Employee ID is required'
+   RETURN
+END
+
+* Read and lock employee record
+READU EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Employee not found: ' : EMP.ID
+   RETURN
+END
+
+* Save original record for audit
+ORIGINAL.REC = EMP.REC
+
+* Parse and apply field updates
+GOSUB PARSE.FIELD.UPDATES
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.EMPLOYEES, EMP.ID
+   RETURN
+END
+
+* Validate all changes
+GOSUB VALIDATE.UPDATES
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.EMPLOYEES, EMP.ID
+   RETURN
+END
+
+* Process specific field changes
+GOSUB PROCESS.FIELD.CHANGES
+
+* Update audit fields
+EMP.REC<EMP.MODIFIED.BY> = USER.ID
+EMP.REC<EMP.MODIFIED.DATE> = SYSTEM.DATE
+EMP.REC<EMP.MODIFIED.TIME> = SYSTEM.TIME
+
+* Write updated record
+WRITE EMP.REC TO F.EMPLOYEES, EMP.ID
+
+* Create audit trail
+GOSUB CREATE.AUDIT.TRAIL
+
+* Process notifications
+GOSUB SEND.NOTIFICATIONS
+
+LOG.MSG = 'Employee updated: ' : EMP.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Parse Field Updates
+**************************************************************************
+PARSE.FIELD.UPDATES:
+   UPDATE.COUNT = DCOUNT(FIELD.UPDATES, VM)
+
+   FOR I = 1 TO UPDATE.COUNT
+      UPDATE.STR = FIELD.UPDATES<1, I>
+
+      * Parse field name and value (separated by ])
+      DELIM.POS = INDEX(UPDATE.STR, ']', 1)
+
+      IF DELIM.POS = 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid update format at position ' : I
+         RETURN
+      END
+
+      FIELD.NAME = UPDATE.STR[1, DELIM.POS - 1]
+      FIELD.VALUE = UPDATE.STR[DELIM.POS + 1, 999]
+
+      * Apply update based on field name
+      GOSUB APPLY.FIELD.UPDATE
+      IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Apply Field Update
+**************************************************************************
+APPLY.FIELD.UPDATE:
+   BEGIN CASE
+      * Personal Information
+      CASE FIELD.NAME = 'FIRST.NAME'
+         EMP.REC<FIRST.NAME> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'LAST.NAME'
+         EMP.REC<LAST.NAME> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'MIDDLE.INITIAL'
+         EMP.REC<MIDDLE.INITIAL> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'SSN'
+         * Encrypt SSN
+         CALL UTILS.COMMON('ENCRYPT.STRING', FIELD.VALUE, ENC.SSN)
+         EMP.REC<SSN> = ENC.SSN
+
+      CASE FIELD.NAME = 'DATE.OF.BIRTH'
+         EMP.REC<DATE.OF.BIRTH> = ICONV(FIELD.VALUE, 'D/')
+
+      * Contact Information
+      CASE FIELD.NAME = 'PHONE.MOBILE'
+         EMP.REC<PHONE.MOBILE> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'PHONE.HOME'
+         EMP.REC<PHONE.HOME> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'EMP.EMAIL'
+         EMP.REC<EMP.EMAIL> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'ADDRESS.1'
+         EMP.REC<ADDRESS.1> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'ADDRESS.2'
+         EMP.REC<ADDRESS.2> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'CITY'
+         EMP.REC<CITY> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'STATE'
+         EMP.REC<STATE> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'ZIP'
+         EMP.REC<ZIP> = FIELD.VALUE
+
+      * Employment Information
+      CASE FIELD.NAME = 'POSITION'
+         EMP.REC<POSITION> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'DEPARTMENT'
+         EMP.REC<DEPARTMENT> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'SUPERVISOR.ID'
+         EMP.REC<SUPERVISOR.ID> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'PRIMARY.STORE'
+         EMP.REC<PRIMARY.STORE> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'STATUS'
+         OLD.STATUS = EMP.REC<EMP.STATUS>
+         EMP.REC<EMP.STATUS> = FIELD.VALUE
+         STATUS.CHANGED = TRUE
+
+      * Compensation
+      CASE FIELD.NAME = 'PAY.TYPE'
+         EMP.REC<PAY.TYPE> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'PAY.RATE'
+         OLD.PAY.RATE = EMP.REC<PAY.RATE>
+         EMP.REC<PAY.RATE> = FIELD.VALUE
+         PAY.RATE.CHANGED = TRUE
+
+      CASE FIELD.NAME = 'COMMISSION.RATE'
+         EMP.REC<COMMISSION.RATE> = FIELD.VALUE
+
+      * Benefits
+      CASE FIELD.NAME = 'MEDICAL.PLAN'
+         EMP.REC<MEDICAL.PLAN> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'DENTAL.PLAN'
+         EMP.REC<DENTAL.PLAN> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'VISION.PLAN'
+         EMP.REC<VISION.PLAN> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'K401.PERCENT'
+         EMP.REC<K401.PERCENT> = FIELD.VALUE
+
+      * PTO Balances
+      CASE FIELD.NAME = 'PTO.BALANCE'
+         EMP.REC<PTO.BALANCE> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'SICK.BALANCE'
+         EMP.REC<SICK.BALANCE> = FIELD.VALUE
+
+      * Banking
+      CASE FIELD.NAME = 'BANK.ROUTING'
+         CALL UTILS.COMMON('ENCRYPT.STRING', FIELD.VALUE, ENC.ROUTING)
+         EMP.REC<BANK.ROUTING> = ENC.ROUTING
+
+      CASE FIELD.NAME = 'BANK.ACCOUNT'
+         CALL UTILS.COMMON('ENCRYPT.STRING', FIELD.VALUE, ENC.ACCOUNT)
+         EMP.REC<BANK.ACCOUNT> = ENC.ACCOUNT
+
+      * Emergency Contact
+      CASE FIELD.NAME = 'EMERGENCY.CONTACT'
+         EMP.REC<EMERGENCY.CONTACT> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'EMERGENCY.PHONE'
+         EMP.REC<EMERGENCY.PHONE> = FIELD.VALUE
+
+      CASE FIELD.NAME = 'EMERGENCY.RELATION'
+         EMP.REC<EMERGENCY.RELATION> = FIELD.VALUE
+
+      * Access
+      CASE FIELD.NAME = 'USER.LEVEL'
+         OLD.LEVEL = EMP.REC<USER.LEVEL>
+         EMP.REC<USER.LEVEL> = FIELD.VALUE
+         ACCESS.LEVEL.CHANGED = TRUE
+
+      CASE FIELD.NAME = 'PIN.CODE'
+         CALL UTILS.COMMON('ENCRYPT.STRING', FIELD.VALUE, ENC.PIN)
+         EMP.REC<PIN.CODE> = ENC.PIN
+
+      CASE 1
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid field name: ' : FIELD.NAME
+         RETURN
+   END CASE
+   RETURN
+
+**************************************************************************
+* Validate Updates
+**************************************************************************
+VALIDATE.UPDATES:
+   * Validate required fields
+   IF EMP.REC<FIRST.NAME> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'First name is required'
+      RETURN
+   END
+
+   IF EMP.REC<LAST.NAME> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Last name is required'
+      RETURN
+   END
+
+   * Validate SSN if changed
+   IF EMP.REC<SSN> # ORIGINAL.REC<SSN> THEN
+      GOSUB VALIDATE.SSN.UNIQUE
+      IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+   END
+
+   * Validate email if provided
+   IF EMP.REC<EMP.EMAIL> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.EMAIL', EMP.REC<EMP.EMAIL>, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid email address'
+         RETURN
+      END
+   END
+
+   * Validate phone numbers
+   IF EMP.REC<PHONE.MOBILE> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.PHONE', EMP.REC<PHONE.MOBILE>, FMT.PHONE, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid mobile phone'
+         RETURN
+      END
+      EMP.REC<PHONE.MOBILE> = FMT.PHONE
+   END
+
+   * Validate department
+   IF EMP.REC<DEPARTMENT> # '' THEN
+      VALID.DEPTS = 'SALES':VM:'MANAGEMENT':VM:'WAREHOUSE':VM:'RECEIVING':VM:'IT'
+      LOCATE EMP.REC<DEPARTMENT> IN VALID.DEPTS<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid department'
+         RETURN
+      END
+   END
+
+   * Validate pay type
+   IF EMP.REC<PAY.TYPE> # '' THEN
+      VALID.PAY.TYPES = 'HOURLY':VM:'SALARY':VM:'COMMISSION'
+      LOCATE EMP.REC<PAY.TYPE> IN VALID.PAY.TYPES<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid pay type'
+         RETURN
+      END
+   END
+
+   * Validate pay rate
+   IF EMP.REC<PAY.RATE> # '' THEN
+      IF NOT(NUM(EMP.REC<PAY.RATE>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Pay rate must be numeric'
+         RETURN
+      END
+      IF EMP.REC<PAY.RATE> <= 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Pay rate must be greater than zero'
+         RETURN
+      END
+   END
+
+   * Validate supervisor if specified
+   IF EMP.REC<SUPERVISOR.ID> # '' THEN
+      READ SUPER.REC FROM F.EMPLOYEES, EMP.REC<SUPERVISOR.ID> ELSE
+         ERROR.CODE = ERR.RECORD.NOT.FOUND
+         ERROR.MSG = 'Supervisor not found'
+         RETURN
+      END
+   END
+
+   * Validate primary store
+   IF EMP.REC<PRIMARY.STORE> # '' THEN
+      READ STORE.REC FROM F.STORES, EMP.REC<PRIMARY.STORE> ELSE
+         ERROR.CODE = ERR.RECORD.NOT.FOUND
+         ERROR.MSG = 'Primary store not found'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Validate SSN Unique
+**************************************************************************
+VALIDATE.SSN.UNIQUE:
+   SELECT.CMD = 'SELECT EMPLOYEES'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT EXISTING.EMP.ID ELSE EXIT
+
+      IF EXISTING.EMP.ID = EMP.ID THEN CONTINUE
+
+      READ EXISTING.REC FROM F.EMPLOYEES, EXISTING.EMP.ID ELSE CONTINUE
+
+      IF EXISTING.REC<SSN> = EMP.REC<SSN> THEN
+         ERROR.CODE = ERR.DUPLICATE.KEY
+         ERROR.MSG = 'SSN already exists in system'
+         RETURN
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Process Field Changes
+**************************************************************************
+PROCESS.FIELD.CHANGES:
+   * Track pay rate changes
+   IF PAY.RATE.CHANGED THEN
+      GOSUB TRACK.PAY.RATE.CHANGE
+   END
+
+   * Track status changes
+   IF STATUS.CHANGED THEN
+      GOSUB TRACK.STATUS.CHANGE
+   END
+
+   * Update user account if access level changed
+   IF ACCESS.LEVEL.CHANGED THEN
+      GOSUB UPDATE.USER.ACCESS
+   END
+
+   * Update name in user account if name changed
+   IF EMP.REC<FIRST.NAME> # ORIGINAL.REC<FIRST.NAME> OR EMP.REC<LAST.NAME> # ORIGINAL.REC<LAST.NAME> THEN
+      GOSUB UPDATE.USER.NAME
+   END
+   RETURN
+
+**************************************************************************
+* Track Pay Rate Change
+**************************************************************************
+TRACK.PAY.RATE.CHANGE:
+   OPEN 'PAY.HISTORY' TO F.PAY.HIST ELSE
+      EXECUTE 'CREATE.FILE PAY.HISTORY 1 101'
+      OPEN 'PAY.HISTORY' TO F.PAY.HIST ELSE
+         RETURN
+      END
+   END
+
+   HIST.ID = EMP.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   HIST.REC = ''
+   HIST.REC<1> = EMP.ID
+   HIST.REC<2> = SYSTEM.DATE
+   HIST.REC<3> = OLD.PAY.RATE
+   HIST.REC<4> = EMP.REC<PAY.RATE>
+   HIST.REC<5> = EMP.REC<PAY.TYPE>
+   HIST.REC<6> = USER.ID  ; Changed by
+   HIST.REC<7> = 'PAY RATE UPDATE'
+
+   WRITE HIST.REC TO F.PAY.HIST, HIST.ID
+   RETURN
+
+**************************************************************************
+* Track Status Change
+**************************************************************************
+TRACK.STATUS.CHANGE:
+   OPEN 'STATUS.HISTORY' TO F.STATUS.HIST ELSE
+      EXECUTE 'CREATE.FILE STATUS.HISTORY 1 101'
+      OPEN 'STATUS.HISTORY' TO F.STATUS.HIST ELSE
+         RETURN
+      END
+   END
+
+   HIST.ID = EMP.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   HIST.REC = ''
+   HIST.REC<1> = EMP.ID
+   HIST.REC<2> = SYSTEM.DATE
+   HIST.REC<3> = OLD.STATUS
+   HIST.REC<4> = EMP.REC<EMP.STATUS>
+   HIST.REC<5> = USER.ID
+   HIST.REC<6> = 'STATUS CHANGE'
+
+   WRITE HIST.REC TO F.STATUS.HIST, HIST.ID
+
+   * If status changed to TERMINATED, process termination
+   IF EMP.REC<EMP.STATUS> = 'TERMINATED' THEN
+      GOSUB PROCESS.TERMINATION
+   END
+   RETURN
+
+**************************************************************************
+* Update User Access
+**************************************************************************
+UPDATE.USER.ACCESS:
+   OPEN 'USERS' TO F.USERS ELSE
+      RETURN
+   END
+
+   USER.ID.VAL = EMP.REC<USER.ID>
+
+   READU USER.REC FROM F.USERS, USER.ID.VAL ELSE
+      RETURN
+   END
+
+   USER.REC<4> = EMP.REC<USER.LEVEL>
+   WRITE USER.REC TO F.USERS, USER.ID.VAL
+   RETURN
+
+**************************************************************************
+* Update User Name
+**************************************************************************
+UPDATE.USER.NAME:
+   * This could trigger user ID regeneration if name changed significantly
+   * For now, just log the change
+   LOG.MSG = 'Employee name changed: ' : EMP.ID
+   LOG.MSG := ' from ' : ORIGINAL.REC<FIRST.NAME> : ' ' : ORIGINAL.REC<LAST.NAME>
+   LOG.MSG := ' to ' : EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Process Termination
+**************************************************************************
+PROCESS.TERMINATION:
+   * Deactivate user account
+   OPEN 'USERS' TO F.USERS ELSE
+      RETURN
+   END
+
+   USER.ID.VAL = EMP.REC<USER.ID>
+
+   READU USER.REC FROM F.USERS, USER.ID.VAL ELSE
+      RETURN
+   END
+
+   USER.REC<3> = 'INACTIVE'
+   USER.REC<8> = SYSTEM.DATE  ; Termination date
+   WRITE USER.REC TO F.USERS, USER.ID.VAL
+
+   * Create exit interview record
+   GOSUB CREATE.EXIT.INTERVIEW
+
+   * Calculate final paycheck
+   GOSUB CALCULATE.FINAL.PAYCHECK
+   RETURN
+
+**************************************************************************
+* Create Exit Interview
+**************************************************************************
+CREATE.EXIT.INTERVIEW:
+   OPEN 'EXIT.INTERVIEWS' TO F.EXIT ELSE
+      EXECUTE 'CREATE.FILE EXIT.INTERVIEWS 1 101'
+      OPEN 'EXIT.INTERVIEWS' TO F.EXIT ELSE
+         RETURN
+      END
+   END
+
+   EXIT.ID = EMP.ID
+   EXIT.REC = ''
+   EXIT.REC<1> = EMP.ID
+   EXIT.REC<2> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   EXIT.REC<3> = SYSTEM.DATE
+   EXIT.REC<4> = EMP.REC<HIRE.DATE>
+   EXIT.REC<5> = EMP.REC<POSITION>
+   EXIT.REC<6> = EMP.REC<DEPARTMENT>
+   EXIT.REC<7> = 'PENDING'  ; Interview status
+
+   WRITE EXIT.REC TO F.EXIT, EXIT.ID
+   RETURN
+
+**************************************************************************
+* Calculate Final Paycheck
+**************************************************************************
+CALCULATE.FINAL.PAYCHECK:
+   OPEN 'FINAL.PAYCHECKS' TO F.FINAL.PAY ELSE
+      EXECUTE 'CREATE.FILE FINAL.PAYCHECKS 1 101'
+      OPEN 'FINAL.PAYCHECKS' TO F.FINAL.PAY ELSE
+         RETURN
+      END
+   END
+
+   FINAL.ID = EMP.ID
+   FINAL.REC = ''
+   FINAL.REC<1> = EMP.ID
+   FINAL.REC<2> = SYSTEM.DATE
+   FINAL.REC<3> = 0  ; Regular pay (to be calculated)
+   FINAL.REC<4> = EMP.REC<PTO.BALANCE>  ; PTO payout
+   FINAL.REC<5> = 0  ; Other compensation
+   FINAL.REC<6> = 'PENDING'
+
+   * Calculate PTO payout value
+   IF EMP.REC<PAY.TYPE> = 'HOURLY' THEN
+      PTO.VALUE = EMP.REC<PTO.BALANCE> * EMP.REC<PAY.RATE>
+   END ELSE
+      HOURLY.RATE = EMP.REC<PAY.RATE> / 2080
+      PTO.VALUE = EMP.REC<PTO.BALANCE> * HOURLY.RATE
+   END
+
+   FINAL.REC<7> = PTO.VALUE
+
+   WRITE FINAL.REC TO F.FINAL.PAY, FINAL.ID
+   RETURN
+
+**************************************************************************
+* Create Audit Trail
+**************************************************************************
+CREATE.AUDIT.TRAIL:
+   OPEN 'AUDIT.TRAIL' TO F.AUDIT ELSE
+      EXECUTE 'CREATE.FILE AUDIT.TRAIL 1 101'
+      OPEN 'AUDIT.TRAIL' TO F.AUDIT ELSE
+         RETURN
+      END
+   END
+
+   AUDIT.ID = 'EMP*' : EMP.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   AUDIT.REC = ''
+   AUDIT.REC<1> = 'EMPLOYEE'
+   AUDIT.REC<2> = EMP.ID
+   AUDIT.REC<3> = 'UPDATE'
+   AUDIT.REC<4> = USER.ID
+   AUDIT.REC<5> = SYSTEM.DATE
+   AUDIT.REC<6> = SYSTEM.TIME
+
+   * Track changed fields
+   CHANGE.COUNT = 0
+   FOR I = 1 TO 100
+      IF EMP.REC<I> # ORIGINAL.REC<I> THEN
+         CHANGE.COUNT += 1
+         AUDIT.REC<10, CHANGE.COUNT> = I  ; Field position
+         AUDIT.REC<11, CHANGE.COUNT> = ORIGINAL.REC<I>  ; Old value
+         AUDIT.REC<12, CHANGE.COUNT> = EMP.REC<I>  ; New value
+      END
+   NEXT I
+
+   AUDIT.REC<7> = CHANGE.COUNT
+
+   WRITE AUDIT.REC TO F.AUDIT, AUDIT.ID
+   RETURN
+
+**************************************************************************
+* Send Notifications
+**************************************************************************
+SEND.NOTIFICATIONS:
+   * Send email if pay rate changed
+   IF PAY.RATE.CHANGED THEN
+      GOSUB SEND.PAY.CHANGE.EMAIL
+   END
+
+   * Send email if status changed
+   IF STATUS.CHANGED THEN
+      GOSUB SEND.STATUS.CHANGE.EMAIL
+   END
+
+   * Notify supervisor of significant changes
+   IF EMP.REC<SUPERVISOR.ID> # '' THEN
+      GOSUB NOTIFY.SUPERVISOR
+   END
+   RETURN
+
+**************************************************************************
+* Send Pay Change Email
+**************************************************************************
+SEND.PAY.CHANGE.EMAIL:
+   IF EMP.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'PAY.CHANGE*' : EMP.ID : '*' : SYSTEM.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = EMP.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Compensation Change Notification'
+   EMAIL.REC<3> = 'Your compensation has been updated.' : AM
+   EMAIL.REC<3> := 'Effective Date: ' : OCONV(SYSTEM.DATE, 'D4/') : AM
+   EMAIL.REC<3> := 'New Rate: ' : EMP.REC<PAY.RATE> : AM
+   EMAIL.REC<3> := 'Please contact HR with any questions.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Status Change Email
+**************************************************************************
+SEND.STATUS.CHANGE.EMAIL:
+   IF EMP.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'STATUS.CHANGE*' : EMP.ID : '*' : SYSTEM.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = EMP.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Employment Status Change'
+   EMAIL.REC<3> = 'Your employment status has been updated.' : AM
+   EMAIL.REC<3> := 'New Status: ' : EMP.REC<EMP.STATUS> : AM
+   EMAIL.REC<3> := 'Effective Date: ' : OCONV(SYSTEM.DATE, 'D4/') : AM
+   EMAIL.REC<3> := 'Please contact HR with any questions.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Notify Supervisor
+**************************************************************************
+NOTIFY.SUPERVISOR:
+   READ SUPER.REC FROM F.EMPLOYEES, EMP.REC<SUPERVISOR.ID> ELSE
+      RETURN
+   END
+
+   IF SUPER.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'EMP.UPDATE*' : EMP.ID : '*' : SYSTEM.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = SUPER.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Employee Update Notification'
+   EMAIL.REC<3> = 'Employee record has been updated:' : AM
+   EMAIL.REC<3> := 'Employee: ' : EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME> : AM
+   EMAIL.REC<3> := 'Employee ID: ' : EMP.ID : AM
+   EMAIL.REC<3> := 'Updated by: ' : USER.ID : AM
+   EMAIL.REC<3> := 'Date: ' : OCONV(SYSTEM.DATE, 'D4/')
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

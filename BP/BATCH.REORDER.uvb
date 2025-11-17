@@ -1,0 +1,459 @@
+SUBROUTINE BATCH.REORDER(RUN.MODE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: BATCH.REORDER
+* Purpose: Automated Inventory Reorder Processing
+* Parameters:
+*   RUN.MODE (IN) - Execution mode:
+*                   TEST = Test mode (no PO creation)
+*                   LIVE = Live mode (create actual POs)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+IF RUN.MODE = '' THEN RUN.MODE = 'TEST'
+
+* Initialize batch
+GOSUB INITIALIZE.BATCH
+
+* Find items needing reorder
+GOSUB FIND.REORDER.ITEMS
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Group items by vendor
+GOSUB GROUP.ITEMS.BY.VENDOR
+
+* Create purchase orders
+GOSUB CREATE.PURCHASE.ORDERS
+
+* Send notifications
+GOSUB SEND.REORDER.NOTIFICATIONS
+
+* Generate batch report
+GOSUB GENERATE.BATCH.REPORT
+
+LOG.MSG = 'Reorder batch completed - Mode: ' : RUN.MODE
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Initialize Batch
+**************************************************************************
+INITIALIZE.BATCH:
+   BATCH.ID = 'REORDER*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   BATCH.START.TIME = SYSTEM.TIME
+   BATCH.DATE = SYSTEM.DATE
+
+   * Initialize counters
+   ITEMS.CHECKED = 0
+   ITEMS.TO.REORDER = 0
+   POS.CREATED = 0
+   TOTAL.ORDERED.QTY = 0
+   TOTAL.ORDERED.VALUE = 0
+
+   * Initialize data storage
+   REORDER.ITEMS = ''
+   VENDOR.POS = ''
+   RETURN
+
+**************************************************************************
+* Find Reorder Items
+**************************************************************************
+FIND.REORDER.ITEMS:
+   SELECT.CMD = 'SELECT INVENTORY WITH STATUS = "ACTIVE"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      ITEMS.CHECKED += 1
+
+      * Check if item needs reordering
+      GOSUB CHECK.REORDER.NEEDED
+
+      IF NEEDS.REORDER THEN
+         * Calculate reorder quantity
+         GOSUB CALCULATE.REORDER.QTY
+
+         * Store reorder item
+         GOSUB STORE.REORDER.ITEM
+
+         ITEMS.TO.REORDER += 1
+      END
+   REPEAT
+
+   IF ITEMS.TO.REORDER = 0 THEN
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'No items need reordering'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Check Reorder Needed
+**************************************************************************
+CHECK.REORDER.NEEDED:
+   NEEDS.REORDER = FALSE
+
+   * Get reorder parameters
+   MIN.QTY = ITEM.REC<MIN.QTY>
+   IF MIN.QTY = '' THEN MIN.QTY = 0
+
+   REORDER.QTY = ITEM.REC<REORDER.QTY>
+   IF REORDER.QTY = '' OR REORDER.QTY <= 0 THEN
+      * Item not set up for auto-reorder
+      RETURN
+   END
+
+   * Get current total quantity across all stores
+   CURRENT.QTY = 0
+   QTY.LIST = ITEM.REC<QTY.ON.HAND>
+
+   IF QTY.LIST # '' THEN
+      QTY.COUNT = DCOUNT(QTY.LIST, VM)
+      FOR I = 1 TO QTY.COUNT
+         QTY.AMT = QTY.LIST<1, I>
+         IF QTY.AMT # '' THEN
+            CURRENT.QTY += QTY.AMT
+         END
+      NEXT I
+   END
+
+   * Get quantity on order
+   ON.ORDER.QTY = ITEM.REC<QTY.ON.ORDER>
+   IF ON.ORDER.QTY = '' THEN ON.ORDER.QTY = 0
+
+   * Calculate available quantity
+   AVAILABLE.QTY = CURRENT.QTY + ON.ORDER.QTY
+
+   * Check if below reorder point
+   IF AVAILABLE.QTY <= MIN.QTY THEN
+      NEEDS.REORDER = TRUE
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Reorder Qty
+**************************************************************************
+CALCULATE.REORDER.QTY:
+   * Base reorder quantity
+   ORDER.QTY = REORDER.QTY
+
+   * Check for pending orders
+   IF ON.ORDER.QTY > 0 THEN
+      * Reduce order qty by what's already on order
+      ORDER.QTY = ORDER.QTY - ON.ORDER.QTY
+      IF ORDER.QTY < 0 THEN ORDER.QTY = 0
+   END
+
+   * Check vendor minimum order quantity
+   PRIMARY.VENDOR = ITEM.REC<PRIMARY.VENDOR>
+   IF PRIMARY.VENDOR # '' THEN
+      READ VENDOR.REC FROM F.VENDORS, PRIMARY.VENDOR ELSE
+         VENDOR.MIN.QTY = 0
+      END ELSE
+         VENDOR.MIN.QTY = VENDOR.REC<MIN.ORDER.QTY>
+         IF VENDOR.MIN.QTY = '' THEN VENDOR.MIN.QTY = 0
+      END
+
+      IF ORDER.QTY < VENDOR.MIN.QTY THEN
+         ORDER.QTY = VENDOR.MIN.QTY
+      END
+   END
+
+   * Check for sales velocity-based ordering
+   GOSUB CALCULATE.VELOCITY.ORDER.QTY
+   RETURN
+
+**************************************************************************
+* Calculate Velocity Order Qty
+**************************************************************************
+CALCULATE.VELOCITY.ORDER.QTY:
+   * Use sales velocity to optimize order quantity
+
+   SALES.30DAY = ITEM.REC<SALES.30DAY>
+   IF SALES.30DAY = '' THEN SALES.30DAY = 0
+
+   IF SALES.30DAY <= 0 THEN RETURN
+
+   * Calculate daily sales rate
+   DAILY.SALES = SALES.30DAY / 30
+
+   * Get lead time
+   IF PRIMARY.VENDOR # '' THEN
+      LEAD.TIME = VENDOR.REC<LEAD.TIME.DAYS>
+      IF LEAD.TIME = '' THEN LEAD.TIME = 7
+   END ELSE
+      LEAD.TIME = 7
+   END
+
+   * Safety stock (2 weeks of sales)
+   SAFETY.STOCK = DAILY.SALES * 14
+
+   * Order enough for lead time + safety stock
+   VELOCITY.QTY = (DAILY.SALES * LEAD.TIME) + SAFETY.STOCK
+
+   * Use the higher of standard or velocity-based qty
+   IF VELOCITY.QTY > ORDER.QTY THEN
+      ORDER.QTY = VELOCITY.QTY
+   END
+
+   * Round to case quantity if specified
+   CASE.QTY = ITEM.REC<CASE.QTY>
+   IF CASE.QTY # '' AND CASE.QTY > 0 THEN
+      CASES.NEEDED = INT((ORDER.QTY + CASE.QTY - 1) / CASE.QTY)
+      ORDER.QTY = CASES.NEEDED * CASE.QTY
+   END
+   RETURN
+
+**************************************************************************
+* Store Reorder Item
+**************************************************************************
+STORE.REORDER.ITEM:
+   * Store item data for PO creation
+   REORDER.DATA = ITEM.ID
+   REORDER.DATA := AM : PRIMARY.VENDOR
+   REORDER.DATA := AM : ORDER.QTY
+   REORDER.DATA := AM : ITEM.REC<LAST.COST>
+   REORDER.DATA := AM : ITEM.REC<SKU>
+   REORDER.DATA := AM : ITEM.REC<ITEM.DESCRIPTION>
+   REORDER.DATA := AM : CURRENT.QTY
+   REORDER.DATA := AM : MIN.QTY
+
+   IF REORDER.ITEMS = '' THEN
+      REORDER.ITEMS = REORDER.DATA
+   END ELSE
+      REORDER.ITEMS := VM : REORDER.DATA
+   END
+
+   TOTAL.ORDERED.QTY += ORDER.QTY
+
+   ORDER.VALUE = ORDER.QTY * ITEM.REC<LAST.COST>
+   TOTAL.ORDERED.VALUE += ORDER.VALUE
+   RETURN
+
+**************************************************************************
+* Group Items by Vendor
+**************************************************************************
+GROUP.ITEMS.BY.VENDOR:
+   IF REORDER.ITEMS = '' THEN RETURN
+
+   * Build vendor groups
+   MAT VENDOR.LIST = ''
+   MAT VENDOR.ITEM.LIST = ''
+
+   ITEM.COUNT = DCOUNT(REORDER.ITEMS, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.DATA = REORDER.ITEMS<1, I>
+
+      VENDOR.ID = ITEM.DATA<1, 1, 2>
+      IF VENDOR.ID = '' THEN VENDOR.ID = 'NO.VENDOR'
+
+      * Find or create vendor entry
+      LOCATE VENDOR.ID IN VENDOR.LIST SETTING POS ELSE
+         * Add new vendor
+         VENDOR.CNT = DCOUNT(VENDOR.LIST, AM)
+         IF VENDOR.CNT = 0 OR VENDOR.LIST = '' THEN
+            POS = 1
+         END ELSE
+            POS = VENDOR.CNT + 1
+         END
+
+         VENDOR.LIST<POS> = VENDOR.ID
+         VENDOR.ITEM.LIST<POS> = ''
+      END
+
+      * Add item to vendor's list
+      IF VENDOR.ITEM.LIST<POS> = '' THEN
+         VENDOR.ITEM.LIST<POS> = ITEM.DATA
+      END ELSE
+         VENDOR.ITEM.LIST<POS> := SVM : ITEM.DATA
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Create Purchase Orders
+**************************************************************************
+CREATE.PURCHASE.ORDERS:
+   IF RUN.MODE # 'LIVE' THEN
+      * Test mode - just report what would be created
+      RETURN
+   END
+
+   VENDOR.CNT = DCOUNT(VENDOR.LIST, AM)
+   IF VENDOR.CNT = 0 THEN RETURN
+
+   FOR I = 1 TO VENDOR.CNT
+      VENDOR.ID = VENDOR.LIST<I>
+      ITEMS.LIST = VENDOR.ITEM.LIST<I>
+
+      IF VENDOR.ID = 'NO.VENDOR' THEN CONTINUE
+
+      * Create PO for this vendor
+      GOSUB CREATE.VENDOR.PO
+
+      IF PO.CREATED THEN
+         POS.CREATED += 1
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Create Vendor PO
+**************************************************************************
+CREATE.VENDOR.PO:
+   PO.CREATED = FALSE
+
+   * Build PO record
+   PO.REC = ''
+   PO.REC<PO.VENDOR.ID> = VENDOR.ID
+
+   * Get vendor details
+   READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+      RETURN
+   END
+
+   PO.REC<PO.VENDOR.NAME> = VENDOR.REC<VENDOR.NAME>
+   PO.REC<PO.DATE> = SYSTEM.DATE
+   PO.REC<PO.STATUS> = 'PENDING'
+   PO.REC<PO.TYPE> = 'AUTO.REORDER'
+   PO.REC<PO.REQUESTED.BY> = 'BATCH.REORDER'
+
+   * Add items to PO
+   ITEM.CNT = DCOUNT(ITEMS.LIST, SVM)
+   PO.TOTAL = 0
+
+   FOR J = 1 TO ITEM.CNT
+      ITEM.DATA = ITEMS.LIST<1, 1, J>
+
+      ITEM.ID = ITEM.DATA<1, 1, 1>
+      ORDER.QTY = ITEM.DATA<1, 1, 3>
+      UNIT.COST = ITEM.DATA<1, 1, 4>
+      ITEM.SKU = ITEM.DATA<1, 1, 5>
+      ITEM.DESC = ITEM.DATA<1, 1, 6>
+
+      IF UNIT.COST = '' THEN UNIT.COST = 0
+
+      LINE.TOTAL = ORDER.QTY * UNIT.COST
+      PO.TOTAL += LINE.TOTAL
+
+      PO.REC<PO.ITEM.IDS, J> = ITEM.ID
+      PO.REC<PO.ITEM.SKUS, J> = ITEM.SKU
+      PO.REC<PO.ITEM.DESCRIPTIONS, J> = ITEM.DESC
+      PO.REC<PO.QTY.ORDERED, J> = ORDER.QTY
+      PO.REC<PO.UNIT.COST, J> = UNIT.COST
+      PO.REC<PO.LINE.TOTALS, J> = LINE.TOTAL
+   NEXT J
+
+   PO.REC<PO.TOTAL> = PO.TOTAL
+
+   * Call PO.CREATE to generate PO
+   CALL PO.CREATE(PO.REC, PO.ID.OUT, PO.ERROR.CODE, PO.ERROR.MSG)
+
+   IF PO.ERROR.CODE = ERR.SUCCESS THEN
+      PO.CREATED = TRUE
+
+      * Store PO reference
+      IF VENDOR.POS = '' THEN
+         VENDOR.POS = VENDOR.ID : ':' : PO.ID.OUT : ':' : PO.TOTAL
+      END ELSE
+         VENDOR.POS := VM : VENDOR.ID : ':' : PO.ID.OUT : ':' : PO.TOTAL
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Send Reorder Notifications
+**************************************************************************
+SEND.REORDER.NOTIFICATIONS:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   * Send summary email to purchasing
+   EMAIL.ID = 'REORDER.BATCH*' : BATCH.DATE
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'purchasing@company.com'
+   EMAIL.REC<2> = 'Automated Reorder Batch - ' : OCONV(BATCH.DATE, 'D4/')
+
+   EMAIL.BODY = 'Automated Reorder Batch Summary' : AM : AM
+   EMAIL.BODY := 'Mode: ' : RUN.MODE : AM
+   EMAIL.BODY := 'Date: ' : OCONV(BATCH.DATE, 'D4/') : AM : AM
+
+   EMAIL.BODY := 'Items Checked: ' : ITEMS.CHECKED : AM
+   EMAIL.BODY := 'Items Needing Reorder: ' : ITEMS.TO.REORDER : AM
+
+   IF RUN.MODE = 'LIVE' THEN
+      EMAIL.BODY := 'Purchase Orders Created: ' : POS.CREATED : AM : AM
+   END ELSE
+      EMAIL.BODY := 'TEST MODE - No POs Created' : AM : AM
+   END
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.ORDERED.VALUE, FMT.VALUE)
+
+   EMAIL.BODY := 'Total Quantity Ordered: ' : TOTAL.ORDERED.QTY : AM
+   EMAIL.BODY := 'Total Order Value: $' : FMT.VALUE : AM : AM
+
+   * List POs created
+   IF VENDOR.POS # '' THEN
+      EMAIL.BODY := 'Purchase Orders:' : AM
+
+      PO.CNT = DCOUNT(VENDOR.POS, VM)
+      FOR I = 1 TO PO.CNT
+         PO.DATA = VENDOR.POS<1, I>
+
+         VENDOR.ID = FIELD(PO.DATA, ':', 1)
+         PO.ID = FIELD(PO.DATA, ':', 2)
+         PO.AMT = FIELD(PO.DATA, ':', 3)
+
+         CALL UTILS.COMMON('FORMAT.AMOUNT', PO.AMT, FMT.PO.AMT)
+
+         EMAIL.BODY := '  ' : PO.ID : ' - ' : VENDOR.ID
+         EMAIL.BODY := ' - $' : FMT.PO.AMT : AM
+      NEXT I
+   END
+
+   EMAIL.REC<3> = EMAIL.BODY
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Generate Batch Report
+**************************************************************************
+GENERATE.BATCH.REPORT:
+   OPEN 'BATCH.LOGS' TO F.BATCH.LOGS ELSE
+      EXECUTE 'CREATE.FILE BATCH.LOGS 1 101'
+      OPEN 'BATCH.LOGS' TO F.BATCH.LOGS ELSE RETURN
+   END
+
+   BATCH.END.TIME = SYSTEM.TIME
+   ELAPSED.TIME = BATCH.END.TIME - BATCH.START.TIME
+
+   BATCH.LOG = ''
+   BATCH.LOG<1> = BATCH.ID
+   BATCH.LOG<2> = 'REORDER'
+   BATCH.LOG<3> = RUN.MODE
+   BATCH.LOG<4> = BATCH.DATE
+   BATCH.LOG<5> = BATCH.START.TIME
+   BATCH.LOG<6> = BATCH.END.TIME
+   BATCH.LOG<7> = ELAPSED.TIME
+   BATCH.LOG<8> = ITEMS.CHECKED
+   BATCH.LOG<9> = ITEMS.TO.REORDER
+   BATCH.LOG<10> = POS.CREATED
+   BATCH.LOG<11> = TOTAL.ORDERED.QTY
+   BATCH.LOG<12> = TOTAL.ORDERED.VALUE
+   BATCH.LOG<13> = 'SUCCESS'
+
+   WRITE BATCH.LOG TO F.BATCH.LOGS, BATCH.ID
+   RETURN
+
+END

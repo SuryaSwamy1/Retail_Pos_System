@@ -1,0 +1,1009 @@
+SUBROUTINE EMP.SCHEDULE(ACTION, SCHEDULE.DATA, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: EMP.SCHEDULE
+* Purpose: Employee Scheduling Management
+* Parameters:
+*   ACTION (IN) - Action to perform:
+*                 CREATE.SCHEDULE, UPDATE.SCHEDULE, DELETE.SCHEDULE,
+*                 GET.SCHEDULE, SWAP.SHIFT, REQUEST.TIME.OFF
+*   SCHEDULE.DATA (IN/OUT) - Schedule data (format depends on action)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Open schedules file
+OPEN 'SCHEDULES' TO F.SCHEDULES ELSE
+   EXECUTE 'CREATE.FILE SCHEDULES 1 101'
+   OPEN 'SCHEDULES' TO F.SCHEDULES ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Cannot open schedules file'
+      RETURN
+   END
+END
+
+* Parse action and execute
+BEGIN CASE
+   CASE ACTION = 'CREATE.SCHEDULE'
+      GOSUB CREATE.SCHEDULE
+
+   CASE ACTION = 'UPDATE.SCHEDULE'
+      GOSUB UPDATE.SCHEDULE
+
+   CASE ACTION = 'DELETE.SCHEDULE'
+      GOSUB DELETE.SCHEDULE
+
+   CASE ACTION = 'GET.SCHEDULE'
+      GOSUB GET.SCHEDULE
+
+   CASE ACTION = 'SWAP.SHIFT'
+      GOSUB SWAP.SHIFT
+
+   CASE ACTION = 'REQUEST.TIME.OFF'
+      GOSUB REQUEST.TIME.OFF
+
+   CASE ACTION = 'APPROVE.TIME.OFF'
+      GOSUB APPROVE.TIME.OFF
+
+   CASE ACTION = 'GENERATE.WEEKLY'
+      GOSUB GENERATE.WEEKLY.SCHEDULE
+
+   CASE ACTION = 'CHECK.COVERAGE'
+      GOSUB CHECK.COVERAGE
+
+   CASE 1
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid action: ' : ACTION
+      RETURN
+END CASE
+
+RETURN
+
+**************************************************************************
+* Create Schedule
+**************************************************************************
+CREATE.SCHEDULE:
+   * SCHEDULE.DATA format:
+   * <1> = Employee ID
+   * <2> = Week start date
+   * <3> = Store ID
+   * <10,1-7> = Shift start times for each day (Sun-Sat)
+   * <11,1-7> = Shift end times for each day
+   * <12,1-7> = Position for each shift
+
+   EMP.ID = SCHEDULE.DATA<1>
+   WEEK.START = SCHEDULE.DATA<2>
+   STORE.ID = SCHEDULE.DATA<3>
+
+   * Validate employee
+   READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Employee not found'
+      RETURN
+   END
+
+   IF EMP.REC<EMP.STATUS> # STATUS.ACTIVE THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Employee is not active'
+      RETURN
+   END
+
+   * Validate week start (must be Sunday)
+   IF MOD(WEEK.START, 7) # 0 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Week start must be a Sunday'
+      RETURN
+   END
+
+   * Validate store
+   READ STORE.REC FROM F.STORES, STORE.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Store not found'
+      RETURN
+   END
+
+   SCHEDULE.ID = EMP.ID : '*' : WEEK.START
+
+   * Check if schedule already exists
+   READ EXISTING.SCHED FROM F.SCHEDULES, SCHEDULE.ID THEN
+      ERROR.CODE = ERR.DUPLICATE.KEY
+      ERROR.MSG = 'Schedule already exists for this week'
+      RETURN
+   END
+
+   * Validate shift times and calculate hours
+   GOSUB VALIDATE.SHIFTS
+   IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+   * Check for scheduling conflicts
+   GOSUB CHECK.SCHEDULING.CONFLICTS
+   IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+   * Check labor law compliance
+   GOSUB CHECK.LABOR.COMPLIANCE
+   IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+   * Create schedule record
+   SCHEDULE.REC = ''
+   SCHEDULE.REC<1> = WEEK.START
+   SCHEDULE.REC<2> = EMP.ID
+   SCHEDULE.REC<3> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   SCHEDULE.REC<4> = STORE.ID
+   SCHEDULE.REC<5> = EMP.REC<POSITION>
+   SCHEDULE.REC<6> = EMP.REC<DEPARTMENT>
+
+   * Copy shift data
+   FOR DAY = 1 TO 7
+      SCHEDULE.REC<10, DAY> = SCHEDULE.DATA<10, DAY>  ; Start time
+      SCHEDULE.REC<11, DAY> = SCHEDULE.DATA<11, DAY>  ; End time
+      SCHEDULE.REC<12, DAY> = SCHEDULE.DATA<12, DAY>  ; Position
+      SCHEDULE.REC<13, DAY> = DAILY.HOURS<1, DAY>  ; Calculated hours
+   NEXT DAY
+
+   SCHEDULE.REC<20> = TOTAL.WEEKLY.HOURS
+   SCHEDULE.REC<25> = 'ACTIVE'
+   SCHEDULE.REC<26> = SYSTEM.DATE
+   SCHEDULE.REC<27> = USER.ID
+
+   WRITE SCHEDULE.REC TO F.SCHEDULES, SCHEDULE.ID
+
+   * Send schedule notification
+   GOSUB SEND.SCHEDULE.NOTIFICATION
+
+   LOG.MSG = 'Schedule created: ' : SCHEDULE.ID
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Validate Shifts
+**************************************************************************
+VALIDATE.SHIFTS:
+   DAILY.HOURS = ''
+   TOTAL.WEEKLY.HOURS = 0
+
+   FOR DAY = 1 TO 7
+      START.TIME = SCHEDULE.DATA<10, DAY>
+      END.TIME = SCHEDULE.DATA<11, DAY>
+
+      IF START.TIME = '' AND END.TIME = '' THEN
+         DAILY.HOURS<1, DAY> = 0
+         CONTINUE
+      END
+
+      IF START.TIME = '' OR END.TIME = '' THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Both start and end times required for day ' : DAY
+         RETURN
+      END
+
+      * Validate time format
+      IF NOT(NUM(START.TIME)) OR NOT(NUM(END.TIME)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid time format for day ' : DAY
+         RETURN
+      END
+
+      * Calculate shift hours
+      IF END.TIME < START.TIME THEN
+         * Overnight shift
+         SHIFT.HOURS = ((86400 - START.TIME) + END.TIME) / 3600
+      END ELSE
+         SHIFT.HOURS = (END.TIME - START.TIME) / 3600
+      END
+
+      * Validate shift length (minimum 2 hours, maximum 12 hours)
+      IF SHIFT.HOURS < 2 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Shift must be at least 2 hours (day ' : DAY : ')'
+         RETURN
+      END
+
+      IF SHIFT.HOURS > 12 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Shift cannot exceed 12 hours (day ' : DAY : ')'
+         RETURN
+      END
+
+      DAILY.HOURS<1, DAY> = SHIFT.HOURS
+      TOTAL.WEEKLY.HOURS += SHIFT.HOURS
+   NEXT DAY
+
+   * Validate weekly hours
+   IF TOTAL.WEEKLY.HOURS > 60 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Weekly hours cannot exceed 60'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Check Scheduling Conflicts
+**************************************************************************
+CHECK.SCHEDULING.CONFLICTS:
+   * Check if employee is scheduled at another store during same times
+   SELECT.CMD = 'SELECT SCHEDULES WITH @ID LIKE "' : EMP.ID : '*..."'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT OTHER.SCHED.ID ELSE EXIT
+
+      READ OTHER.SCHED FROM F.SCHEDULES, OTHER.SCHED.ID ELSE CONTINUE
+
+      OTHER.WEEK.START = OTHER.SCHED<1>
+
+      * Check if same week
+      IF OTHER.WEEK.START = WEEK.START THEN
+         * Check each day for overlapping shifts
+         FOR DAY = 1 TO 7
+            THIS.START = SCHEDULE.DATA<10, DAY>
+            THIS.END = SCHEDULE.DATA<11, DAY>
+            OTHER.START = OTHER.SCHED<10, DAY>
+            OTHER.END = OTHER.SCHED<11, DAY>
+
+            IF THIS.START # '' AND OTHER.START # '' THEN
+               * Check for overlap
+               IF THIS.START < OTHER.END AND THIS.END > OTHER.START THEN
+                  ERROR.CODE = ERR.INVALID.DATA
+                  ERROR.MSG = 'Scheduling conflict on day ' : DAY
+                  RETURN
+               END
+            END
+         NEXT DAY
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Check Labor Compliance
+**************************************************************************
+CHECK.LABOR.COMPLIANCE:
+   * Check for required rest periods between shifts
+   PREV.DAY.END = ''
+
+   FOR DAY = 1 TO 7
+      START.TIME = SCHEDULE.DATA<10, DAY>
+      END.TIME = SCHEDULE.DATA<11, DAY>
+
+      IF START.TIME = '' THEN CONTINUE
+
+      * Check rest period from previous day (minimum 8 hours)
+      IF PREV.DAY.END # '' THEN
+         * Calculate hours between shifts
+         TIME.DIFF = (86400 - PREV.DAY.END) + START.TIME
+         REST.HOURS = TIME.DIFF / 3600
+
+         IF REST.HOURS < 8 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Insufficient rest period between shifts (day ' : DAY : ')'
+            RETURN
+         END
+      END
+
+      PREV.DAY.END = END.TIME
+   NEXT DAY
+
+   * Check for minor employee restrictions
+   IF EMP.REC<DATE.OF.BIRTH> # '' THEN
+      AGE = INT((SYSTEM.DATE - EMP.REC<DATE.OF.BIRTH>) / 365)
+
+      IF AGE < 18 THEN
+         GOSUB CHECK.MINOR.RESTRICTIONS
+         IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Check Minor Restrictions
+**************************************************************************
+CHECK.MINOR.RESTRICTIONS:
+   * Minors cannot work:
+   * - Before 7 AM or after 10 PM on school nights
+   * - More than 8 hours per day
+   * - More than 40 hours per week
+
+   FOR DAY = 1 TO 7
+      START.TIME = SCHEDULE.DATA<10, DAY>
+      END.TIME = SCHEDULE.DATA<11, DAY>
+
+      IF START.TIME = '' THEN CONTINUE
+
+      * Check school nights (Sunday-Thursday)
+      IF DAY >= 1 AND DAY <= 5 THEN
+         EARLIEST.START = 7 * 3600  ; 7 AM
+         LATEST.END = 22 * 3600  ; 10 PM
+
+         IF START.TIME < EARLIEST.START OR END.TIME > LATEST.END THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Minor cannot work before 7 AM or after 10 PM on school nights'
+            RETURN
+         END
+      END
+
+      * Check daily hours
+      SHIFT.HOURS = DAILY.HOURS<1, DAY>
+      IF SHIFT.HOURS > 8 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Minor cannot work more than 8 hours per day'
+         RETURN
+      END
+   NEXT DAY
+
+   * Check weekly hours
+   IF TOTAL.WEEKLY.HOURS > 40 THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Minor cannot work more than 40 hours per week'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Update Schedule
+**************************************************************************
+UPDATE.SCHEDULE:
+   * SCHEDULE.DATA format same as CREATE.SCHEDULE
+
+   EMP.ID = SCHEDULE.DATA<1>
+   WEEK.START = SCHEDULE.DATA<2>
+
+   SCHEDULE.ID = EMP.ID : '*' : WEEK.START
+
+   * Read and lock existing schedule
+   READU SCHEDULE.REC FROM F.SCHEDULES, SCHEDULE.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Schedule not found'
+      RETURN
+   END
+
+   * Validate new shifts
+   GOSUB VALIDATE.SHIFTS
+   IF ERROR.CODE # ERR.SUCCESS THEN
+      RELEASE F.SCHEDULES, SCHEDULE.ID
+      RETURN
+   END
+
+   * Update shift data
+   FOR DAY = 1 TO 7
+      SCHEDULE.REC<10, DAY> = SCHEDULE.DATA<10, DAY>
+      SCHEDULE.REC<11, DAY> = SCHEDULE.DATA<11, DAY>
+      SCHEDULE.REC<12, DAY> = SCHEDULE.DATA<12, DAY>
+      SCHEDULE.REC<13, DAY> = DAILY.HOURS<1, DAY>
+   NEXT DAY
+
+   SCHEDULE.REC<20> = TOTAL.WEEKLY.HOURS
+   SCHEDULE.REC<28> = SYSTEM.DATE
+   SCHEDULE.REC<29> = USER.ID
+
+   WRITE SCHEDULE.REC TO F.SCHEDULES, SCHEDULE.ID
+
+   * Send update notification
+   GOSUB SEND.SCHEDULE.UPDATE.NOTIFICATION
+
+   LOG.MSG = 'Schedule updated: ' : SCHEDULE.ID
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Delete Schedule
+**************************************************************************
+DELETE.SCHEDULE:
+   EMP.ID = SCHEDULE.DATA<1>
+   WEEK.START = SCHEDULE.DATA<2>
+
+   SCHEDULE.ID = EMP.ID : '*' : WEEK.START
+
+   READ SCHEDULE.REC FROM F.SCHEDULES, SCHEDULE.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Schedule not found'
+      RETURN
+   END
+
+   * Mark as cancelled instead of deleting
+   SCHEDULE.REC<25> = 'CANCELLED'
+   SCHEDULE.REC<30> = SYSTEM.DATE
+   SCHEDULE.REC<31> = USER.ID
+
+   WRITE SCHEDULE.REC TO F.SCHEDULES, SCHEDULE.ID
+
+   LOG.MSG = 'Schedule cancelled: ' : SCHEDULE.ID
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Get Schedule
+**************************************************************************
+GET.SCHEDULE:
+   EMP.ID = SCHEDULE.DATA<1>
+   WEEK.START = SCHEDULE.DATA<2>
+
+   IF WEEK.START = '' THEN
+      * Get current week
+      WEEK.START = SYSTEM.DATE - MOD(SYSTEM.DATE, 7)
+   END
+
+   SCHEDULE.ID = EMP.ID : '*' : WEEK.START
+
+   READ SCHEDULE.REC FROM F.SCHEDULES, SCHEDULE.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Schedule not found'
+      RETURN
+   END
+
+   * Return schedule in SCHEDULE.DATA
+   SCHEDULE.DATA = SCHEDULE.REC
+   RETURN
+
+**************************************************************************
+* Swap Shift
+**************************************************************************
+SWAP.SHIFT:
+   * SCHEDULE.DATA format:
+   * <1> = Employee 1 ID
+   * <2> = Employee 2 ID
+   * <3> = Week start
+   * <4> = Day number (1-7)
+
+   EMP1.ID = SCHEDULE.DATA<1>
+   EMP2.ID = SCHEDULE.DATA<2>
+   WEEK.START = SCHEDULE.DATA<3>
+   DAY.NUM = SCHEDULE.DATA<4>
+
+   * Read both schedules
+   SCHED1.ID = EMP1.ID : '*' : WEEK.START
+   SCHED2.ID = EMP2.ID : '*' : WEEK.START
+
+   READU SCHED1.REC FROM F.SCHEDULES, SCHED1.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Schedule 1 not found'
+      RETURN
+   END
+
+   READU SCHED2.REC FROM F.SCHEDULES, SCHED2.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Schedule 2 not found'
+      RELEASE F.SCHEDULES, SCHED1.ID
+      RETURN
+   END
+
+   * Swap the shifts for the specified day
+   TEMP.START = SCHED1.REC<10, DAY.NUM>
+   TEMP.END = SCHED1.REC<11, DAY.NUM>
+   TEMP.POS = SCHED1.REC<12, DAY.NUM>
+   TEMP.HOURS = SCHED1.REC<13, DAY.NUM>
+
+   SCHED1.REC<10, DAY.NUM> = SCHED2.REC<10, DAY.NUM>
+   SCHED1.REC<11, DAY.NUM> = SCHED2.REC<11, DAY.NUM>
+   SCHED1.REC<12, DAY.NUM> = SCHED2.REC<12, DAY.NUM>
+   SCHED1.REC<13, DAY.NUM> = SCHED2.REC<13, DAY.NUM>
+
+   SCHED2.REC<10, DAY.NUM> = TEMP.START
+   SCHED2.REC<11, DAY.NUM> = TEMP.END
+   SCHED2.REC<12, DAY.NUM> = TEMP.POS
+   SCHED2.REC<13, DAY.NUM> = TEMP.HOURS
+
+   * Recalculate weekly hours
+   GOSUB RECALC.WEEKLY.HOURS.1
+   GOSUB RECALC.WEEKLY.HOURS.2
+
+   * Write both schedules
+   WRITE SCHED1.REC TO F.SCHEDULES, SCHED1.ID
+   WRITE SCHED2.REC TO F.SCHEDULES, SCHED2.ID
+
+   * Notify both employees
+   GOSUB SEND.SHIFT.SWAP.NOTIFICATION
+
+   LOG.MSG = 'Shift swapped: ' : EMP1.ID : ' <-> ' : EMP2.ID
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Recalculate Weekly Hours 1
+**************************************************************************
+RECALC.WEEKLY.HOURS.1:
+   TOTAL.1 = 0
+   FOR I = 1 TO 7
+      HOURS = SCHED1.REC<13, I>
+      IF HOURS # '' THEN TOTAL.1 += HOURS
+   NEXT I
+   SCHED1.REC<20> = TOTAL.1
+   RETURN
+
+**************************************************************************
+* Recalculate Weekly Hours 2
+**************************************************************************
+RECALC.WEEKLY.HOURS.2:
+   TOTAL.2 = 0
+   FOR I = 1 TO 7
+      HOURS = SCHED2.REC<13, I>
+      IF HOURS # '' THEN TOTAL.2 += HOURS
+   NEXT I
+   SCHED2.REC<20> = TOTAL.2
+   RETURN
+
+**************************************************************************
+* Request Time Off
+**************************************************************************
+REQUEST.TIME.OFF:
+   * SCHEDULE.DATA format:
+   * <1> = Employee ID
+   * <2> = Start date
+   * <3> = End date
+   * <4> = Reason (PTO, SICK, UNPAID, etc.)
+   * <5> = Notes
+
+   OPEN 'TIME.OFF.REQUESTS' TO F.TIME.OFF ELSE
+      EXECUTE 'CREATE.FILE TIME.OFF.REQUESTS 1 101'
+      OPEN 'TIME.OFF.REQUESTS' TO F.TIME.OFF ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open time off requests file'
+         RETURN
+      END
+   END
+
+   EMP.ID = SCHEDULE.DATA<1>
+   START.DATE = SCHEDULE.DATA<2>
+   END.DATE = SCHEDULE.DATA<3>
+   REASON = SCHEDULE.DATA<4>
+   NOTES = SCHEDULE.DATA<5>
+
+   * Validate employee
+   READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Employee not found'
+      RETURN
+   END
+
+   * Validate dates
+   IF END.DATE < START.DATE THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'End date must be after start date'
+      RETURN
+   END
+
+   * Check PTO balance if PTO request
+   IF REASON = 'PTO' THEN
+      GOSUB CHECK.PTO.BALANCE
+      IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+   END
+
+   * Create time off request
+   REQUEST.ID = EMP.ID : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   REQUEST.REC = ''
+   REQUEST.REC<1> = EMP.ID
+   REQUEST.REC<2> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   REQUEST.REC<3> = START.DATE
+   REQUEST.REC<4> = END.DATE
+   REQUEST.REC<5> = REASON
+   REQUEST.REC<6> = NOTES
+   REQUEST.REC<7> = 'PENDING'
+   REQUEST.REC<8> = SYSTEM.DATE
+   REQUEST.REC<9> = ''  ; Approved by
+   REQUEST.REC<10> = ''  ; Approved date
+   REQUEST.REC<11> = EMP.REC<SUPERVISOR.ID>
+
+   WRITE REQUEST.REC TO F.TIME.OFF, REQUEST.ID
+
+   * Send notification to supervisor
+   GOSUB SEND.TIME.OFF.REQUEST.NOTIFICATION
+
+   * Return request ID in SCHEDULE.DATA
+   SCHEDULE.DATA<10> = REQUEST.ID
+
+   LOG.MSG = 'Time off requested: ' : REQUEST.ID
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Check PTO Balance
+**************************************************************************
+CHECK.PTO.BALANCE:
+   * Calculate days requested
+   DAYS.REQUESTED = END.DATE - START.DATE + 1
+
+   * Convert to hours (8 hours per day)
+   HOURS.REQUESTED = DAYS.REQUESTED * 8
+
+   * Check balance
+   PTO.BALANCE = EMP.REC<PTO.BALANCE>
+   IF PTO.BALANCE = '' THEN PTO.BALANCE = 0
+
+   IF HOURS.REQUESTED > PTO.BALANCE THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Insufficient PTO balance (need ' : HOURS.REQUESTED
+      ERROR.MSG := ' hours, have ' : PTO.BALANCE : ' hours)'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Approve Time Off
+**************************************************************************
+APPROVE.TIME.OFF:
+   * SCHEDULE.DATA format:
+   * <1> = Request ID
+   * <2> = Approved (Y/N)
+   * <3> = Notes
+
+   OPEN 'TIME.OFF.REQUESTS' TO F.TIME.OFF ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Cannot open time off requests file'
+      RETURN
+   END
+
+   REQUEST.ID = SCHEDULE.DATA<1>
+   APPROVED = SCHEDULE.DATA<2>
+   APPROVAL.NOTES = SCHEDULE.DATA<3>
+
+   READU REQUEST.REC FROM F.TIME.OFF, REQUEST.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Time off request not found'
+      RETURN
+   END
+
+   IF REQUEST.REC<7> # 'PENDING' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Request already processed'
+      RELEASE F.TIME.OFF, REQUEST.ID
+      RETURN
+   END
+
+   IF APPROVED = 'Y' THEN
+      REQUEST.REC<7> = 'APPROVED'
+
+      * Update schedules to remove employee from shifts
+      GOSUB UPDATE.SCHEDULES.FOR.TIME.OFF
+   END ELSE
+      REQUEST.REC<7> = 'DENIED'
+   END
+
+   REQUEST.REC<9> = USER.ID
+   REQUEST.REC<10> = SYSTEM.DATE
+   REQUEST.REC<12> = APPROVAL.NOTES
+
+   WRITE REQUEST.REC TO F.TIME.OFF, REQUEST.ID
+
+   * Send notification to employee
+   GOSUB SEND.TIME.OFF.APPROVAL.NOTIFICATION
+
+   LOG.MSG = 'Time off request ' : REQUEST.REC<7> : ': ' : REQUEST.ID
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Update Schedules for Time Off
+**************************************************************************
+UPDATE.SCHEDULES.FOR.TIME.OFF:
+   EMP.ID = REQUEST.REC<1>
+   START.DATE = REQUEST.REC<3>
+   END.DATE = REQUEST.REC<4>
+
+   CURRENT.DATE = START.DATE
+
+   LOOP WHILE CURRENT.DATE <= END.DATE
+      * Find week start for this date
+      WEEK.START = CURRENT.DATE - MOD(CURRENT.DATE, 7)
+      SCHED.ID = EMP.ID : '*' : WEEK.START
+
+      READU SCHED.REC FROM F.SCHEDULES, SCHED.ID ELSE
+         CURRENT.DATE += 1
+         CONTINUE
+      END
+
+      * Get day of week
+      DAY.NUM = MOD(CURRENT.DATE, 7) + 1
+
+      * Clear shift for this day
+      SCHED.REC<10, DAY.NUM> = ''
+      SCHED.REC<11, DAY.NUM> = ''
+      SCHED.REC<12, DAY.NUM> = 'TIME OFF'
+      SCHED.REC<13, DAY.NUM> = 0
+
+      WRITE SCHED.REC TO F.SCHEDULES, SCHED.ID
+
+      CURRENT.DATE += 1
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Generate Weekly Schedule
+**************************************************************************
+GENERATE.WEEKLY.SCHEDULE:
+   * Auto-generate schedule for all employees based on availability
+   * SCHEDULE.DATA format:
+   * <1> = Store ID
+   * <2> = Week start date
+   * <3> = Department (optional)
+
+   STORE.ID = SCHEDULE.DATA<1>
+   WEEK.START = SCHEDULE.DATA<2>
+   DEPT.FILTER = SCHEDULE.DATA<3>
+
+   * Get all active employees for store
+   SELECT.CMD = 'SELECT EMPLOYEES WITH PRIMARY.STORE = "' : STORE.ID : '"'
+   SELECT.CMD := ' AND WITH STATUS = "ACTIVE"'
+
+   IF DEPT.FILTER # '' THEN
+      SELECT.CMD := ' AND WITH DEPARTMENT = "' : DEPT.FILTER : '"'
+   END
+
+   EXECUTE SELECT.CMD
+
+   SCHEDULES.CREATED = 0
+
+   LOOP
+      READNEXT EMP.ID ELSE EXIT
+
+      READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE CONTINUE
+
+      * Check if schedule already exists
+      SCHED.ID = EMP.ID : '*' : WEEK.START
+      READ EXISTING FROM F.SCHEDULES, SCHED.ID THEN
+         CONTINUE
+      END
+
+      * Auto-assign shifts based on availability and position
+      GOSUB AUTO.ASSIGN.SHIFTS
+
+      IF ASSIGNED.HOURS > 0 THEN
+         SCHEDULES.CREATED += 1
+      END
+   REPEAT
+
+   SCHEDULE.DATA<10> = SCHEDULES.CREATED
+
+   LOG.MSG = 'Generated ' : SCHEDULES.CREATED : ' schedules for week ' : WEEK.START
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Auto Assign Shifts
+**************************************************************************
+AUTO.ASSIGN.SHIFTS:
+   * Simple auto-assignment logic
+   * Full-time: 5 days, 8 hours each
+   * Part-time: 3 days, 6 hours each
+
+   AUTO.SCHED.REC = ''
+   AUTO.SCHED.REC<1> = WEEK.START
+   AUTO.SCHED.REC<2> = EMP.ID
+   AUTO.SCHED.REC<3> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   AUTO.SCHED.REC<4> = STORE.ID
+   AUTO.SCHED.REC<5> = EMP.REC<POSITION>
+   AUTO.SCHED.REC<6> = EMP.REC<DEPARTMENT>
+
+   ASSIGNED.HOURS = 0
+
+   * Determine if full-time or part-time
+   IF EMP.REC<PAY.TYPE> = 'SALARY' THEN
+      DAYS.TO.SCHEDULE = 5
+      HOURS.PER.DAY = 8
+   END ELSE
+      DAYS.TO.SCHEDULE = 3
+      HOURS.PER.DAY = 6
+   END
+
+   * Assign shifts (skipping Sunday)
+   DAY.COUNT = 0
+   FOR DAY = 2 TO 7
+      IF DAY.COUNT >= DAYS.TO.SCHEDULE THEN EXIT
+
+      START.TIME = 9 * 3600  ; 9 AM
+      END.TIME = START.TIME + (HOURS.PER.DAY * 3600)
+
+      AUTO.SCHED.REC<10, DAY> = START.TIME
+      AUTO.SCHED.REC<11, DAY> = END.TIME
+      AUTO.SCHED.REC<12, DAY> = EMP.REC<POSITION>
+      AUTO.SCHED.REC<13, DAY> = HOURS.PER.DAY
+
+      ASSIGNED.HOURS += HOURS.PER.DAY
+      DAY.COUNT += 1
+   NEXT DAY
+
+   AUTO.SCHED.REC<20> = ASSIGNED.HOURS
+   AUTO.SCHED.REC<25> = 'ACTIVE'
+   AUTO.SCHED.REC<26> = SYSTEM.DATE
+   AUTO.SCHED.REC<27> = 'AUTO-GENERATED'
+
+   SCHED.ID = EMP.ID : '*' : WEEK.START
+   WRITE AUTO.SCHED.REC TO F.SCHEDULES, SCHED.ID
+   RETURN
+
+**************************************************************************
+* Check Coverage
+**************************************************************************
+CHECK.COVERAGE:
+   * Check if store has adequate staffing coverage
+   * SCHEDULE.DATA format:
+   * <1> = Store ID
+   * <2> = Week start
+   * <3> = Department
+
+   STORE.ID = SCHEDULE.DATA<1>
+   WEEK.START = SCHEDULE.DATA<2>
+   DEPARTMENT = SCHEDULE.DATA<3>
+
+   * Initialize coverage matrix (7 days x 24 hours)
+   MAT COVERAGE = ''
+
+   * Count employees scheduled for each hour
+   SELECT.CMD = 'SELECT SCHEDULES WITH STORE.ID = "' : STORE.ID : '"'
+   SELECT.CMD := ' AND WITH WEEK.START = "' : WEEK.START : '"'
+
+   IF DEPARTMENT # '' THEN
+      SELECT.CMD := ' AND WITH DEPARTMENT = "' : DEPARTMENT : '"'
+   END
+
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT SCHED.ID ELSE EXIT
+
+      READ SCHED.REC FROM F.SCHEDULES, SCHED.ID ELSE CONTINUE
+
+      * Count coverage for each day/hour
+      FOR DAY = 1 TO 7
+         START.TIME = SCHED.REC<10, DAY>
+         END.TIME = SCHED.REC<11, DAY>
+
+         IF START.TIME = '' THEN CONTINUE
+
+         START.HOUR = INT(START.TIME / 3600)
+         END.HOUR = INT(END.TIME / 3600)
+
+         FOR HOUR = START.HOUR TO END.HOUR
+            COVERAGE(DAY, HOUR) += 1
+         NEXT HOUR
+      NEXT DAY
+   REPEAT
+
+   * Check for understaffed periods
+   UNDERSTAFFED.PERIODS = 0
+
+   FOR DAY = 1 TO 7
+      FOR HOUR = 8 TO 22  ; Store hours 8 AM to 10 PM
+         IF COVERAGE(DAY, HOUR) < 2 THEN  ; Minimum 2 employees
+            UNDERSTAFFED.PERIODS += 1
+         END
+      NEXT HOUR
+   NEXT DAY
+
+   SCHEDULE.DATA<10> = UNDERSTAFFED.PERIODS
+   RETURN
+
+**************************************************************************
+* Send Schedule Notification
+**************************************************************************
+SEND.SCHEDULE.NOTIFICATION:
+   IF EMP.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'SCHEDULE*' : SCHEDULE.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = EMP.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Your Schedule for Week of ' : OCONV(WEEK.START, 'D4/')
+   EMAIL.REC<3> = 'Your schedule has been created.' : AM
+   EMAIL.REC<3> := 'Total hours: ' : TOTAL.WEEKLY.HOURS
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Schedule Update Notification
+**************************************************************************
+SEND.SCHEDULE.UPDATE.NOTIFICATION:
+   READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE RETURN
+
+   IF EMP.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'SCHEDULE.UPDATE*' : SCHEDULE.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = EMP.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Schedule Updated'
+   EMAIL.REC<3> = 'Your schedule has been updated. Please review.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Shift Swap Notification
+**************************************************************************
+SEND.SHIFT.SWAP.NOTIFICATION:
+   * Notify both employees about the swap
+   READ EMP1.REC FROM F.EMPLOYEES, EMP1.ID ELSE RETURN
+   READ EMP2.REC FROM F.EMPLOYEES, EMP2.ID ELSE RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   * Email to employee 1
+   IF EMP1.REC<EMP.EMAIL> # '' THEN
+      EMAIL.ID = 'SWAP*' : EMP1.ID : '*' : SYSTEM.DATE
+      EMAIL.REC = ''
+      EMAIL.REC<1> = EMP1.REC<EMP.EMAIL>
+      EMAIL.REC<2> = 'Shift Swap Confirmed'
+      EMAIL.REC<3> = 'Your shift has been swapped. Please review your updated schedule.'
+      EMAIL.REC<4> = 'PENDING'
+      WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   END
+
+   * Email to employee 2
+   IF EMP2.REC<EMP.EMAIL> # '' THEN
+      EMAIL.ID = 'SWAP*' : EMP2.ID : '*' : SYSTEM.DATE
+      EMAIL.REC = ''
+      EMAIL.REC<1> = EMP2.REC<EMP.EMAIL>
+      EMAIL.REC<2> = 'Shift Swap Confirmed'
+      EMAIL.REC<3> = 'Your shift has been swapped. Please review your updated schedule.'
+      EMAIL.REC<4> = 'PENDING'
+      WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   END
+   RETURN
+
+**************************************************************************
+* Send Time Off Request Notification
+**************************************************************************
+SEND.TIME.OFF.REQUEST.NOTIFICATION:
+   IF EMP.REC<SUPERVISOR.ID> = '' THEN RETURN
+
+   READ SUPER.REC FROM F.EMPLOYEES, EMP.REC<SUPERVISOR.ID> ELSE RETURN
+
+   IF SUPER.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'TIMEOFF.REQUEST*' : REQUEST.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = SUPER.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Time Off Request - Approval Needed'
+   EMAIL.REC<3> = EMP.REC<FIRST.NAME> : ' ' : EMP.REC<LAST.NAME>
+   EMAIL.REC<3> := ' has requested time off.' : AM
+   EMAIL.REC<3> := 'Dates: ' : OCONV(START.DATE, 'D4/') : ' - ' : OCONV(END.DATE, 'D4/')
+   EMAIL.REC<3> := AM : 'Reason: ' : REASON
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+**************************************************************************
+* Send Time Off Approval Notification
+**************************************************************************
+SEND.TIME.OFF.APPROVAL.NOTIFICATION:
+   EMP.ID = REQUEST.REC<1>
+
+   READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE RETURN
+
+   IF EMP.REC<EMP.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'TIMEOFF.APPROVAL*' : REQUEST.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = EMP.REC<EMP.EMAIL>
+   EMAIL.REC<2> = 'Time Off Request ' : REQUEST.REC<7>
+   EMAIL.REC<3> = 'Your time off request has been ' : REQUEST.REC<7> : '.'
+   IF APPROVAL.NOTES # '' THEN
+      EMAIL.REC<3> := AM : 'Notes: ' : APPROVAL.NOTES
+   END
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

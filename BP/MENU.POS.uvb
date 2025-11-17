@@ -1,0 +1,592 @@
+SUBROUTINE MENU.POS()
+**************************************************************************
+* Program: MENU.POS
+* Purpose: Point of Sale Menu
+* Description: POS transaction menu with sales processing options
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize menu
+GOSUB INITIALIZE.MENU
+
+* POS menu loop
+LOOP
+   * Display menu
+   GOSUB DISPLAY.POS.MENU
+
+   * Get user selection
+   GOSUB GET.USER.SELECTION
+
+   * Process selection
+   GOSUB PROCESS.SELECTION
+
+   * Check if return requested
+   IF RETURN.REQUESTED = 'Y' THEN EXIT
+REPEAT
+
+RETURN
+
+**************************************************************************
+* Initialize Menu
+**************************************************************************
+INITIALIZE.MENU:
+   RETURN.REQUESTED = 'N'
+   CURRENT.TRANS.ID = ''
+   RETURN
+
+**************************************************************************
+* Display POS Menu
+**************************************************************************
+DISPLAY.POS.MENU:
+   CRT @(-1)  ; Clear screen
+
+   * Header
+   CRT ''
+   CRT '========================================='
+   CRT '          POINT OF SALE MENU            '
+   CRT '========================================='
+   CRT ''
+   CRT 'Store: ' : STORE.ID
+   CRT 'Cashier: ' : USER.ID
+   CRT 'Date: ' : OCONV(SYSTEM.DATE, 'D4/') : '  Time: ' : OCONV(SYSTEM.TIME, 'MTS')
+   CRT ''
+   CRT '-----------------------------------------'
+   CRT 'TRANSACTION MENU'
+   CRT '-----------------------------------------'
+   CRT ''
+   CRT '1. Start New Transaction'
+   CRT '2. Add Items to Transaction'
+   CRT '3. Process Payment'
+   CRT '4. Complete Transaction'
+   CRT ''
+   CRT '5. Return Items'
+   CRT '6. Void Transaction'
+   CRT '7. Exchange Items'
+   CRT ''
+   CRT '8. Transaction Lookup'
+   CRT '9. Daily Sales Summary'
+   CRT ''
+   CRT 'R. Return to Main Menu'
+   CRT ''
+   CRT '========================================='
+   CRT ''
+
+   IF CURRENT.TRANS.ID # '' THEN
+      CRT 'Current Transaction: ' : CURRENT.TRANS.ID
+      CRT ''
+   END
+   RETURN
+
+**************************************************************************
+* Get User Selection
+**************************************************************************
+GET.USER.SELECTION:
+   INPUT.PROMPT = 'Enter selection: '
+   CRT INPUT.PROMPT:
+   INPUT USER.SELECTION
+
+   USER.SELECTION = TRIM(USER.SELECTION)
+   USER.SELECTION = UPCASE(USER.SELECTION)
+   RETURN
+
+**************************************************************************
+* Process Selection
+**************************************************************************
+PROCESS.SELECTION:
+   BEGIN CASE
+      CASE USER.SELECTION = '1'
+         GOSUB START.NEW.TRANSACTION
+
+      CASE USER.SELECTION = '2'
+         GOSUB ADD.ITEMS
+
+      CASE USER.SELECTION = '3'
+         GOSUB PROCESS.PAYMENT
+
+      CASE USER.SELECTION = '4'
+         GOSUB COMPLETE.TRANSACTION
+
+      CASE USER.SELECTION = '5'
+         GOSUB RETURN.ITEMS
+
+      CASE USER.SELECTION = '6'
+         GOSUB VOID.TRANSACTION
+
+      CASE USER.SELECTION = '7'
+         GOSUB EXCHANGE.ITEMS
+
+      CASE USER.SELECTION = '8'
+         GOSUB TRANSACTION.LOOKUP
+
+      CASE USER.SELECTION = '9'
+         GOSUB DAILY.SUMMARY
+
+      CASE USER.SELECTION = 'R'
+         RETURN.REQUESTED = 'Y'
+
+      CASE 1
+         CRT ''
+         CRT 'Invalid selection. Please try again.'
+         CRT ''
+         GOSUB PAUSE
+   END CASE
+   RETURN
+
+**************************************************************************
+* Start New Transaction
+**************************************************************************
+START.NEW.TRANSACTION:
+   CRT ''
+   CRT '--- Start New Transaction ---'
+   CRT ''
+
+   * Get customer ID (optional)
+   CRT 'Customer ID (or ENTER to skip): ':
+   INPUT CUST.ID
+   CUST.ID = TRIM(CUST.ID)
+
+   * Call POS.START
+   CALL POS.START(CUST.ID, TRANS.ID, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CURRENT.TRANS.ID = TRANS.ID
+      CRT ''
+      CRT 'Transaction started: ' : TRANS.ID
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Add Items
+**************************************************************************
+ADD.ITEMS:
+   IF CURRENT.TRANS.ID = '' THEN
+      CRT ''
+      CRT 'No active transaction. Please start a new transaction first.'
+      CRT ''
+      GOSUB PAUSE
+      RETURN
+   END
+
+   CRT ''
+   CRT '--- Add Items to Transaction ---'
+   CRT 'Transaction: ' : CURRENT.TRANS.ID
+   CRT ''
+
+   LOOP
+      CRT 'Item ID (or ENTER to finish): ':
+      INPUT ITEM.ID
+      ITEM.ID = TRIM(ITEM.ID)
+
+      IF ITEM.ID = '' THEN EXIT
+
+      CRT 'Quantity: ':
+      INPUT ITEM.QTY
+      ITEM.QTY = TRIM(ITEM.QTY)
+
+      IF NOT(NUM(ITEM.QTY)) OR ITEM.QTY <= 0 THEN
+         CRT 'Invalid quantity'
+         CONTINUE
+      END
+
+      * Call POS.ADD.ITEM
+      CALL POS.ADD.ITEM(CURRENT.TRANS.ID, ITEM.ID, ITEM.QTY, ERROR.CODE, ERROR.MSG)
+
+      IF ERROR.CODE = ERR.SUCCESS THEN
+         CRT 'Item added successfully'
+         CRT ''
+      END ELSE
+         CRT 'Error: ' : ERROR.MSG
+         CRT ''
+      END
+   REPEAT
+
+   RETURN
+
+**************************************************************************
+* Process Payment
+**************************************************************************
+PROCESS.PAYMENT:
+   IF CURRENT.TRANS.ID = '' THEN
+      CRT ''
+      CRT 'No active transaction. Please start a new transaction first.'
+      CRT ''
+      GOSUB PAUSE
+      RETURN
+   END
+
+   CRT ''
+   CRT '--- Process Payment ---'
+   CRT 'Transaction: ' : CURRENT.TRANS.ID
+   CRT ''
+
+   * Calculate total first
+   CALL POS.CALCULATE(CURRENT.TRANS.ID, TRANS.TOTALS, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE # ERR.SUCCESS THEN
+      CRT 'Error calculating total: ' : ERROR.MSG
+      CRT ''
+      GOSUB PAUSE
+      RETURN
+   END
+
+   * Display totals
+   SUBTOTAL = TRANS.TOTALS<1>
+   TAX = TRANS.TOTALS<2>
+   TOTAL = TRANS.TOTALS<3>
+
+   CRT 'Subtotal: $' : SUBTOTAL
+   CRT 'Tax: $' : TAX
+   CRT 'Total: $' : TOTAL
+   CRT ''
+
+   * Get payment type
+   CRT 'Payment Type:'
+   CRT '  1. Cash'
+   CRT '  2. Credit Card'
+   CRT '  3. Debit Card'
+   CRT '  4. Gift Card'
+   CRT ''
+   CRT 'Select payment type: ':
+   INPUT PAYMENT.TYPE
+
+   BEGIN CASE
+      CASE PAYMENT.TYPE = '1'
+         PAYMENT.TYPE = 'CASH'
+      CASE PAYMENT.TYPE = '2'
+         PAYMENT.TYPE = 'CREDIT'
+      CASE PAYMENT.TYPE = '3'
+         PAYMENT.TYPE = 'DEBIT'
+      CASE PAYMENT.TYPE = '4'
+         PAYMENT.TYPE = 'GIFT.CARD'
+      CASE 1
+         CRT 'Invalid payment type'
+         GOSUB PAUSE
+         RETURN
+   END CASE
+
+   CRT 'Payment amount: ':
+   INPUT PAYMENT.AMT
+
+   * Call POS.PAYMENT
+   CALL POS.PAYMENT(CURRENT.TRANS.ID, PAYMENT.TYPE, PAYMENT.AMT, PAYMENT.INFO, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Payment processed successfully'
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Complete Transaction
+**************************************************************************
+COMPLETE.TRANSACTION:
+   IF CURRENT.TRANS.ID = '' THEN
+      CRT ''
+      CRT 'No active transaction to complete.'
+      CRT ''
+      GOSUB PAUSE
+      RETURN
+   END
+
+   CRT ''
+   CRT '--- Complete Transaction ---'
+   CRT 'Transaction: ' : CURRENT.TRANS.ID
+   CRT ''
+
+   * Call POS.COMPLETE
+   CALL POS.COMPLETE(CURRENT.TRANS.ID, RECEIPT.TEXT, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Transaction completed successfully!'
+      CRT ''
+      CRT '========================================='
+      CRT '             RECEIPT                    '
+      CRT '========================================='
+
+      * Display receipt
+      RECEIPT.LINES = DCOUNT(RECEIPT.TEXT, AM)
+      FOR I = 1 TO RECEIPT.LINES
+         CRT RECEIPT.TEXT<I>
+      NEXT I
+
+      CRT ''
+      CURRENT.TRANS.ID = ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Return Items
+**************************************************************************
+RETURN.ITEMS:
+   CRT ''
+   CRT '--- Return Items ---'
+   CRT ''
+
+   CRT 'Original Transaction ID: ':
+   INPUT ORIGINAL.TRANS.ID
+   ORIGINAL.TRANS.ID = TRIM(ORIGINAL.TRANS.ID)
+
+   IF ORIGINAL.TRANS.ID = '' THEN RETURN
+
+   CRT ''
+   CRT 'Enter items to return (Item ID^Quantity^Reason):'
+   CRT 'Reasons: DEFECTIVE, WRONG.SIZE, CHANGED.MIND, etc.'
+   CRT ''
+
+   RETURN.ITEMS = ''
+   LOOP
+      CRT 'Item (or ENTER to finish): ':
+      INPUT ITEM.SPEC
+      ITEM.SPEC = TRIM(ITEM.SPEC)
+
+      IF ITEM.SPEC = '' THEN EXIT
+
+      RETURN.ITEMS<1, -1> = ITEM.SPEC
+   REPEAT
+
+   IF RETURN.ITEMS = '' THEN RETURN
+
+   * Get refund method
+   CRT ''
+   CRT 'Refund Method:'
+   CRT '  1. Original Payment'
+   CRT '  2. Store Credit'
+   CRT '  3. Cash'
+   CRT ''
+   CRT 'Select refund method: ':
+   INPUT REFUND.METHOD
+
+   * Call POS.RETURN
+   CALL POS.RETURN(ORIGINAL.TRANS.ID, RETURN.ITEMS, REFUND.METHOD, RETURN.REC, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Return processed successfully'
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Void Transaction
+**************************************************************************
+VOID.TRANSACTION:
+   CRT ''
+   CRT '--- Void Transaction ---'
+   CRT ''
+
+   CRT 'Transaction ID to void: ':
+   INPUT VOID.TRANS.ID
+   VOID.TRANS.ID = TRIM(VOID.TRANS.ID)
+
+   IF VOID.TRANS.ID = '' THEN RETURN
+
+   CRT 'Void Reason:'
+   CRT '  1. Cashier Error'
+   CRT '  2. Customer Request'
+   CRT '  3. Duplicate'
+   CRT '  4. System Error'
+   CRT ''
+   CRT 'Select reason: ':
+   INPUT REASON.CHOICE
+
+   BEGIN CASE
+      CASE REASON.CHOICE = '1'
+         VOID.REASON = 'CASHIER.ERROR'
+      CASE REASON.CHOICE = '2'
+         VOID.REASON = 'CUSTOMER.REQUEST'
+      CASE REASON.CHOICE = '3'
+         VOID.REASON = 'DUPLICATE'
+      CASE REASON.CHOICE = '4'
+         VOID.REASON = 'SYSTEM.ERROR'
+      CASE 1
+         CRT 'Invalid reason'
+         GOSUB PAUSE
+         RETURN
+   END CASE
+
+   * Call POS.VOID
+   CALL POS.VOID(VOID.TRANS.ID, VOID.REASON, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Transaction voided successfully'
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Exchange Items
+**************************************************************************
+EXCHANGE.ITEMS:
+   CRT ''
+   CRT '--- Exchange Items ---'
+   CRT ''
+
+   CRT 'Original Transaction ID: ':
+   INPUT ORIGINAL.TRANS.ID
+   ORIGINAL.TRANS.ID = TRIM(ORIGINAL.TRANS.ID)
+
+   IF ORIGINAL.TRANS.ID = '' THEN RETURN
+
+   CRT ''
+   CRT 'Items to return (Item ID^Quantity^Reason):'
+   RETURN.ITEMS = ''
+   LOOP
+      CRT 'Return item (or ENTER to finish): ':
+      INPUT ITEM.SPEC
+      ITEM.SPEC = TRIM(ITEM.SPEC)
+
+      IF ITEM.SPEC = '' THEN EXIT
+
+      RETURN.ITEMS<1, -1> = ITEM.SPEC
+   REPEAT
+
+   CRT ''
+   CRT 'New items to purchase (Item ID^Quantity):'
+   NEW.ITEMS = ''
+   LOOP
+      CRT 'New item (or ENTER to finish): ':
+      INPUT ITEM.SPEC
+      ITEM.SPEC = TRIM(ITEM.SPEC)
+
+      IF ITEM.SPEC = '' THEN EXIT
+
+      NEW.ITEMS<1, -1> = ITEM.SPEC
+   REPEAT
+
+   IF RETURN.ITEMS = '' OR NEW.ITEMS = '' THEN
+      CRT 'Both return and new items required for exchange'
+      GOSUB PAUSE
+      RETURN
+   END
+
+   * Call POS.EXCHANGE
+   CALL POS.EXCHANGE(ORIGINAL.TRANS.ID, RETURN.ITEMS, NEW.ITEMS, EXCHANGE.REC, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      CRT ''
+      CRT 'Exchange processed successfully'
+      CRT ''
+   END ELSE
+      CRT ''
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Transaction Lookup
+**************************************************************************
+TRANSACTION.LOOKUP:
+   CRT ''
+   CRT '--- Transaction Lookup ---'
+   CRT ''
+
+   CRT 'Transaction ID: ':
+   INPUT LOOKUP.TRANS.ID
+   LOOKUP.TRANS.ID = TRIM(LOOKUP.TRANS.ID)
+
+   IF LOOKUP.TRANS.ID = '' THEN RETURN
+
+   READ TRANS.REC FROM F.POS.TRANS, LOOKUP.TRANS.ID ELSE
+      CRT ''
+      CRT 'Transaction not found'
+      CRT ''
+      GOSUB PAUSE
+      RETURN
+   END
+
+   * Display transaction details
+   CRT ''
+   CRT '========================================='
+   CRT 'Transaction: ' : LOOKUP.TRANS.ID
+   CRT '========================================='
+   CRT 'Date: ' : OCONV(TRANS.REC<TRANS.DATE>, 'D4/')
+   CRT 'Time: ' : OCONV(TRANS.REC<TRANS.TIME>, 'MTS')
+   CRT 'Store: ' : TRANS.REC<STORE.ID>
+   CRT 'Cashier: ' : TRANS.REC<CASHIER.ID>
+   CRT 'Customer: ' : TRANS.REC<CUSTOMER.ID>
+   CRT 'Status: ' : TRANS.REC<STATUS>
+   CRT ''
+   CRT 'Subtotal: $' : TRANS.REC<SUBTOTAL>
+   CRT 'Tax: $' : TRANS.REC<TAX>
+   CRT 'Total: $' : TRANS.REC<TOTAL>
+   CRT ''
+   CRT 'Payment Type: ' : TRANS.REC<PAYMENT.TYPE>
+   CRT '========================================='
+   CRT ''
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Daily Summary
+**************************************************************************
+DAILY.SUMMARY:
+   CRT ''
+   CRT '--- Daily Sales Summary ---'
+   CRT ''
+
+   * Call daily sales report
+   CALL RPT.SALES.DAILY(SYSTEM.DATE, SYSTEM.DATE, STORE.ID, REPORT.REC, ERROR.CODE, ERROR.MSG)
+
+   IF ERROR.CODE = ERR.SUCCESS THEN
+      * Display report
+      REPORT.LINES = DCOUNT(REPORT.REC, AM)
+      FOR I = 1 TO REPORT.LINES
+         CRT REPORT.REC<I>
+      NEXT I
+      CRT ''
+   END ELSE
+      CRT 'Error: ' : ERROR.MSG
+      CRT ''
+   END
+
+   GOSUB PAUSE
+   RETURN
+
+**************************************************************************
+* Pause
+**************************************************************************
+PAUSE:
+   CRT 'Press ENTER to continue...':
+   INPUT DUMMY
+   RETURN
+
+END

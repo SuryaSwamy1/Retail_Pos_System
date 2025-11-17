@@ -1,0 +1,409 @@
+SUBROUTINE VENDOR.PERFORMANCE(VENDOR.ID, START.DATE, END.DATE, PERFORMANCE.REC, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: VENDOR.PERFORMANCE
+* Purpose: Calculate Vendor Performance Metrics
+* Parameters:
+*   VENDOR.ID (IN) - Vendor ID to analyze
+*   START.DATE (IN) - Start date for analysis
+*   END.DATE (IN) - End date for analysis
+*   PERFORMANCE.REC (OUT) - Performance metrics
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+PERFORMANCE.REC = ''
+
+* Validate vendor ID
+IF VENDOR.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Vendor ID is required'
+   RETURN
+END
+
+* Read vendor record
+READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Vendor not found'
+   RETURN
+END
+
+* Default date range if not provided
+IF START.DATE = '' THEN START.DATE = SYSTEM.DATE - 90
+IF END.DATE = '' THEN END.DATE = SYSTEM.DATE
+
+* Initialize metrics
+GOSUB INITIALIZE.METRICS
+
+* Calculate purchase metrics
+GOSUB CALCULATE.PURCHASE.METRICS
+
+* Calculate delivery performance
+GOSUB CALCULATE.DELIVERY.PERFORMANCE
+
+* Calculate quality metrics
+GOSUB CALCULATE.QUALITY.METRICS
+
+* Calculate cost competitiveness
+GOSUB CALCULATE.COST.METRICS
+
+* Calculate overall rating
+GOSUB CALCULATE.OVERALL.RATING
+
+* Build performance record
+GOSUB BUILD.PERFORMANCE.RECORD
+
+RETURN
+
+**************************************************************************
+* Initialize Metrics
+**************************************************************************
+INITIALIZE.METRICS:
+   * Purchase metrics
+   TOTAL.POS = 0
+   TOTAL.PO.AMT = 0
+   TOTAL.ITEMS.ORDERED = 0
+   TOTAL.ITEMS.RECEIVED = 0
+
+   * Delivery metrics
+   ON.TIME.DELIVERIES = 0
+   LATE.DELIVERIES = 0
+   EARLY.DELIVERIES = 0
+   AVG.LEAD.TIME = 0
+
+   * Quality metrics
+   ITEMS.REJECTED = 0
+   ITEMS.ACCEPTED = 0
+   DEFECT.RATE = 0
+
+   * Cost metrics
+   AVG.COST.VARIANCE = 0
+   RETURN
+
+**************************************************************************
+* Calculate Purchase Metrics
+**************************************************************************
+CALCULATE.PURCHASE.METRICS:
+   * Find all POs for vendor in date range
+   SELECT.CMD = 'SELECT PURCHASE.ORDERS WITH VENDOR.ID = "' : VENDOR.ID : '"'
+   SELECT.CMD := ' AND WITH PO.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH PO.DATE <= "' : END.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT PO.ID ELSE EXIT
+
+      READ PO.REC FROM F.PURCHASE.ORDERS, PO.ID ELSE CONTINUE
+
+      TOTAL.POS += 1
+
+      * Get PO total
+      PO.TOTAL = PO.REC<PO.TOTAL>
+      IF PO.TOTAL # '' THEN
+         TOTAL.PO.AMT += PO.TOTAL
+      END
+
+      * Count items
+      ITEM.IDS = PO.REC<PO.ITEM.IDS>
+      IF ITEM.IDS # '' THEN
+         ITEM.COUNT = DCOUNT(ITEM.IDS, VM)
+         TOTAL.ITEMS.ORDERED += ITEM.COUNT
+      END
+   REPEAT
+
+   * Calculate average PO amount
+   IF TOTAL.POS > 0 THEN
+      AVG.PO.AMT = TOTAL.PO.AMT / TOTAL.POS
+   END ELSE
+      AVG.PO.AMT = 0
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Delivery Performance
+**************************************************************************
+CALCULATE.DELIVERY.PERFORMANCE:
+   * Analyze receipts against POs
+   SELECT.CMD = 'SELECT RECEIPTS WITH VENDOR.ID = "' : VENDOR.ID : '"'
+   SELECT.CMD := ' AND WITH RECEIPT.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH RECEIPT.DATE <= "' : END.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   TOTAL.LEAD.TIME = 0
+   DELIVERY.COUNT = 0
+
+   LOOP
+      READNEXT RECEIPT.ID ELSE EXIT
+
+      READ RECEIPT.REC FROM F.RECEIPTS, RECEIPT.ID ELSE CONTINUE
+
+      * Get associated PO
+      PO.NUM = RECEIPT.REC<2>
+
+      READ PO.REC FROM F.PURCHASE.ORDERS, PO.NUM ELSE CONTINUE
+
+      * Calculate lead time
+      PO.DATE = PO.REC<PO.DATE>
+      RECEIPT.DATE = RECEIPT.REC<4>
+
+      ACTUAL.LEAD.TIME = RECEIPT.DATE - PO.DATE
+      TOTAL.LEAD.TIME += ACTUAL.LEAD.TIME
+
+      * Get expected lead time
+      EXPECTED.LEAD.TIME = VENDOR.REC<LEAD.TIME.DAYS>
+      IF EXPECTED.LEAD.TIME = '' THEN EXPECTED.LEAD.TIME = 7
+
+      * Check delivery status
+      IF ACTUAL.LEAD.TIME <= EXPECTED.LEAD.TIME THEN
+         ON.TIME.DELIVERIES += 1
+      END ELSE IF ACTUAL.LEAD.TIME < EXPECTED.LEAD.TIME THEN
+         EARLY.DELIVERIES += 1
+      END ELSE
+         LATE.DELIVERIES += 1
+      END
+
+      DELIVERY.COUNT += 1
+
+      * Count received items
+      ITEM.IDS = RECEIPT.REC<10>
+      IF ITEM.IDS # '' THEN
+         ITEM.COUNT = DCOUNT(ITEM.IDS, VM)
+         TOTAL.ITEMS.RECEIVED += ITEM.COUNT
+      END
+   REPEAT
+
+   * Calculate average lead time
+   IF DELIVERY.COUNT > 0 THEN
+      AVG.LEAD.TIME = TOTAL.LEAD.TIME / DELIVERY.COUNT
+   END
+
+   * Calculate on-time delivery percentage
+   TOTAL.DELIVERIES = ON.TIME.DELIVERIES + LATE.DELIVERIES + EARLY.DELIVERIES
+   IF TOTAL.DELIVERIES > 0 THEN
+      ON.TIME.PCT = (ON.TIME.DELIVERIES / TOTAL.DELIVERIES) * 100
+   END ELSE
+      ON.TIME.PCT = 0
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Quality Metrics
+**************************************************************************
+CALCULATE.QUALITY.METRICS:
+   * Check for rejected/returned items
+   SELECT.CMD = 'SELECT RECEIPTS WITH VENDOR.ID = "' : VENDOR.ID : '"'
+   SELECT.CMD := ' AND WITH RECEIPT.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH RECEIPT.DATE <= "' : END.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   TOTAL.QTY.RECEIVED = 0
+   TOTAL.QTY.REJECTED = 0
+
+   LOOP
+      READNEXT RECEIPT.ID ELSE EXIT
+
+      READ RECEIPT.REC FROM F.RECEIPTS, RECEIPT.ID ELSE CONTINUE
+
+      * Get quantities
+      QTY.LIST = RECEIPT.REC<15>
+      REJECTED.LIST = RECEIPT.REC<17>
+
+      IF QTY.LIST # '' THEN
+         QTY.COUNT = DCOUNT(QTY.LIST, VM)
+
+         FOR I = 1 TO QTY.COUNT
+            QTY.AMT = QTY.LIST<1, I>
+            REJECTED.AMT = REJECTED.LIST<1, I>
+
+            IF QTY.AMT # '' THEN
+               TOTAL.QTY.RECEIVED += QTY.AMT
+            END
+
+            IF REJECTED.AMT # '' THEN
+               TOTAL.QTY.REJECTED += REJECTED.AMT
+               ITEMS.REJECTED += 1
+            END ELSE
+               ITEMS.ACCEPTED += 1
+            END
+         NEXT I
+      END
+   REPEAT
+
+   * Calculate defect rate
+   IF TOTAL.QTY.RECEIVED > 0 THEN
+      DEFECT.RATE = (TOTAL.QTY.REJECTED / TOTAL.QTY.RECEIVED) * 100
+   END ELSE
+      DEFECT.RATE = 0
+   END
+
+   * Calculate acceptance rate
+   TOTAL.ITEMS.INSPECTED = ITEMS.ACCEPTED + ITEMS.REJECTED
+   IF TOTAL.ITEMS.INSPECTED > 0 THEN
+      ACCEPTANCE.RATE = (ITEMS.ACCEPTED / TOTAL.ITEMS.INSPECTED) * 100
+   END ELSE
+      ACCEPTANCE.RATE = 100
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Cost Metrics
+**************************************************************************
+CALCULATE.COST.METRICS:
+   * Compare vendor costs to market average
+
+   SELECT.CMD = 'SELECT RECEIPTS WITH VENDOR.ID = "' : VENDOR.ID : '"'
+   SELECT.CMD := ' AND WITH RECEIPT.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH RECEIPT.DATE <= "' : END.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   TOTAL.VARIANCE = 0
+   VARIANCE.COUNT = 0
+
+   LOOP
+      READNEXT RECEIPT.ID ELSE EXIT
+
+      READ RECEIPT.REC FROM F.RECEIPTS, RECEIPT.ID ELSE CONTINUE
+
+      ITEM.IDS = RECEIPT.REC<10>
+      UNIT.COSTS = RECEIPT.REC<14>
+
+      IF ITEM.IDS = '' THEN CONTINUE
+
+      ITEM.COUNT = DCOUNT(ITEM.IDS, VM)
+
+      FOR I = 1 TO ITEM.COUNT
+         ITEM.ID = ITEM.IDS<1, I>
+         ACTUAL.COST = UNIT.COSTS<1, I>
+
+         IF ACTUAL.COST = '' THEN CONTINUE
+
+         * Get item's current cost
+         READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+         CURRENT.COST = ITEM.REC<AVG.COST>
+         IF CURRENT.COST = '' OR CURRENT.COST = 0 THEN CONTINUE
+
+         * Calculate variance
+         COST.VARIANCE = ((ACTUAL.COST - CURRENT.COST) / CURRENT.COST) * 100
+         TOTAL.VARIANCE += COST.VARIANCE
+         VARIANCE.COUNT += 1
+      NEXT I
+   REPEAT
+
+   * Calculate average cost variance
+   IF VARIANCE.COUNT > 0 THEN
+      AVG.COST.VARIANCE = TOTAL.VARIANCE / VARIANCE.COUNT
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Overall Rating
+**************************************************************************
+CALCULATE.OVERALL.RATING:
+   * Weighted rating calculation
+   * 40% - On-time delivery
+   * 30% - Quality (acceptance rate)
+   * 20% - Cost competitiveness
+   * 10% - Responsiveness
+
+   DELIVERY.SCORE = ON.TIME.PCT * 0.4
+   QUALITY.SCORE = ACCEPTANCE.RATE * 0.3
+
+   * Cost score (lower variance is better)
+   IF AVG.COST.VARIANCE <= 0 THEN
+      COST.SCORE = 20  ; Below market cost
+   END ELSE IF AVG.COST.VARIANCE <= 5 THEN
+      COST.SCORE = 15  ; Slightly above market
+   END ELSE
+      COST.SCORE = 10  ; Above market
+   END
+
+   * Responsiveness score (based on lead time)
+   EXPECTED.LEAD = VENDOR.REC<LEAD.TIME.DAYS>
+   IF EXPECTED.LEAD = '' THEN EXPECTED.LEAD = 7
+
+   IF AVG.LEAD.TIME <= EXPECTED.LEAD THEN
+      RESPONSIVE.SCORE = 10
+   END ELSE IF AVG.LEAD.TIME <= (EXPECTED.LEAD * 1.2) THEN
+      RESPONSIVE.SCORE = 7
+   END ELSE
+      RESPONSIVE.SCORE = 5
+   END
+
+   * Overall rating (0-100)
+   OVERALL.RATING = DELIVERY.SCORE + QUALITY.SCORE + COST.SCORE + RESPONSIVE.SCORE
+
+   * Convert to 5-star rating
+   STAR.RATING = (OVERALL.RATING / 100) * 5
+
+   * Rating category
+   BEGIN CASE
+      CASE OVERALL.RATING >= 90
+         RATING.CATEGORY = 'EXCELLENT'
+      CASE OVERALL.RATING >= 80
+         RATING.CATEGORY = 'GOOD'
+      CASE OVERALL.RATING >= 70
+         RATING.CATEGORY = 'FAIR'
+      CASE OVERALL.RATING >= 60
+         RATING.CATEGORY = 'POOR'
+      CASE 1
+         RATING.CATEGORY = 'UNACCEPTABLE'
+   END CASE
+   RETURN
+
+**************************************************************************
+* Build Performance Record
+**************************************************************************
+BUILD.PERFORMANCE.RECORD:
+   PERFORMANCE.REC = ''
+
+   * Header info
+   PERFORMANCE.REC<1> = VENDOR.ID
+   PERFORMANCE.REC<2> = VENDOR.REC<VENDOR.NAME>
+   PERFORMANCE.REC<3> = START.DATE
+   PERFORMANCE.REC<4> = END.DATE
+
+   * Purchase metrics
+   PERFORMANCE.REC<10> = TOTAL.POS
+   PERFORMANCE.REC<11> = TOTAL.PO.AMT
+   PERFORMANCE.REC<12> = AVG.PO.AMT
+   PERFORMANCE.REC<13> = TOTAL.ITEMS.ORDERED
+   PERFORMANCE.REC<14> = TOTAL.ITEMS.RECEIVED
+
+   * Delivery metrics
+   PERFORMANCE.REC<20> = TOTAL.DELIVERIES
+   PERFORMANCE.REC<21> = ON.TIME.DELIVERIES
+   PERFORMANCE.REC<22> = LATE.DELIVERIES
+   PERFORMANCE.REC<23> = EARLY.DELIVERIES
+   PERFORMANCE.REC<24> = ON.TIME.PCT
+   PERFORMANCE.REC<25> = AVG.LEAD.TIME
+
+   * Quality metrics
+   PERFORMANCE.REC<30> = TOTAL.ITEMS.INSPECTED
+   PERFORMANCE.REC<31> = ITEMS.ACCEPTED
+   PERFORMANCE.REC<32> = ITEMS.REJECTED
+   PERFORMANCE.REC<33> = ACCEPTANCE.RATE
+   PERFORMANCE.REC<34> = DEFECT.RATE
+
+   * Cost metrics
+   PERFORMANCE.REC<40> = AVG.COST.VARIANCE
+
+   * Overall rating
+   PERFORMANCE.REC<50> = OVERALL.RATING
+   PERFORMANCE.REC<51> = STAR.RATING
+   PERFORMANCE.REC<52> = RATING.CATEGORY
+
+   * Individual scores
+   PERFORMANCE.REC<53> = DELIVERY.SCORE
+   PERFORMANCE.REC<54> = QUALITY.SCORE
+   PERFORMANCE.REC<55> = COST.SCORE
+   PERFORMANCE.REC<56> = RESPONSIVE.SCORE
+
+   * Analysis date
+   PERFORMANCE.REC<60> = SYSTEM.DATE
+   RETURN
+
+END

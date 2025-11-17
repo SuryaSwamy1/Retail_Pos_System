@@ -1,0 +1,6 @@
+VENDOR001]Tech Solutions Inc]1000 Tech Drive]San Jose]CA]95110]techsales@techsolutions.com](408)555-1000]NET30]ACTIVE]ELECTRONICS
+VENDOR002]Fashion Wholesale Co]2500 Fashion Blvd]New York]NY]10001]orders@fashionwholesale.com](212)555-2000]NET45]ACTIVE]CLOTHING
+VENDOR003]Footwear Distributors]750 Shoe Lane]Portland]OR]97201]sales@footweardist.com](503)555-3000]NET30]ACTIVE]FOOTWEAR
+VENDOR004]Book Publishers Ltd]1200 Library St]Boston]MA]02101]orders@bookpublishers.com](617)555-4000]NET60]ACTIVE]BOOKS
+VENDOR005]Food & Beverage Supply]3000 Market St]Chicago]IL]60601]sales@foodbev.com](312)555-5000]NET15]ACTIVE]FOOD
+VENDOR006]Home Appliance Corp]4500 Industrial Pkwy]Atlanta]GA]30301]orders@homeappliance.com](404)555-6000]NET30]ACTIVE]APPLIANCES

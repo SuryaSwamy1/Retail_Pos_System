@@ -1,0 +1,17 @@
+# Retail POS System - Cron Schedule
+# Edit this file to configure automated batch jobs
+
+# End of Day Process - Daily at 11:00 PM
+0 23 * * * /C:/Users/surya.mukka/Desktop/Cursor/AI-Repos/Unibasic\ AI\ Repo/RETAIL-POS-SYSTEM/BATCH/RUN.EOD.sh
+
+# End of Month Process - Last day of month at 11:30 PM
+30 23 L * * /C:/Users/surya.mukka/Desktop/Cursor/AI-Repos/Unibasic\ AI\ Repo/RETAIL-POS-SYSTEM/BATCH/RUN.EOM.sh
+
+# Reorder Check - Daily at 6:00 AM
+0 6 * * * /C:/Users/surya.mukka/Desktop/Cursor/AI-Repos/Unibasic\ AI\ Repo/RETAIL-POS-SYSTEM/BATCH/RUN.REORDER.sh
+
+# Data Synchronization - Every 2 hours
+0 */2 * * * /C:/Users/surya.mukka/Desktop/Cursor/AI-Repos/Unibasic\ AI\ Repo/RETAIL-POS-SYSTEM/BATCH/RUN.SYNC.sh
+
+# Purge Old Data - Weekly on Sunday at 2:00 AM
+0 2 * * 0 /C:/Users/surya.mukka/Desktop/Cursor/AI-Repos/Unibasic\ AI\ Repo/RETAIL-POS-SYSTEM/BATCH/RUN.PURGE.sh

@@ -1,0 +1,229 @@
+SUBROUTINE MENU.MAIN()
+**************************************************************************
+* Program: MENU.MAIN
+* Purpose: Main Menu System
+* Description: Primary navigation menu for retail POS system
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize menu
+GOSUB INITIALIZE.MENU
+
+* Main menu loop
+LOOP
+   * Display menu
+   GOSUB DISPLAY.MAIN.MENU
+
+   * Get user selection
+   GOSUB GET.USER.SELECTION
+
+   * Process selection
+   GOSUB PROCESS.SELECTION
+
+   * Check if exit requested
+   IF EXIT.REQUESTED = 'Y' THEN EXIT
+REPEAT
+
+RETURN
+
+**************************************************************************
+* Initialize Menu
+**************************************************************************
+INITIALIZE.MENU:
+   EXIT.REQUESTED = 'N'
+   CURRENT.USER = USER.ID
+   CURRENT.STORE = STORE.ID
+
+   * Get user information
+   IF CURRENT.USER # '' THEN
+      READ USER.REC FROM F.EMPLOYEES, CURRENT.USER ELSE
+         USER.NAME = 'Unknown User'
+         USER.LEVEL = 1
+      END
+      USER.NAME = USER.REC<FIRST.NAME> : ' ' : USER.REC<LAST.NAME>
+      USER.LEVEL = USER.REC<SECURITY.LEVEL>
+      IF USER.LEVEL = '' THEN USER.LEVEL = 1
+   END ELSE
+      USER.NAME = 'Guest'
+      USER.LEVEL = 1
+   END
+
+   * Get store information
+   IF CURRENT.STORE # '' THEN
+      READ STORE.REC FROM F.STORES, CURRENT.STORE ELSE
+         STORE.NAME = 'Unknown Store'
+      END
+      STORE.NAME = STORE.REC<STORE.NAME>
+   END ELSE
+      STORE.NAME = 'No Store'
+   END
+   RETURN
+
+**************************************************************************
+* Display Main Menu
+**************************************************************************
+DISPLAY.MAIN.MENU:
+   CRT @(-1)  ; Clear screen
+
+   * Header
+   CRT ''
+   CRT '========================================='
+   CRT '       RETAIL POS SYSTEM MENU           '
+   CRT '========================================='
+   CRT ''
+   CRT 'User: ' : USER.NAME : ' (Level ' : USER.LEVEL : ')'
+   CRT 'Store: ' : STORE.NAME
+   CRT 'Date: ' : OCONV(SYSTEM.DATE, 'D4/') : '  Time: ' : OCONV(SYSTEM.TIME, 'MTS')
+   CRT ''
+   CRT '-----------------------------------------'
+   CRT 'MAIN MENU'
+   CRT '-----------------------------------------'
+   CRT ''
+   CRT '1. Point of Sale (POS)'
+   CRT '2. Inventory Management'
+   CRT '3. Customer Management'
+   CRT '4. Purchase Orders'
+   CRT '5. Employee Management'
+   CRT '6. Reports'
+   CRT '7. Batch Processing'
+   CRT '8. System Administration'
+   CRT ''
+   CRT '9. Loyalty Program'
+   CRT '10. Promotions'
+   CRT '11. Vendor Management'
+   CRT '12. Warehouse Operations'
+   CRT ''
+   CRT 'X. Exit System'
+   CRT ''
+   CRT '========================================='
+   CRT ''
+   RETURN
+
+**************************************************************************
+* Get User Selection
+**************************************************************************
+GET.USER.SELECTION:
+   INPUT.PROMPT = 'Enter selection: '
+   CRT INPUT.PROMPT:
+   INPUT USER.SELECTION
+
+   USER.SELECTION = TRIM(USER.SELECTION)
+   USER.SELECTION = UPCASE(USER.SELECTION)
+   RETURN
+
+**************************************************************************
+* Process Selection
+**************************************************************************
+PROCESS.SELECTION:
+   BEGIN CASE
+      CASE USER.SELECTION = '1'
+         CALL MENU.POS
+
+      CASE USER.SELECTION = '2'
+         CALL MENU.INVENTORY
+
+      CASE USER.SELECTION = '3'
+         CALL MENU.CUSTOMER
+
+      CASE USER.SELECTION = '4'
+         CALL MENU.PURCHASE.ORDERS
+
+      CASE USER.SELECTION = '5'
+         IF USER.LEVEL >= 7 THEN
+            CALL MENU.EMPLOYEE
+         END ELSE
+            CRT ''
+            CRT 'Access Denied: Insufficient privileges'
+            CRT ''
+            GOSUB PAUSE
+         END
+
+      CASE USER.SELECTION = '6'
+         CALL MENU.REPORTS
+
+      CASE USER.SELECTION = '7'
+         IF USER.LEVEL >= 9 THEN
+            CALL MENU.BATCH
+         END ELSE
+            CRT ''
+            CRT 'Access Denied: Insufficient privileges'
+            CRT ''
+            GOSUB PAUSE
+         END
+
+      CASE USER.SELECTION = '8'
+         IF USER.LEVEL >= 10 THEN
+            CALL MENU.ADMIN
+         END ELSE
+            CRT ''
+            CRT 'Access Denied: Administrator privileges required'
+            CRT ''
+            GOSUB PAUSE
+         END
+
+      CASE USER.SELECTION = '9'
+         CALL MENU.LOYALTY
+
+      CASE USER.SELECTION = '10'
+         CALL MENU.PROMOTIONS
+
+      CASE USER.SELECTION = '11'
+         IF USER.LEVEL >= 5 THEN
+            CALL MENU.VENDORS
+         END ELSE
+            CRT ''
+            CRT 'Access Denied: Insufficient privileges'
+            CRT ''
+            GOSUB PAUSE
+         END
+
+      CASE USER.SELECTION = '12'
+         IF USER.LEVEL >= 5 THEN
+            CALL MENU.WAREHOUSE
+         END ELSE
+            CRT ''
+            CRT 'Access Denied: Insufficient privileges'
+            CRT ''
+            GOSUB PAUSE
+         END
+
+      CASE USER.SELECTION = 'X'
+         GOSUB CONFIRM.EXIT
+
+      CASE 1
+         CRT ''
+         CRT 'Invalid selection. Please try again.'
+         CRT ''
+         GOSUB PAUSE
+   END CASE
+   RETURN
+
+**************************************************************************
+* Confirm Exit
+**************************************************************************
+CONFIRM.EXIT:
+   CRT ''
+   CRT 'Are you sure you want to exit? (Y/N): ':
+   INPUT CONFIRM
+
+   CONFIRM = TRIM(CONFIRM)
+   CONFIRM = UPCASE(CONFIRM)
+
+   IF CONFIRM = 'Y' THEN
+      EXIT.REQUESTED = 'Y'
+      CRT ''
+      CRT 'Goodbye!'
+      CRT ''
+   END
+   RETURN
+
+**************************************************************************
+* Pause
+**************************************************************************
+PAUSE:
+   CRT 'Press ENTER to continue...':
+   INPUT DUMMY
+   RETURN
+
+END

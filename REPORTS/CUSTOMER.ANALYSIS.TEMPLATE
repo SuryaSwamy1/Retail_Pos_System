@@ -1,0 +1,80 @@
+================================================================================
+                        RETAIL POS SYSTEM
+                    CUSTOMER ANALYSIS REPORT
+================================================================================
+
+Store ID: [STORE_ID]                           Date: [REPORT_DATE]
+Store Name: [STORE_NAME]                       Period: [PERIOD]
+
+--------------------------------------------------------------------------------
+CUSTOMER SUMMARY
+--------------------------------------------------------------------------------
+Total Customers:                                                 [TOTAL_CUST]
+Active Customers (30 days):                                      [ACTIVE_30]
+New Customers (This Period):                                     [NEW_CUST]
+Loyalty Members:                                                 [LOYAL_COUNT]
+Average Customer Value:                                 $[AVG_CUST_VALUE]
+--------------------------------------------------------------------------------
+
+TOP 10 CUSTOMERS BY REVENUE
+--------------------------------------------------------------------------------
+Rank  Customer ID  Name                      Purchases  Revenue     Avg Trans
+--------------------------------------------------------------------------------
+1     [ID1]        [NAME1]                   [CNT1]     $[REV1]     $[AVG1]
+2     [ID2]        [NAME2]                   [CNT2]     $[REV2]     $[AVG2]
+3     [ID3]        [NAME3]                   [CNT3]     $[REV3]     $[AVG3]
+4     [ID4]        [NAME4]                   [CNT4]     $[REV4]     $[AVG4]
+5     [ID5]        [NAME5]                   [CNT5]     $[REV5]     $[AVG5]
+6     [ID6]        [NAME6]                   [CNT6]     $[REV6]     $[AVG6]
+7     [ID7]        [NAME7]                   [CNT7]     $[REV7]     $[AVG7]
+8     [ID8]        [NAME8]                   [CNT8]     $[REV8]     $[AVG8]
+9     [ID9]        [NAME9]                   [CNT9]     $[REV9]     $[AVG9]
+10    [ID10]       [NAME10]                  [CNT10]    $[REV10]    $[AVG10]
+--------------------------------------------------------------------------------
+
+CUSTOMER SEGMENTATION
+--------------------------------------------------------------------------------
+Segment             Count   Avg Revenue   Total Revenue   % of Total
+--------------------------------------------------------------------------------
+Premium (>$5000)    [CNT1]  $[AVG1]       $[TOT1]         [PCT1]%
+Active (>$1000)     [CNT2]  $[AVG2]       $[TOT2]         [PCT2]%
+Regular             [CNT3]  $[AVG3]       $[TOT3]         [PCT3]%
+Occasional          [CNT4]  $[AVG4]       $[TOT4]         [PCT4]%
+Inactive (>90 days) [CNT5]  $[AVG5]       $[TOT5]         [PCT5]%
+--------------------------------------------------------------------------------
+
+CUSTOMER ACQUISITION TREND
+--------------------------------------------------------------------------------
+Month           New Customers   Retention Rate
+--------------------------------------------------------------------------------
+[MONTH1]        [NEW1]          [RET1]%
+[MONTH2]        [NEW2]          [RET2]%
+[MONTH3]        [NEW3]          [RET3]%
+[MONTH4]        [NEW4]          [RET4]%
+[MONTH5]        [NEW5]          [RET5]%
+[MONTH6]        [NEW6]          [RET6]%
+--------------------------------------------------------------------------------
+
+LOYALTY PROGRAM STATISTICS
+--------------------------------------------------------------------------------
+Total Loyalty Members:                                           [LOYAL_TOT]
+Points Earned (This Period):                                     [PTS_EARN]
+Points Redeemed (This Period):                                   [PTS_REDEEM]
+Average Points per Member:                                       [AVG_PTS]
+Loyalty Revenue:                                        $[LOYAL_REV]
+% of Total Revenue:                                              [LOYAL_PCT]%
+--------------------------------------------------------------------------------
+
+AT RISK CUSTOMERS (No purchase in 60+ days)
+--------------------------------------------------------------------------------
+Customer ID  Name                      Last Purchase   Lifetime Value
+--------------------------------------------------------------------------------
+[ID1]        [NAME1]                   [DATE1]         $[VAL1]
+[ID2]        [NAME2]                   [DATE2]         $[VAL2]
+[ID3]        [NAME3]                   [DATE3]         $[VAL3]
+[ID4]        [NAME4]                   [DATE4]         $[VAL4]
+[ID5]        [NAME5]                   [DATE5]         $[VAL5]
+--------------------------------------------------------------------------------
+
+Report Generated: [TIMESTAMP]
+================================================================================

@@ -1,0 +1,86 @@
+* PROMOTIONS Dictionary Definitions
+* MultiValue Database Schema for Promotional Campaigns and Rules
+
+* Field Definitions
+FIELD~PROMO.ID~1~Promotion ID~Primary Key
+FIELD~PROMO.CODE~2~Promotion Code~User-facing code
+FIELD~PROMO.NAME~3~Promotion Name~
+FIELD~PROMO.DESC~4~Promotion Description~
+FIELD~PROMO.TYPE~5~Promotion Type~DISCOUNT, BOGO, BUNDLE, FIXED_PRICE, LOYALTY, COUPON
+FIELD~START.DATE~6~Start Date~
+FIELD~START.TIME~7~Start Time~
+FIELD~END.DATE~8~End Date~
+FIELD~END.TIME~9~End Time~
+FIELD~STATUS~10~Status~ACTIVE, INACTIVE, SCHEDULED, EXPIRED
+FIELD~PRIORITY~11~Priority~1-10 (higher = higher priority)
+FIELD~DISCOUNT.TYPE~12~Discount Type~PERCENT, AMOUNT, FIXED_PRICE
+FIELD~DISCOUNT.VALUE~13~Discount Value~
+FIELD~MAX.DISCOUNT~14~Maximum Discount Amount~
+FIELD~MIN.PURCHASE~15~Minimum Purchase Amount~
+FIELD~MAX.PURCHASE~16~Maximum Purchase Amount~
+FIELD~APPLIES.TO~17~Applies To~ITEMS, CATEGORIES, BRANDS, TRANSACTION
+FIELD~ITEM.IDS~18~Applicable Item IDs~Multivalued
+FIELD~CATEGORIES~19~Applicable Categories~Multivalued
+FIELD~BRANDS~20~Applicable Brands~Multivalued
+FIELD~EXCLUDE.ITEMS~21~Excluded Item IDs~Multivalued
+FIELD~EXCLUDE.CATEGORIES~22~Excluded Categories~Multivalued
+FIELD~EXCLUDE.BRANDS~23~Excluded Brands~Multivalued
+FIELD~BUY.QTY~24~Buy Quantity~For BOGO
+FIELD~GET.QTY~25~Get Quantity~For BOGO
+FIELD~GET.DISCOUNT~26~Get Discount Percentage~For BOGO
+FIELD~BUNDLE.ITEMS~27~Bundle Item IDs~Multivalued
+FIELD~BUNDLE.QTY~28~Bundle Quantities~Multivalued
+FIELD~BUNDLE.PRICE~29~Bundle Price~
+FIELD~STACKABLE~30~Stackable with Other Promos~Y/N
+FIELD~COMBINABLE.WITH~31~Combinable Promotion IDs~Multivalued
+FIELD~CUSTOMER.TYPE~32~Customer Type Restriction~R, W, C, or ALL
+FIELD~LOYALTY.TIER~33~Loyalty Tier Restriction~BRONZE, SILVER, GOLD, PLATINUM, ALL
+FIELD~NEW.CUSTOMER~34~New Customer Only~Y/N
+FIELD~STORE.IDS~35~Applicable Store IDs~Multivalued (blank = all)
+FIELD~CHANNEL~36~Sales Channel~POS, WEB, MOBILE, ALL
+FIELD~DAY.OF.WEEK~37~Day of Week~Multivalued (1=Sun through 7=Sat)
+FIELD~TIME.START~38~Time of Day Start~
+FIELD~TIME.END~39~Time of Day End~
+FIELD~USE.LIMIT.TOTAL~40~Total Use Limit~
+FIELD~USE.LIMIT.CUST~41~Per Customer Use Limit~
+FIELD~USE.COUNT.TOTAL~42~Total Use Count~
+FIELD~USE.COUNT.CUST~43~Customer Use Counts~Multivalued (CUST.ID:COUNT)
+FIELD~REQUIRES.COUPON~44~Requires Coupon Code~Y/N
+FIELD~AUTO.APPLY~45~Auto Apply~Y/N
+FIELD~LOYALTY.POINTS.MULT~46~Loyalty Points Multiplier~
+FIELD~LOYALTY.BONUS.PTS~47~Loyalty Bonus Points~
+FIELD~ADVERTISED~48~Advertised Promotion~Y/N
+FIELD~AD.CAMPAIGN~49~Advertising Campaign ID~
+FIELD~AD.MEDIA~50~Advertising Media~Multivalued (TV, PRINT, EMAIL, SOCIAL)
+FIELD~COST.CENTER~51~Cost Center~
+FIELD~GL.ACCOUNT~52~GL Account for Discount~
+FIELD~BUDGET.AMOUNT~53~Budgeted Amount~
+FIELD~ACTUAL.COST~54~Actual Cost to Date~
+FIELD~APPROVAL.REQUIRED~55~Approval Required~Y/N
+FIELD~APPROVED.BY~56~Approved By User~
+FIELD~APPROVED.DATE~57~Approval Date~
+FIELD~CREATED.BY~58~Created By User~
+FIELD~CREATED.DATE~59~Created Date~
+FIELD~CREATED.TIME~60~Created Time~
+FIELD~MODIFIED.BY~61~Modified By User~
+FIELD~MODIFIED.DATE~62~Modified Date~
+FIELD~MODIFIED.TIME~63~Modified Time~
+FIELD~NOTES~64~Notes~Multivalued
+
+* Index Definitions
+INDEX~CODE.IDX~PROMO.CODE~Promotion Code Index
+INDEX~STATUS.IDX~STATUS~Status Index
+INDEX~START.DATE.IDX~START.DATE~Start Date Index
+INDEX~END.DATE.IDX~END.DATE~End Date Index
+INDEX~TYPE.IDX~PROMO.TYPE~Type Index
+
+* Correlatives and Derived Fields
+CORR~IS.ACTIVE~IF STATUS = 'ACTIVE' AND DATE() >= START.DATE AND DATE() <= END.DATE THEN 'Y' ELSE 'N'
+CORR~DAYS.REMAINING~END.DATE - DATE()
+CORR~DAYS.SINCE.START~DATE() - START.DATE
+CORR~TOTAL.USES~USE.COUNT.TOTAL
+CORR~USES.REMAINING~USE.LIMIT.TOTAL - USE.COUNT.TOTAL
+CORR~BUDGET.VARIANCE~BUDGET.AMOUNT - ACTUAL.COST
+CORR~BUDGET.PCT.USED~(ACTUAL.COST / BUDGET.AMOUNT) * 100
+CORR~AVG.DISCOUNT.PER.USE~IF USE.COUNT.TOTAL > 0 THEN ACTUAL.COST / USE.COUNT.TOTAL ELSE 0
+CORR~ROI~Revenue impact calculation (complex, defined in application)

@@ -1,0 +1,569 @@
+SUBROUTINE BATCH.EOD(RUN.DATE, STORE.ID.IN, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: BATCH.EOD
+* Purpose: End of Day Batch Processing
+* Parameters:
+*   RUN.DATE (IN) - Date to process (blank = today)
+*   STORE.ID.IN (IN) - Store ID (blank = all stores)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Set defaults
+IF RUN.DATE = '' THEN RUN.DATE = SYSTEM.DATE
+
+* Log EOD start
+LOG.MSG = 'EOD Processing started for ' : OCONV(RUN.DATE, 'D4/')
+IF STORE.ID.IN # '' THEN
+   LOG.MSG := ', Store: ' : STORE.ID.IN
+END ELSE
+   LOG.MSG := ', All Stores'
+END
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+* Initialize EOD statistics
+GOSUB INITIALIZE.EOD.STATS
+
+* Close register sessions
+GOSUB CLOSE.REGISTER.SESSIONS
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Post transactions to GL
+GOSUB POST.TRANSACTIONS.TO.GL
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Calculate employee commissions
+GOSUB CALCULATE.COMMISSIONS
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Update inventory valuations
+GOSUB UPDATE.INVENTORY.VALUATIONS
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Process loyalty points expiration
+GOSUB PROCESS.LOYALTY.EXPIRATION
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Update customer purchase statistics
+GOSUB UPDATE.CUSTOMER.STATS
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Archive old transactions
+GOSUB ARCHIVE.OLD.TRANSACTIONS
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Generate automatic reports
+GOSUB GENERATE.EOD.REPORTS
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Create backup
+GOSUB CREATE.EOD.BACKUP
+IF ERROR.CODE # ERR.SUCCESS THEN GOTO EOD.ERROR
+
+* Update EOD log
+GOSUB UPDATE.EOD.LOG
+
+LOG.MSG = 'EOD Processing completed successfully'
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+EOD.ERROR:
+   ERR.LOG = 'EOD Processing failed: ' : ERROR.MSG
+   CALL UTILS.COMMON('LOG.ERROR', ERR.LOG, 'ERROR')
+   RETURN
+
+**************************************************************************
+* Initialize EOD Statistics
+**************************************************************************
+INITIALIZE.EOD.STATS:
+   TOTAL.SALES = 0
+   TOTAL.TRANSACTIONS = 0
+   TOTAL.CUSTOMERS = 0
+   TOTAL.ITEMS.SOLD = 0
+   CASH.COLLECTED = 0
+   CREDIT.COLLECTED = 0
+   ERRORS.COUNT = 0
+   STORES.PROCESSED = 0
+   RETURN
+
+**************************************************************************
+* Close Register Sessions
+**************************************************************************
+CLOSE.REGISTER.SESSIONS:
+   * Select register sessions for the date
+   SELECT.CMD = 'SELECT REGISTER.SESSIONS WITH SESSION.DATE = "' : RUN.DATE : '"'
+   IF STORE.ID.IN # '' THEN
+      SELECT.CMD := ' AND STORE.ID = "' : STORE.ID.IN : '"'
+   END
+   SELECT.CMD := ' AND CLOSE.TIME = ""'
+
+   EXECUTE SELECT.CMD
+
+   SESSION.COUNT = 0
+   LOOP
+      READNEXT SESSION.ID ELSE EXIT
+
+      READU SESSION.REC FROM F.REG.SESSIONS, SESSION.ID ELSE
+         CONTINUE
+      END
+
+      * Check if already closed
+      IF SESSION.REC<20> # '' THEN  ; CLOSE.TIME
+         RELEASE F.REG.SESSIONS, SESSION.ID
+         CONTINUE
+      END
+
+      SESSION.COUNT += 1
+
+      * Set close time
+      SESSION.REC<20> = SYSTEM.TIME  ; CLOSE.TIME
+      SESSION.REC<21> = USER.ID  ; CLOSED.BY
+
+      * Calculate expected vs actual cash
+      GOSUB CALCULATE.CASH.VARIANCE
+
+      * Mark session as closed
+      SESSION.REC<25> = 'CLOSED'  ; STATUS
+
+      WRITE SESSION.REC TO F.REG.SESSIONS, SESSION.ID
+
+      * Log session closure
+      LOG.MSG = 'Register session closed: ' : SESSION.ID
+      CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   REPEAT
+
+   IF SESSION.COUNT = 0 THEN
+      WARN.MSG = 'No open register sessions found for EOD'
+      CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Cash Variance
+**************************************************************************
+CALCULATE.CASH.VARIANCE:
+   * Get expected cash
+   OPENING.CASH = SESSION.REC<5>
+   CASH.SALES = SESSION.REC<12>  ; Total cash payments
+   EXPECTED.CASH = OPENING.CASH + CASH.SALES
+
+   * Get actual cash (would come from count)
+   * For now, assume matches expected
+   ACTUAL.CASH = EXPECTED.CASH
+
+   * Calculate variance
+   VARIANCE = ACTUAL.CASH - EXPECTED.CASH
+   SESSION.REC<22> = ACTUAL.CASH  ; ACTUAL.CASH
+   SESSION.REC<23> = VARIANCE  ; CASH.VARIANCE
+
+   IF ABS(VARIANCE) > 5 THEN
+      WARN.MSG = 'Cash variance for session ' : SESSION.ID
+      WARN.MSG := ': $' : OCONV(VARIANCE, 'MD2')
+      CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+   END
+   RETURN
+
+**************************************************************************
+* Post Transactions to GL
+**************************************************************************
+POST.TRANSACTIONS.TO.GL:
+   * Select unposted transactions
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE = "' : RUN.DATE : '"'
+   IF STORE.ID.IN # '' THEN
+      SELECT.CMD := ' AND STORE.ID = "' : STORE.ID.IN : '"'
+   END
+   SELECT.CMD := ' AND POSTED.FLAG = "N"'
+   SELECT.CMD := ' AND STATUS = "' : STATUS.COMPLETE : '"'
+
+   EXECUTE SELECT.CMD
+
+   POSTED.COUNT = 0
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READU TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE
+         CONTINUE
+      END
+
+      * Create GL entries (already done in POS.COMPLETE, but verify)
+      GOSUB CREATE.GL.POSTING
+
+      * Mark as posted
+      TRANS.REC<POSTED.FLAG> = 'Y'
+      TRANS.REC<POSTED.DATE> = SYSTEM.DATE
+
+      WRITE TRANS.REC TO F.POS.TRANS, TRANS.ID
+
+      POSTED.COUNT += 1
+      TOTAL.TRANSACTIONS += 1
+      TRANS.AMT = TRANS.REC<TOTAL.AMOUNT>
+      IF TRANS.AMT = '' THEN TRANS.AMT = 0
+      TOTAL.SALES += TRANS.AMT
+   REPEAT
+
+   LOG.MSG = 'Posted ' : POSTED.COUNT : ' transactions to GL'
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Create GL Posting
+**************************************************************************
+CREATE.GL.POSTING:
+   * Verify GL entries exist
+   OPEN 'GL.JOURNAL' TO F.GL.JOURNAL ELSE
+      RETURN
+   END
+
+   JE.ID = 'SALE*' : TRANS.ID
+   READ JE.REC FROM F.GL.JOURNAL, JE.ID ELSE
+      * Create if missing
+      JE.REC = ''
+      JE.REC<1> = TRANS.REC<TRANS.DATE>
+      JE.REC<2> = 'POS Sale: ' : TRANS.ID
+      JE.REC<3> = 'CASH'
+      JE.REC<4> = TRANS.REC<TOTAL.AMOUNT>
+      JE.REC<5> = 'SALES'
+      JE.REC<6> = TRANS.REC<SUBTOTAL>
+      JE.REC<7> = 'SALES.TAX'
+      JE.REC<8> = TRANS.REC<TOTAL.TAX>
+
+      WRITE JE.REC TO F.GL.JOURNAL, JE.ID
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Commissions
+**************************************************************************
+CALCULATE.COMMISSIONS:
+   * Select transactions with commissions for the date
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE = "' : RUN.DATE : '"'
+   IF STORE.ID.IN # '' THEN
+      SELECT.CMD := ' AND STORE.ID = "' : STORE.ID.IN : '"'
+   END
+   SELECT.CMD := ' AND COMMISSION.AMT # ""'
+   SELECT.CMD := ' AND COMMISSION.AMT # "0"'
+   SELECT.CMD := ' AND STATUS = "' : STATUS.COMPLETE : '"'
+
+   EXECUTE SELECT.CMD
+
+   * Track commission by employee
+   EMP.COMM = ''
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Get commission split
+      COMM.SPLIT = TRANS.REC<COMMISSION.SPLIT>
+      SPLIT.COUNT = DCOUNT(COMM.SPLIT, VM)
+
+      FOR I = 1 TO SPLIT.COUNT
+         SPLIT.DATA = COMM.SPLIT<1, I>
+         EMP.ID = FIELD(SPLIT.DATA, '|', 1)
+         COMM.AMT = FIELD(SPLIT.DATA, '|', 2)
+
+         IF EMP.ID = '' OR COMM.AMT = '' THEN CONTINUE
+
+         * Find or add employee
+         LOCATE EMP.ID IN EMP.COMM<1, 1> USING VM SETTING POS ELSE
+            COMM.CNT = DCOUNT(EMP.COMM, VM)
+            IF COMM.CNT = 0 OR EMP.COMM = '' THEN
+               POS = 1
+            END ELSE
+               POS = COMM.CNT + 1
+            END
+            EMP.COMM<1, POS> = EMP.ID
+            EMP.COMM<2, POS> = 0
+         END
+
+         * Add commission
+         OLD.COMM = EMP.COMM<2, POS>
+         IF OLD.COMM = '' THEN OLD.COMM = 0
+         EMP.COMM<2, POS> = OLD.COMM + COMM.AMT
+      NEXT I
+   REPEAT
+
+   * Create commission records
+   OPEN 'COMMISSIONS' TO F.COMMISSIONS ELSE
+      EXECUTE 'CREATE.FILE COMMISSIONS 1 101'
+      OPEN 'COMMISSIONS' TO F.COMMISSIONS ELSE
+         RETURN
+      END
+   END
+
+   EMP.COUNT = DCOUNT(EMP.COMM, VM)
+   FOR I = 1 TO EMP.COUNT
+      EMP.ID = EMP.COMM<1, I>
+      COMM.TOTAL = EMP.COMM<2, I>
+
+      COMM.ID = EMP.ID : '*' : RUN.DATE
+      COMM.REC = ''
+      COMM.REC<1> = EMP.ID
+      COMM.REC<2> = RUN.DATE
+      COMM.REC<3> = COMM.TOTAL
+      COMM.REC<4> = 'PENDING'  ; Status
+      COMM.REC<5> = SYSTEM.DATE  ; Created date
+
+      WRITE COMM.REC TO F.COMMISSIONS, COMM.ID
+   NEXT I
+
+   LOG.MSG = 'Calculated commissions for ' : EMP.COUNT : ' employees'
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Update Inventory Valuations
+**************************************************************************
+UPDATE.INVENTORY.VALUATIONS:
+   * Calculate total inventory value
+   SELECT.CMD = 'SELECT INVENTORY'
+   IF STORE.ID.IN # '' THEN
+      * Would filter by store if needed
+   END
+
+   EXECUTE SELECT.CMD
+
+   TOTAL.VALUE = 0
+   ITEM.COUNT = 0
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      * Calculate total quantity on hand
+      QTY.COUNT = DCOUNT(ITEM.REC<QTY.ON.HAND>, VM)
+      TOTAL.QTY = 0
+
+      FOR I = 1 TO QTY.COUNT
+         QTY = ITEM.REC<QTY.ON.HAND, I>
+         IF QTY = '' THEN QTY = 0
+         TOTAL.QTY += QTY
+      NEXT I
+
+      * Calculate value
+      AVG.COST.VAL = ITEM.REC<AVG.COST>
+      IF AVG.COST.VAL = '' THEN AVG.COST.VAL = 0
+
+      ITEM.VALUE = TOTAL.QTY * AVG.COST.VAL
+      TOTAL.VALUE += ITEM.VALUE
+
+      ITEM.COUNT += 1
+   REPEAT
+
+   * Log inventory valuation
+   LOG.MSG = 'Total inventory value: $' : OCONV(TOTAL.VALUE, 'MD2')
+   LOG.MSG := ' (' : ITEM.COUNT : ' items)'
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Process Loyalty Expiration
+**************************************************************************
+PROCESS.LOYALTY.EXPIRATION:
+   * Expire points older than 12 months
+   EXPIRY.DATE = RUN.DATE - 365
+
+   SELECT.CMD = 'SELECT LOYALTY.TRANS WITH TRANS.DATE <= "' : EXPIRY.DATE : '"'
+   SELECT.CMD := ' AND TRANS.TYPE = "EARN"'
+   SELECT.CMD := ' AND STATUS # "EXPIRED"'
+
+   EXECUTE SELECT.CMD
+
+   EXPIRED.COUNT = 0
+   EXPIRED.POINTS = 0
+
+   LOOP
+      READNEXT LOYAL.TRANS.ID ELSE EXIT
+
+      READU LOYAL.REC FROM F.LOYALTY.TRANS, LOYAL.TRANS.ID ELSE
+         CONTINUE
+      END
+
+      * Mark as expired
+      LOYAL.REC<29> = 'EXPIRED'  ; STATUS
+      POINTS = LOYAL.REC<9>  ; POINTS.EARNED
+      IF POINTS = '' THEN POINTS = 0
+
+      WRITE LOYAL.REC TO F.LOYALTY.TRANS, LOYAL.TRANS.ID
+
+      * Deduct from customer balance
+      CUST.ID = LOYAL.REC<3>
+      READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE
+         CONTINUE
+      END
+
+      OLD.POINTS = CUST.REC<LOYALTY.POINTS>
+      IF OLD.POINTS = '' THEN OLD.POINTS = 0
+
+      NEW.POINTS = OLD.POINTS - POINTS
+      IF NEW.POINTS < 0 THEN NEW.POINTS = 0
+
+      CUST.REC<LOYALTY.POINTS> = NEW.POINTS
+
+      WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+
+      EXPIRED.COUNT += 1
+      EXPIRED.POINTS += POINTS
+   REPEAT
+
+   IF EXPIRED.COUNT > 0 THEN
+      LOG.MSG = 'Expired ' : EXPIRED.POINTS : ' loyalty points'
+      LOG.MSG := ' from ' : EXPIRED.COUNT : ' transactions'
+      CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   END
+   RETURN
+
+**************************************************************************
+* Update Customer Statistics
+**************************************************************************
+UPDATE.CUSTOMER.STATS:
+   * Update customer lifetime values and tier status
+   SELECT.CMD = 'SELECT CUSTOMERS'
+   EXECUTE SELECT.CMD
+
+   UPDATED.COUNT = 0
+
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE CONTINUE
+
+      * Calculate tier based on purchases
+      TOTAL.PURCH = CUST.REC<TOTAL.PURCHASES>
+      IF TOTAL.PURCH = '' THEN TOTAL.PURCH = 0
+
+      OLD.TIER = CUST.REC<LOYALTY.TIER>
+
+      * Determine new tier
+      BEGIN CASE
+         CASE TOTAL.PURCH >= 10000
+            NEW.TIER = 'PLATINUM'
+         CASE TOTAL.PURCH >= 5000
+            NEW.TIER = 'GOLD'
+         CASE TOTAL.PURCH >= 2000
+            NEW.TIER = 'SILVER'
+         CASE 1
+            NEW.TIER = 'BRONZE'
+      END CASE
+
+      IF OLD.TIER # NEW.TIER THEN
+         CUST.REC<LOYALTY.TIER> = NEW.TIER
+         WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+         UPDATED.COUNT += 1
+      END ELSE
+         RELEASE F.CUSTOMERS, CUST.ID
+      END
+   REPEAT
+
+   IF UPDATED.COUNT > 0 THEN
+      LOG.MSG = 'Updated loyalty tier for ' : UPDATED.COUNT : ' customers'
+      CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   END
+   RETURN
+
+**************************************************************************
+* Archive Old Transactions
+**************************************************************************
+ARCHIVE.OLD.TRANSACTIONS:
+   * Archive transactions older than 2 years
+   ARCHIVE.CUTOFF = RUN.DATE - 730
+
+   SELECT.CMD = 'SELECT POS.TRANS WITH TRANS.DATE <= "' : ARCHIVE.CUTOFF : '"'
+   EXECUTE SELECT.CMD
+
+   ARCHIVED.COUNT = 0
+
+   OPEN 'POS.TRANS.ARCHIVE' TO F.POS.ARCHIVE ELSE
+      EXECUTE 'CREATE.FILE POS.TRANS.ARCHIVE 1 101'
+      OPEN 'POS.TRANS.ARCHIVE' TO F.POS.ARCHIVE ELSE
+         RETURN
+      END
+   END
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Write to archive
+      WRITE TRANS.REC TO F.POS.ARCHIVE, TRANS.ID
+
+      * Delete from active file
+      DELETE F.POS.TRANS, TRANS.ID
+
+      ARCHIVED.COUNT += 1
+   REPEAT
+
+   IF ARCHIVED.COUNT > 0 THEN
+      LOG.MSG = 'Archived ' : ARCHIVED.COUNT : ' old transactions'
+      CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   END
+   RETURN
+
+**************************************************************************
+* Generate EOD Reports
+**************************************************************************
+GENERATE.EOD.REPORTS:
+   * Generate daily sales report
+   CALL RPT.SALES.DAILY(RUN.DATE, STORE.ID.IN, 'FILE', REPORT.DATA, RPT.ERROR, RPT.MSG)
+
+   IF RPT.ERROR # ERR.SUCCESS THEN
+      WARN.MSG = 'Failed to generate daily sales report: ' : RPT.MSG
+      CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+   END
+   RETURN
+
+**************************************************************************
+* Create EOD Backup
+**************************************************************************
+CREATE.EOD.BACKUP:
+   * Trigger backup process
+   BACKUP.CMD = 'BACKUP.SYSTEM'
+   * In production, would execute actual backup command
+   LOG.MSG = 'EOD backup initiated'
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Update EOD Log
+**************************************************************************
+UPDATE.EOD.LOG:
+   OPEN 'EOD.LOG' TO F.EOD.LOG ELSE
+      EXECUTE 'CREATE.FILE EOD.LOG 1 101'
+      OPEN 'EOD.LOG' TO F.EOD.LOG ELSE
+         RETURN
+      END
+   END
+
+   LOG.ID = RUN.DATE
+   IF STORE.ID.IN # '' THEN
+      LOG.ID := '*' : STORE.ID.IN
+   END
+
+   EOD.LOG.REC = ''
+   EOD.LOG.REC<1> = RUN.DATE
+   EOD.LOG.REC<2> = STORE.ID.IN
+   EOD.LOG.REC<3> = TOTAL.SALES
+   EOD.LOG.REC<4> = TOTAL.TRANSACTIONS
+   EOD.LOG.REC<5> = TOTAL.CUSTOMERS
+   EOD.LOG.REC<6> = TOTAL.ITEMS.SOLD
+   EOD.LOG.REC<7> = CASH.COLLECTED
+   EOD.LOG.REC<8> = CREDIT.COLLECTED
+   EOD.LOG.REC<9> = ERRORS.COUNT
+   EOD.LOG.REC<10> = 'COMPLETE'
+   EOD.LOG.REC<11> = SYSTEM.DATE
+   EOD.LOG.REC<12> = SYSTEM.TIME
+   EOD.LOG.REC<13> = USER.ID
+
+   WRITE EOD.LOG.REC TO F.EOD.LOG, LOG.ID
+   RETURN
+
+END

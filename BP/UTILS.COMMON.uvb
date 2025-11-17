@@ -1,0 +1,309 @@
+SUBROUTINE UTILS.COMMON
+**************************************************************************
+* Program: UTILS.COMMON
+* Purpose: Common Utility Functions for Retail POS System
+* Contains: Date, String, Number, Formatting utilities
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* This is a placeholder for utility function declarations
+* Individual functions are implemented as separate entry points
+RETURN
+
+**************************************************************************
+* ENTRY: FORMAT.AMOUNT - Format currency amount
+* Parameters:
+*   AMOUNT.IN - Amount to format
+*   FORMATTED.OUT - Formatted amount string
+**************************************************************************
+ENTRY FORMAT.AMOUNT(AMOUNT.IN, FORMATTED.OUT)
+   IF AMOUNT.IN = '' THEN AMOUNT.IN = 0
+   AMOUNT.IN = NUM(AMOUNT.IN)
+
+   * Round to decimal places
+   MULTIPLIER = 10 ^ DECIMAL.PLACES
+   ROUNDED = INT((AMOUNT.IN * MULTIPLIER) + 0.5) / MULTIPLIER
+
+   * Format with commas and currency symbol
+   FORMATTED.OUT = OCONV(ROUNDED, 'MD2,$')
+   IF CURRENCY.SYMBOL # '' THEN
+      FORMATTED.OUT = CURRENCY.SYMBOL : FORMATTED.OUT
+   END
+   RETURN
+
+**************************************************************************
+* ENTRY: FORMAT.DATE - Format date based on system configuration
+* Parameters:
+*   DATE.IN - Internal date
+*   FORMATTED.OUT - Formatted date string
+**************************************************************************
+ENTRY FORMAT.DATE(DATE.IN, FORMATTED.OUT)
+   IF DATE.IN = '' OR NOT(NUM(DATE.IN)) THEN
+      FORMATTED.OUT = ''
+      RETURN
+   END
+
+   BEGIN CASE
+      CASE DATE.FORMAT = 'MM/DD/YYYY'
+         FORMATTED.OUT = OCONV(DATE.IN, 'D4/')
+      CASE DATE.FORMAT = 'DD/MM/YYYY'
+         FORMATTED.OUT = OCONV(DATE.IN, 'D2/')
+      CASE DATE.FORMAT = 'YYYY-MM-DD'
+         FORMATTED.OUT = OCONV(DATE.IN, 'D4-')
+      CASE 1
+         FORMATTED.OUT = OCONV(DATE.IN, 'D4/')
+   END CASE
+   RETURN
+
+**************************************************************************
+* ENTRY: FORMAT.TIME - Format time based on system configuration
+* Parameters:
+*   TIME.IN - Internal time
+*   FORMATTED.OUT - Formatted time string
+**************************************************************************
+ENTRY FORMAT.TIME(TIME.IN, FORMATTED.OUT)
+   IF TIME.IN = '' OR NOT(NUM(TIME.IN)) THEN
+      FORMATTED.OUT = ''
+      RETURN
+   END
+
+   BEGIN CASE
+      CASE TIME.FORMAT = '12HR'
+         FORMATTED.OUT = OCONV(TIME.IN, 'MTS')
+      CASE TIME.FORMAT = '24HR'
+         FORMATTED.OUT = OCONV(TIME.IN, 'MT')
+      CASE 1
+         FORMATTED.OUT = OCONV(TIME.IN, 'MTS')
+   END CASE
+   RETURN
+
+**************************************************************************
+* ENTRY: VALIDATE.EMAIL - Validate email address format
+* Parameters:
+*   EMAIL.IN - Email to validate
+*   VALID.FLAG - Returns TRUE if valid, FALSE otherwise
+**************************************************************************
+ENTRY VALIDATE.EMAIL(EMAIL.IN, VALID.FLAG)
+   VALID.FLAG = FALSE
+
+   IF EMAIL.IN = '' THEN RETURN
+
+   * Check for @ symbol
+   AT.POS = INDEX(EMAIL.IN, '@', 1)
+   IF AT.POS = 0 THEN RETURN
+
+   * Check for domain
+   DOT.POS = INDEX(EMAIL.IN, '.', AT.POS)
+   IF DOT.POS = 0 THEN RETURN
+
+   * Basic validation passed
+   VALID.FLAG = TRUE
+   RETURN
+
+**************************************************************************
+* ENTRY: VALIDATE.PHONE - Validate and format phone number
+* Parameters:
+*   PHONE.IN - Phone number to validate
+*   FORMATTED.OUT - Formatted phone number
+*   VALID.FLAG - Returns TRUE if valid
+**************************************************************************
+ENTRY VALIDATE.PHONE(PHONE.IN, FORMATTED.OUT, VALID.FLAG)
+   VALID.FLAG = FALSE
+   FORMATTED.OUT = ''
+
+   IF PHONE.IN = '' THEN RETURN
+
+   * Remove non-numeric characters
+   PHONE.CLEAN = ''
+   FOR I = 1 TO LEN(PHONE.IN)
+      CHAR = PHONE.IN[I,1]
+      IF CHAR GE '0' AND CHAR LE '9' THEN
+         PHONE.CLEAN := CHAR
+      END
+   NEXT I
+
+   * Check length (10 digits for US)
+   IF LEN(PHONE.CLEAN) # 10 THEN RETURN
+
+   * Format as (XXX) XXX-XXXX
+   FORMATTED.OUT = '(' : PHONE.CLEAN[1,3] : ') '
+   FORMATTED.OUT := PHONE.CLEAN[4,3] : '-'
+   FORMATTED.OUT := PHONE.CLEAN[7,4]
+
+   VALID.FLAG = TRUE
+   RETURN
+
+**************************************************************************
+* ENTRY: CALCULATE.TAX - Calculate sales tax
+* Parameters:
+*   AMOUNT.IN - Amount to calculate tax on
+*   TAX.RATE.IN - Tax rate (if blank, use system default)
+*   TAX.AMOUNT.OUT - Calculated tax amount
+**************************************************************************
+ENTRY CALCULATE.TAX(AMOUNT.IN, TAX.RATE.IN, TAX.AMOUNT.OUT)
+   IF AMOUNT.IN = '' THEN AMOUNT.IN = 0
+   AMOUNT.IN = NUM(AMOUNT.IN)
+
+   IF TAX.RATE.IN = '' THEN
+      RATE = TAX.RATE
+   END ELSE
+      RATE = NUM(TAX.RATE.IN)
+   END
+
+   TAX.AMOUNT.OUT = AMOUNT.IN * RATE
+
+   * Round to decimal places
+   MULTIPLIER = 10 ^ DECIMAL.PLACES
+   TAX.AMOUNT.OUT = INT((TAX.AMOUNT.OUT * MULTIPLIER) + 0.5) / MULTIPLIER
+   RETURN
+
+**************************************************************************
+* ENTRY: GENERATE.ID - Generate unique ID with prefix
+* Parameters:
+*   PREFIX - ID prefix (e.g., 'CUST', 'PO', 'TRANS')
+*   FILE.VAR - File variable to check for uniqueness
+*   NEW.ID - Generated unique ID
+**************************************************************************
+ENTRY GENERATE.ID(PREFIX, FILE.VAR, NEW.ID)
+   LOOP.COUNT = 0
+   MAX.LOOPS = 1000
+
+   LOOP
+      LOOP.COUNT += 1
+      IF LOOP.COUNT > MAX.LOOPS THEN
+         NEW.ID = ''
+         RETURN
+      END
+
+      * Generate ID using date, time, and random number
+      TIME.STAMP = OCONV(DATE(), 'D4') : OCONV(TIME(), 'MTS')
+      TIME.STAMP = CONVERT('/', '', TIME.STAMP)
+      TIME.STAMP = CONVERT(':', '', TIME.STAMP)
+      TIME.STAMP = CONVERT(' ', '', TIME.STAMP)
+      TIME.STAMP = CONVERT('AM', '', TIME.STAMP)
+      TIME.STAMP = CONVERT('PM', '', TIME.STAMP)
+
+      RANDOM.NUM = RND(9999)
+      RANDOM.STR = OCONV(RANDOM.NUM, 'R(0)#4')
+
+      NEW.ID = PREFIX : '-' : TIME.STAMP : '-' : RANDOM.STR
+
+      * Check if ID already exists
+      READ TEST.REC FROM FILE.VAR, NEW.ID ELSE
+         * ID doesn't exist, we can use it
+         RETURN
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* ENTRY: ENCRYPT.STRING - Simple encryption for sensitive data
+* Parameters:
+*   STRING.IN - String to encrypt
+*   ENCRYPTED.OUT - Encrypted string
+**************************************************************************
+ENTRY ENCRYPT.STRING(STRING.IN, ENCRYPTED.OUT)
+   IF STRING.IN = '' THEN
+      ENCRYPTED.OUT = ''
+      RETURN
+   END
+
+   * Simple XOR encryption with key
+   * In production, use proper encryption
+   ENCRYPT.KEY = 'RETAIL@POS#SYSTEM$2025'
+   KEY.LEN = LEN(ENCRYPT.KEY)
+
+   ENCRYPTED.OUT = ''
+   FOR I = 1 TO LEN(STRING.IN)
+      CHAR.CODE = SEQ(STRING.IN[I,1])
+      KEY.POS = MOD(I - 1, KEY.LEN) + 1
+      KEY.CHAR = SEQ(ENCRYPT.KEY[KEY.POS,1])
+
+      ENCRYPTED.CHAR = CHAR.CODE + KEY.CHAR
+      ENCRYPTED.OUT := CHAR(ENCRYPTED.CHAR)
+   NEXT I
+
+   * Convert to hex for storage
+   ENCRYPTED.OUT = OCONV(ENCRYPTED.OUT, 'MX')
+   RETURN
+
+**************************************************************************
+* ENTRY: DECRYPT.STRING - Decrypt encrypted string
+* Parameters:
+*   ENCRYPTED.IN - Encrypted string
+*   DECRYPTED.OUT - Decrypted string
+**************************************************************************
+ENTRY DECRYPT.STRING(ENCRYPTED.IN, DECRYPTED.OUT)
+   IF ENCRYPTED.IN = '' THEN
+      DECRYPTED.OUT = ''
+      RETURN
+   END
+
+   * Convert from hex
+   ENCRYPTED.BYTES = ICONV(ENCRYPTED.IN, 'MX')
+
+   * XOR decryption
+   ENCRYPT.KEY = 'RETAIL@POS#SYSTEM$2025'
+   KEY.LEN = LEN(ENCRYPT.KEY)
+
+   DECRYPTED.OUT = ''
+   FOR I = 1 TO LEN(ENCRYPTED.BYTES)
+      CHAR.CODE = SEQ(ENCRYPTED.BYTES[I,1])
+      KEY.POS = MOD(I - 1, KEY.LEN) + 1
+      KEY.CHAR = SEQ(ENCRYPT.KEY[KEY.POS,1])
+
+      DECRYPTED.CHAR = CHAR.CODE - KEY.CHAR
+      DECRYPTED.OUT := CHAR(DECRYPTED.CHAR)
+   NEXT I
+   RETURN
+
+**************************************************************************
+* ENTRY: LOG.ERROR - Log error to file
+* Parameters:
+*   ERROR.MSG - Error message
+*   ERROR.LEVEL - Error level (INFO, WARNING, ERROR, CRITICAL)
+**************************************************************************
+ENTRY LOG.ERROR(ERROR.MSG, ERROR.LEVEL)
+   IF ERROR.LEVEL = '' THEN ERROR.LEVEL = 'ERROR'
+
+   LOG.TIMESTAMP = OCONV(DATE(), 'D4/') : ' ' : OCONV(TIME(), 'MTS')
+   LOG.LINE = LOG.TIMESTAMP : ' [' : ERROR.LEVEL : '] '
+   LOG.LINE := ERROR.MSG
+   LOG.LINE := ' (User: ' : USER.ID : ', Store: ' : CURRENT.STORE : ')'
+
+   * Write to error log
+   OPENSEQ ERROR.LOG.FILE TO F.ERROR.LOG THEN
+      WRITESEQ LOG.LINE TO F.ERROR.LOG ELSE
+         * Cannot write to log
+      END
+   END ELSE
+      * Cannot open log file
+   END
+   RETURN
+
+**************************************************************************
+* ENTRY: ROUND.AMOUNT - Round amount based on system configuration
+* Parameters:
+*   AMOUNT.IN - Amount to round
+*   ROUNDED.OUT - Rounded amount
+**************************************************************************
+ENTRY ROUND.AMOUNT(AMOUNT.IN, ROUNDED.OUT)
+   IF AMOUNT.IN = '' THEN AMOUNT.IN = 0
+   AMOUNT.IN = NUM(AMOUNT.IN)
+
+   MULTIPLIER = 10 ^ DECIMAL.PLACES
+
+   BEGIN CASE
+      CASE ROUNDING.METHOD = 'NORMAL'
+         ROUNDED.OUT = INT((AMOUNT.IN * MULTIPLIER) + 0.5) / MULTIPLIER
+      CASE ROUNDING.METHOD = 'UP'
+         ROUNDED.OUT = INT((AMOUNT.IN * MULTIPLIER) + 0.999) / MULTIPLIER
+      CASE ROUNDING.METHOD = 'DOWN'
+         ROUNDED.OUT = INT(AMOUNT.IN * MULTIPLIER) / MULTIPLIER
+      CASE 1
+         ROUNDED.OUT = INT((AMOUNT.IN * MULTIPLIER) + 0.5) / MULTIPLIER
+   END CASE
+   RETURN
+
+END

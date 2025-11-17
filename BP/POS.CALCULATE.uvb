@@ -1,0 +1,379 @@
+SUBROUTINE POS.CALCULATE(TRANS.REC.IO, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: POS.CALCULATE
+* Purpose: Calculate Transaction Totals (Subtotal, Tax, Total)
+* Parameters:
+*   TRANS.REC.IO (IN/OUT) - Transaction record
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Initialize totals
+SUBTOTAL.AMT = 0
+TOTAL.DISCOUNT.AMT = 0
+TOTAL.TAX.AMT = 0
+TOTAL.AMT = 0
+TOTAL.COST = 0
+
+* Get line count
+LINE.COUNT = TRANS.REC.IO<303>
+IF LINE.COUNT = '' OR LINE.COUNT = 0 THEN
+   * No items in transaction
+   TRANS.REC.IO<SUBTOTAL> = 0
+   TRANS.REC.IO<TOTAL.DISCOUNT> = 0
+   TRANS.REC.IO<TOTAL.TAX> = 0
+   TRANS.REC.IO<TOTAL.AMOUNT> = 0
+   RETURN
+END
+
+* Calculate line item totals
+FOR LINE.NUM = 1 TO LINE.COUNT
+   LINE.QTY = TRANS.REC.IO<T.QTY, LINE.NUM>
+   LINE.UNIT.PRICE = TRANS.REC.IO<T.UNIT.PRICE, LINE.NUM>
+   LINE.DISCOUNT = TRANS.REC.IO<T.DISCOUNT.AMT, LINE.NUM>
+   LINE.TAX = TRANS.REC.IO<T.TAX.AMT, LINE.NUM>
+   LINE.TOTAL.VAL = TRANS.REC.IO<T.LINE.TOTAL, LINE.NUM>
+   LINE.COST = TRANS.REC.IO<T.COST, LINE.NUM>
+
+   * Convert to numeric
+   IF LINE.QTY = '' THEN LINE.QTY = 0
+   IF LINE.UNIT.PRICE = '' THEN LINE.UNIT.PRICE = 0
+   IF LINE.DISCOUNT = '' THEN LINE.DISCOUNT = 0
+   IF LINE.TAX = '' THEN LINE.TAX = 0
+   IF LINE.TOTAL.VAL = '' THEN LINE.TOTAL.VAL = 0
+   IF LINE.COST = '' THEN LINE.COST = 0
+
+   * Accumulate line totals
+   LINE.EXTENDED = LINE.QTY * LINE.UNIT.PRICE
+   SUBTOTAL.AMT += LINE.EXTENDED
+   TOTAL.DISCOUNT.AMT += LINE.DISCOUNT
+   TOTAL.TAX.AMT += LINE.TAX
+   TOTAL.AMT += LINE.TOTAL.VAL
+   TOTAL.COST += (LINE.QTY * LINE.COST)
+NEXT LINE.NUM
+
+* Apply transaction-level discounts (coupons)
+GOSUB APPLY.COUPONS
+
+* Apply transaction-level promotions
+GOSUB APPLY.TRANSACTION.PROMOS
+
+* Calculate loyalty points
+GOSUB CALCULATE.LOYALTY.POINTS
+
+* Calculate shipping if applicable
+GOSUB CALCULATE.SHIPPING
+
+* Calculate commission
+GOSUB CALCULATE.COMMISSION
+
+* Round all amounts
+CALL UTILS.COMMON('ROUND.AMOUNT', SUBTOTAL.AMT, SUBTOTAL.AMT)
+CALL UTILS.COMMON('ROUND.AMOUNT', TOTAL.DISCOUNT.AMT, TOTAL.DISCOUNT.AMT)
+CALL UTILS.COMMON('ROUND.AMOUNT', TOTAL.TAX.AMT, TOTAL.TAX.AMT)
+CALL UTILS.COMMON('ROUND.AMOUNT', TOTAL.AMT, TOTAL.AMT)
+
+* Update transaction record
+TRANS.REC.IO<SUBTOTAL> = SUBTOTAL.AMT
+TRANS.REC.IO<TOTAL.DISCOUNT> = TOTAL.DISCOUNT.AMT
+TRANS.REC.IO<TOTAL.TAX> = TOTAL.TAX.AMT
+TRANS.REC.IO<TOTAL.AMOUNT> = TOTAL.AMT
+
+* Store total cost for margin calculation
+TRANS.REC.IO<304> = TOTAL.COST
+
+RETURN
+
+**************************************************************************
+* Apply Coupons
+**************************************************************************
+APPLY.COUPONS:
+   * Get coupon codes
+   COUPON.CODES = TRANS.REC.IO<COUPON.CODE>
+   IF COUPON.CODES = '' THEN RETURN
+
+   COUPON.COUNT = DCOUNT(COUPON.CODES, VM)
+   TOTAL.COUPON.AMT = 0
+
+   FOR C = 1 TO COUPON.COUNT
+      COUPON.CODE.VAL = COUPON.CODES<1, C>
+
+      * Read coupon from promotions file
+      SELECT.CMD = 'SELECT PROMOTIONS WITH PROMO.CODE = "' : COUPON.CODE.VAL : '"'
+      SELECT.CMD := ' AND PROMO.TYPE = "COUPON"'
+      SELECT.CMD := ' AND STATUS = "ACTIVE"'
+      EXECUTE SELECT.CMD
+
+      READNEXT PROMO.ID ELSE CONTINUE
+
+      READ PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE CONTINUE
+
+      * Get coupon discount
+      DISC.TYPE = PROMO.REC<12>
+      DISC.VALUE = PROMO.REC<13>
+
+      IF DISC.TYPE = 'PERCENT' THEN
+         COUPON.AMT = SUBTOTAL.AMT * (DISC.VALUE / 100)
+      END ELSE IF DISC.TYPE = 'AMOUNT' THEN
+         COUPON.AMT = DISC.VALUE
+      END ELSE
+         COUPON.AMT = 0
+      END
+
+      * Check minimum purchase requirement
+      MIN.PURCHASE = PROMO.REC<15>
+      IF MIN.PURCHASE # '' THEN
+         IF SUBTOTAL.AMT < MIN.PURCHASE THEN
+            COUPON.AMT = 0
+         END
+      END
+
+      * Apply max discount if specified
+      MAX.DISCOUNT = PROMO.REC<14>
+      IF MAX.DISCOUNT # '' THEN
+         IF COUPON.AMT > MAX.DISCOUNT THEN
+            COUPON.AMT = MAX.DISCOUNT
+         END
+      END
+
+      TOTAL.COUPON.AMT += COUPON.AMT
+      TRANS.REC.IO<COUPON.AMT, C> = COUPON.AMT
+
+      * Update promotion usage
+      PROMO.REC<42> += 1  ; USE.COUNT.TOTAL
+      WRITE PROMO.REC TO F.PROMOTIONS, PROMO.ID
+   NEXT C
+
+   * Add coupon discount to total discount
+   TOTAL.DISCOUNT.AMT += TOTAL.COUPON.AMT
+
+   * Recalculate total
+   TOTAL.AMT = SUBTOTAL.AMT - TOTAL.DISCOUNT.AMT + TOTAL.TAX.AMT
+   RETURN
+
+**************************************************************************
+* Apply Transaction-Level Promotions
+**************************************************************************
+APPLY.TRANSACTION.PROMOS:
+   * Check for promotions that apply to entire transaction
+   SELECT.CMD = 'SELECT PROMOTIONS WITH STATUS = "ACTIVE"'
+   SELECT.CMD := ' AND APPLIES.TO = "TRANSACTION"'
+   SELECT.CMD := ' AND START.DATE <= "' : SYSTEM.DATE : '"'
+   SELECT.CMD := ' AND END.DATE >= "' : SYSTEM.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   TRANS.PROMO.DISCOUNT = 0
+
+   LOOP
+      READNEXT PROMO.ID ELSE EXIT
+
+      READ PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE CONTINUE
+
+      * Check minimum purchase
+      MIN.PURCHASE = PROMO.REC<15>
+      IF MIN.PURCHASE # '' THEN
+         IF SUBTOTAL.AMT < MIN.PURCHASE THEN
+            CONTINUE
+         END
+      END
+
+      * Get discount
+      DISC.TYPE = PROMO.REC<12>
+      DISC.VALUE = PROMO.REC<13>
+
+      IF DISC.TYPE = 'PERCENT' THEN
+         PROMO.AMT = SUBTOTAL.AMT * (DISC.VALUE / 100)
+      END ELSE IF DISC.TYPE = 'AMOUNT' THEN
+         PROMO.AMT = DISC.VALUE
+      END ELSE
+         PROMO.AMT = 0
+      END
+
+      * Apply max discount
+      MAX.DISCOUNT = PROMO.REC<14>
+      IF MAX.DISCOUNT # '' THEN
+         IF PROMO.AMT > MAX.DISCOUNT THEN
+            PROMO.AMT = MAX.DISCOUNT
+         END
+      END
+
+      TRANS.PROMO.DISCOUNT += PROMO.AMT
+
+      * Store promo code
+      IF TRANS.REC.IO<T.PROMO.CODE> = '' THEN
+         TRANS.REC.IO<T.PROMO.CODE> = PROMO.REC<2>
+      END ELSE
+         TRANS.REC.IO<T.PROMO.CODE> := VM : PROMO.REC<2>
+      END
+
+      * Update promotion usage
+      PROMO.REC<42> += 1
+      WRITE PROMO.REC TO F.PROMOTIONS, PROMO.ID
+   REPEAT
+
+   * Add transaction promo discount to total
+   TOTAL.DISCOUNT.AMT += TRANS.PROMO.DISCOUNT
+
+   * Recalculate total
+   TOTAL.AMT = SUBTOTAL.AMT - TOTAL.DISCOUNT.AMT + TOTAL.TAX.AMT
+   RETURN
+
+**************************************************************************
+* Calculate Loyalty Points
+**************************************************************************
+CALCULATE.LOYALTY.POINTS:
+   * Check if customer has loyalty membership
+   LOYALTY.ID.VAL = TRANS.REC.IO<T.LOYALTY.ID>
+   IF LOYALTY.ID.VAL = '' THEN RETURN
+
+   * Points calculation: 1 point per dollar spent
+   POINTS.BASE = INT(TOTAL.AMT)
+
+   * Check for loyalty bonus multipliers
+   CUST.ID = TRANS.REC.IO<CUSTOMER.ID>
+   IF CUST.ID # '' THEN
+      READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE
+         POINTS.MULTIPLIER = 1
+      END
+      LOYALTY.TIER.VAL = CUST.REC<LOYALTY.TIER>
+
+      * Tier-based multipliers
+      BEGIN CASE
+         CASE LOYALTY.TIER.VAL = 'BRONZE'
+            POINTS.MULTIPLIER = 1
+         CASE LOYALTY.TIER.VAL = 'SILVER'
+            POINTS.MULTIPLIER = 1.25
+         CASE LOYALTY.TIER.VAL = 'GOLD'
+            POINTS.MULTIPLIER = 1.5
+         CASE LOYALTY.TIER.VAL = 'PLATINUM'
+            POINTS.MULTIPLIER = 2
+         CASE 1
+            POINTS.MULTIPLIER = 1
+      END CASE
+   END ELSE
+      POINTS.MULTIPLIER = 1
+   END
+
+   * Calculate points earned
+   POINTS.EARNED.VAL = INT(POINTS.BASE * POINTS.MULTIPLIER)
+
+   * Check for promotional bonus points
+   SELECT.CMD = 'SELECT PROMOTIONS WITH STATUS = "ACTIVE"'
+   SELECT.CMD := ' AND LOYALTY.BONUS.PTS # ""'
+   EXECUTE SELECT.CMD
+
+   BONUS.POINTS = 0
+   READNEXT PROMO.ID ELSE
+      * No bonus promotions
+   END
+   IF PROMO.ID # '' THEN
+      READ PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE
+         * Continue
+      END
+      BONUS.POINTS = PROMO.REC<47>  ; LOYALTY.BONUS.PTS
+      IF BONUS.POINTS = '' THEN BONUS.POINTS = 0
+   END
+
+   POINTS.EARNED.VAL += BONUS.POINTS
+
+   * Update transaction
+   TRANS.REC.IO<POINTS.EARNED> = POINTS.EARNED.VAL
+   RETURN
+
+**************************************************************************
+* Calculate Shipping
+**************************************************************************
+CALCULATE.SHIPPING:
+   * Check if shipping is required
+   IF TRANS.REC.IO<SHIP.TO.NAME> = '' THEN RETURN
+
+   SHIP.METHOD.VAL = TRANS.REC.IO<SHIP.METHOD>
+   IF SHIP.METHOD.VAL = '' THEN SHIP.METHOD.VAL = 'STANDARD'
+
+   * Calculate shipping cost based on method and weight
+   TOTAL.WEIGHT = 0
+   FOR LINE.NUM = 1 TO LINE.COUNT
+      ITEM.ID.VAL = TRANS.REC.IO<T.ITEM.ID, LINE.NUM>
+      QTY.VAL = TRANS.REC.IO<T.QTY, LINE.NUM>
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID.VAL ELSE CONTINUE
+
+      ITEM.WEIGHT = ITEM.REC<WEIGHT>
+      IF ITEM.WEIGHT = '' THEN ITEM.WEIGHT = 0
+
+      TOTAL.WEIGHT += (ITEM.WEIGHT * QTY.VAL)
+   NEXT LINE.NUM
+
+   * Simple shipping calculation
+   BEGIN CASE
+      CASE SHIP.METHOD.VAL = 'STANDARD'
+         SHIP.COST.VAL = 5.99
+         IF TOTAL.WEIGHT > 10 THEN
+            SHIP.COST.VAL += ((TOTAL.WEIGHT - 10) * 0.50)
+         END
+      CASE SHIP.METHOD.VAL = 'EXPRESS'
+         SHIP.COST.VAL = 15.99
+         IF TOTAL.WEIGHT > 10 THEN
+            SHIP.COST.VAL += ((TOTAL.WEIGHT - 10) * 1.00)
+         END
+      CASE SHIP.METHOD.VAL = 'OVERNIGHT'
+         SHIP.COST.VAL = 29.99
+         IF TOTAL.WEIGHT > 10 THEN
+            SHIP.COST.VAL += ((TOTAL.WEIGHT - 10) * 2.00)
+         END
+      CASE 1
+         SHIP.COST.VAL = 0
+   END CASE
+
+   * Free shipping on orders over $100
+   IF SUBTOTAL.AMT >= 100 THEN
+      SHIP.COST.VAL = 0
+   END
+
+   TRANS.REC.IO<SHIP.COST> = SHIP.COST.VAL
+
+   * Add shipping to total
+   TOTAL.AMT += SHIP.COST.VAL
+   RETURN
+
+**************************************************************************
+* Calculate Commission
+**************************************************************************
+CALCULATE.COMMISSION:
+   TOTAL.COMMISSION = 0
+
+   * Calculate commission for each line item
+   FOR LINE.NUM = 1 TO LINE.COUNT
+      ITEM.ID.VAL = TRANS.REC.IO<T.ITEM.ID, LINE.NUM>
+      LINE.TOTAL.VAL = TRANS.REC.IO<T.LINE.TOTAL, LINE.NUM>
+
+      READ ITEM.REC FROM F.INVENTORY, ITEM.ID.VAL ELSE CONTINUE
+
+      * Check if item is commissionable
+      IF ITEM.REC<COMMISSIONABLE> # 'Y' THEN CONTINUE
+
+      COMM.PCT = ITEM.REC<COMMISSION.PCT>
+      IF COMM.PCT = '' THEN COMM.PCT = 0
+
+      LINE.COMMISSION = LINE.TOTAL.VAL * (COMM.PCT / 100)
+      TOTAL.COMMISSION += LINE.COMMISSION
+   NEXT LINE.NUM
+
+   * Round commission
+   CALL UTILS.COMMON('ROUND.AMOUNT', TOTAL.COMMISSION, TOTAL.COMMISSION)
+
+   TRANS.REC.IO<COMMISSION.AMT> = TOTAL.COMMISSION
+
+   * Split commission if multiple sales reps
+   * For now, assign all to primary sales rep
+   SALES.REP.VAL = TRANS.REC.IO<SALES.REP.ID>
+   TRANS.REC.IO<COMMISSION.SPLIT, 1> = SALES.REP.VAL : '|' : TOTAL.COMMISSION
+   RETURN
+
+END

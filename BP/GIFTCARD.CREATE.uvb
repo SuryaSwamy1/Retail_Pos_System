@@ -1,0 +1,271 @@
+SUBROUTINE GIFTCARD.CREATE(INITIAL.AMOUNT, CUSTOMER.ID, GC.REC, GC.NUMBER, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: GIFTCARD.CREATE
+* Purpose: Create and Activate Gift Card
+* Parameters:
+*   INITIAL.AMOUNT (IN) - Initial balance amount
+*   CUSTOMER.ID (IN) - Optional customer ID
+*   GC.REC (OUT) - Created gift card record
+*   GC.NUMBER (OUT) - Generated gift card number
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+GC.REC = ''
+GC.NUMBER = ''
+
+* Validate initial amount
+IF INITIAL.AMOUNT = '' OR NOT(NUM(INITIAL.AMOUNT)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Initial amount must be numeric'
+   RETURN
+END
+
+IF INITIAL.AMOUNT < 5 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Minimum gift card amount is $5.00'
+   RETURN
+END
+
+IF INITIAL.AMOUNT > 1000 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Maximum gift card amount is $1000.00'
+   RETURN
+END
+
+* Validate customer ID if provided
+IF CUSTOMER.ID # '' THEN
+   READ CUST.REC FROM F.CUSTOMERS, CUSTOMER.ID ELSE
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'Customer not found'
+      RETURN
+   END
+END
+
+* Open gift card file
+OPEN 'GIFT.CARDS' TO F.GIFT.CARDS ELSE
+   EXECUTE 'CREATE.FILE GIFT.CARDS 1 101'
+   OPEN 'GIFT.CARDS' TO F.GIFT.CARDS ELSE
+      ERROR.CODE = ERR.DATABASE.ERROR
+      ERROR.MSG = 'Cannot open gift card file'
+      RETURN
+   END
+END
+
+* Generate gift card number with Luhn check digit
+GOSUB GENERATE.GIFT.CARD.NUMBER
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Build gift card record
+GOSUB BUILD.GIFT.CARD.RECORD
+
+* Write gift card record
+WRITE GC.REC TO F.GIFT.CARDS, GC.NUMBER ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write gift card record'
+   RETURN
+END
+
+* Create activation transaction
+GOSUB CREATE.ACTIVATION.TRANSACTION
+
+* Update customer record if applicable
+IF CUSTOMER.ID # '' THEN
+   GOSUB UPDATE.CUSTOMER.GIFT.CARDS
+END
+
+* Create activation audit
+GOSUB CREATE.ACTIVATION.AUDIT
+
+LOG.MSG = 'Gift card created: ' : GC.NUMBER : ' - Amount: $' : INITIAL.AMOUNT
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Generate Gift Card Number
+**************************************************************************
+GENERATE.GIFT.CARD.NUMBER:
+   * Format: 6000-XXXX-XXXX-XXXX (16 digits with Luhn check)
+   * 6000 prefix for gift cards
+
+   MAX.ATTEMPTS = 100
+   ATTEMPT = 0
+
+   LOOP
+      ATTEMPT += 1
+      IF ATTEMPT > MAX.ATTEMPTS THEN
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Unable to generate unique gift card number'
+         RETURN
+      END
+
+      * Generate 15 random digits (last digit will be Luhn check)
+      CARD.NUMBER = '6000'
+      FOR I = 1 TO 11
+         DIGIT = RND(10)
+         CARD.NUMBER := DIGIT
+      NEXT I
+
+      * Calculate and append Luhn check digit
+      CALL UTILS.COMMON('LUHN.CHECK.DIGIT', CARD.NUMBER, CHECK.DIGIT)
+      CARD.NUMBER := CHECK.DIGIT
+
+      * Check if number already exists
+      READ TEMP.REC FROM F.GIFT.CARDS, CARD.NUMBER ELSE
+         GC.NUMBER = CARD.NUMBER
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Build Gift Card Record
+**************************************************************************
+BUILD.GIFT.CARD.RECORD:
+   GC.REC = ''
+
+   * Field 1: Gift card number
+   GC.REC<1> = GC.NUMBER
+
+   * Field 2: Initial amount
+   GC.REC<2> = INITIAL.AMOUNT
+
+   * Field 3: Current balance
+   GC.REC<3> = INITIAL.AMOUNT
+
+   * Field 4: Status (ACTIVE, SUSPENDED, EXPIRED, DEPLETED)
+   GC.REC<4> = 'ACTIVE'
+
+   * Field 5: Activation date
+   GC.REC<5> = SYSTEM.DATE
+
+   * Field 6: Activation time
+   GC.REC<6> = SYSTEM.TIME
+
+   * Field 7: Activation store
+   GC.REC<7> = STORE.ID
+
+   * Field 8: Activation cashier
+   GC.REC<8> = USER.ID
+
+   * Field 9: Customer ID
+   GC.REC<9> = CUSTOMER.ID
+
+   * Field 10: Expiration date (3 years from activation)
+   GC.REC<10> = SYSTEM.DATE + 1095
+
+   * Field 11: Last transaction date
+   GC.REC<11> = SYSTEM.DATE
+
+   * Field 12: Last transaction type
+   GC.REC<12> = 'ACTIVATION'
+
+   * Field 13: Total loads
+   GC.REC<13> = 1
+
+   * Field 14: Total redemptions
+   GC.REC<14> = 0
+
+   * Field 15: Total load amount
+   GC.REC<15> = INITIAL.AMOUNT
+
+   * Field 16: Total redemption amount
+   GC.REC<16> = 0
+
+   * Field 17: Created by
+   GC.REC<17> = USER.ID
+
+   * Field 18: Created date
+   GC.REC<18> = SYSTEM.DATE
+
+   * Field 19: Modified by
+   GC.REC<19> = USER.ID
+
+   * Field 20: Modified date
+   GC.REC<20> = SYSTEM.DATE
+   RETURN
+
+**************************************************************************
+* Create Activation Transaction
+**************************************************************************
+CREATE.ACTIVATION.TRANSACTION:
+   OPEN 'GIFTCARD.TRANS' TO F.GC.TRANS ELSE
+      EXECUTE 'CREATE.FILE GIFTCARD.TRANS 1 101'
+      OPEN 'GIFTCARD.TRANS' TO F.GC.TRANS ELSE RETURN
+   END
+
+   TRANS.ID = GC.NUMBER : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME : '*ACT'
+
+   TRANS.REC = ''
+   TRANS.REC<1> = GC.NUMBER
+   TRANS.REC<2> = 'ACTIVATION'
+   TRANS.REC<3> = SYSTEM.DATE
+   TRANS.REC<4> = SYSTEM.TIME
+   TRANS.REC<5> = INITIAL.AMOUNT
+   TRANS.REC<6> = 0  ; Previous balance
+   TRANS.REC<7> = INITIAL.AMOUNT  ; New balance
+   TRANS.REC<8> = STORE.ID
+   TRANS.REC<9> = USER.ID
+   TRANS.REC<10> = ''  ; POS transaction ID
+   TRANS.REC<11> = 'COMPLETED'
+
+   WRITE TRANS.REC TO F.GC.TRANS, TRANS.ID
+   RETURN
+
+**************************************************************************
+* Update Customer Gift Cards
+**************************************************************************
+UPDATE.CUSTOMER.GIFT.CARDS:
+   READU CUST.REC FROM F.CUSTOMERS, CUSTOMER.ID ELSE RETURN
+
+   * Add to customer's gift card list
+   GC.LIST = CUST.REC<GIFT.CARDS>
+   IF GC.LIST = '' THEN
+      CUST.REC<GIFT.CARDS> = GC.NUMBER
+   END ELSE
+      CUST.REC<GIFT.CARDS> := VM : GC.NUMBER
+   END
+
+   * Update gift card count
+   GC.COUNT = CUST.REC<GIFT.CARD.COUNT>
+   IF GC.COUNT = '' THEN GC.COUNT = 0
+   CUST.REC<GIFT.CARD.COUNT> = GC.COUNT + 1
+
+   * Update total gift card value
+   GC.VALUE = CUST.REC<GIFT.CARD.VALUE>
+   IF GC.VALUE = '' THEN GC.VALUE = 0
+   CUST.REC<GIFT.CARD.VALUE> = GC.VALUE + INITIAL.AMOUNT
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUSTOMER.ID
+   RETURN
+
+**************************************************************************
+* Create Activation Audit
+**************************************************************************
+CREATE.ACTIVATION.AUDIT:
+   OPEN 'GIFTCARD.AUDIT' TO F.GC.AUDIT ELSE
+      EXECUTE 'CREATE.FILE GIFTCARD.AUDIT 1 101'
+      OPEN 'GIFTCARD.AUDIT' TO F.GC.AUDIT ELSE RETURN
+   END
+
+   AUDIT.ID = GC.NUMBER : '*ACT*' : SYSTEM.DATE
+
+   AUDIT.REC = ''
+   AUDIT.REC<1> = GC.NUMBER
+   AUDIT.REC<2> = 'ACTIVATION'
+   AUDIT.REC<3> = INITIAL.AMOUNT
+   AUDIT.REC<4> = USER.ID
+   AUDIT.REC<5> = SYSTEM.DATE
+   AUDIT.REC<6> = SYSTEM.TIME
+   AUDIT.REC<7> = STORE.ID
+   AUDIT.REC<8> = CUSTOMER.ID
+
+   WRITE AUDIT.REC TO F.GC.AUDIT, AUDIT.ID
+   RETURN
+
+END

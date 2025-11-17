@@ -1,0 +1,337 @@
+SUBROUTINE INV.CREATE(ITEM.REC, ITEM.ID.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: INV.CREATE
+* Purpose: Create New Inventory Item Record
+* Parameters:
+*   ITEM.REC (IN) - Item record with all fields populated
+*   ITEM.ID.OUT (OUT) - Generated item ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+ITEM.ID.OUT = ''
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate required fields
+GOSUB VALIDATE.ITEM
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check for duplicate SKU or UPC
+GOSUB CHECK.DUPLICATES
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Generate unique item ID
+CALL UTILS.COMMON('GENERATE.ID', 'ITEM', F.INVENTORY, ITEM.ID.OUT)
+IF ITEM.ID.OUT = '' THEN
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to generate item ID'
+   RETURN
+END
+
+* Set audit fields
+ITEM.REC<ITEM.CREATED.BY> = USER.ID
+ITEM.REC<ITEM.CREATED.DATE> = SYSTEM.DATE
+ITEM.REC<ITEM.CREATED.TIME> = SYSTEM.TIME
+ITEM.REC<ITEM.MODIFIED.BY> = USER.ID
+ITEM.REC<ITEM.MODIFIED.DATE> = SYSTEM.DATE
+ITEM.REC<ITEM.MODIFIED.TIME> = SYSTEM.TIME
+
+* Initialize item status if not set
+IF ITEM.REC<ITEM.STATUS> = '' THEN
+   ITEM.REC<ITEM.STATUS> = STATUS.ACTIVE
+END
+
+* Initialize numeric fields
+IF ITEM.REC<COST> = '' THEN ITEM.REC<COST> = 0
+IF ITEM.REC<LAST.COST> = '' THEN ITEM.REC<LAST.COST> = 0
+IF ITEM.REC<AVG.COST> = '' THEN ITEM.REC<AVG.COST> = 0
+IF ITEM.REC<PRICE.LEVEL1> = '' THEN ITEM.REC<PRICE.LEVEL1> = 0
+IF ITEM.REC<PRICE.LEVEL2> = '' THEN ITEM.REC<PRICE.LEVEL2> = 0
+IF ITEM.REC<PRICE.LEVEL3> = '' THEN ITEM.REC<PRICE.LEVEL3> = 0
+IF ITEM.REC<PRICE.LEVEL4> = '' THEN ITEM.REC<PRICE.LEVEL4> = 0
+IF ITEM.REC<PRICE.LEVEL5> = '' THEN ITEM.REC<PRICE.LEVEL5> = 0
+IF ITEM.REC<MSRP> = '' THEN ITEM.REC<MSRP> = 0
+IF ITEM.REC<MIN.PRICE> = '' THEN ITEM.REC<MIN.PRICE> = 0
+
+* Initialize quantity fields (multivalued by store)
+IF ITEM.REC<QTY.ON.HAND> = '' THEN
+   GOSUB INITIALIZE.STORE.QUANTITIES
+END
+
+* Initialize reorder fields
+IF ITEM.REC<REORDER.QTY> = '' THEN ITEM.REC<REORDER.QTY> = 0
+IF ITEM.REC<MAX.STOCK.LEVEL> = '' THEN ITEM.REC<MAX.STOCK.LEVEL> = 0
+IF ITEM.REC<MIN.STOCK.LEVEL> = '' THEN ITEM.REC<MIN.STOCK.LEVEL> = 0
+IF ITEM.REC<LEAD.TIME> = '' THEN ITEM.REC<LEAD.TIME> = 0
+
+* Set default flags
+IF ITEM.REC<TAXABLE> = '' THEN ITEM.REC<TAXABLE> = 'Y'
+IF ITEM.REC<SERIALIZED> = '' THEN ITEM.REC<SERIALIZED> = 'N'
+IF ITEM.REC<LOT.CONTROLLED> = '' THEN ITEM.REC<LOT.CONTROLLED> = 'N'
+IF ITEM.REC<PERISHABLE> = '' THEN ITEM.REC<PERISHABLE> = 'N'
+IF ITEM.REC<COMMISSIONABLE> = '' THEN ITEM.REC<COMMISSIONABLE> = 'Y'
+IF ITEM.REC<WEB.ENABLED> = '' THEN ITEM.REC<WEB.ENABLED> = 'N'
+IF ITEM.REC<KIT.FLAG> = '' THEN ITEM.REC<KIT.FLAG> = 'N'
+
+* Calculate initial margin if not set
+IF ITEM.REC<PRICE.LEVEL1> > 0 AND ITEM.REC<COST> > 0 THEN
+   GOSUB CALCULATE.MARGINS
+END
+
+* Write item record
+WRITE ITEM.REC TO F.INVENTORY, ITEM.ID.OUT ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write inventory item record'
+   RETURN
+END
+
+* Create inventory transaction record for initial setup
+GOSUB CREATE.INIT.TRANSACTION
+
+* Log item creation
+LOG.MSG = 'Inventory item created: ' : ITEM.ID.OUT : ' - ' : ITEM.REC<ITEM.DESC>
+LOG.MSG := ' SKU: ' : ITEM.REC<SKU>
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate Item Data
+**************************************************************************
+VALIDATE.ITEM:
+   * Check item description
+   IF ITEM.REC<ITEM.DESC> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Item description is required'
+      RETURN
+   END
+
+   * Check SKU
+   IF ITEM.REC<SKU> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'SKU is required'
+      RETURN
+   END
+
+   * Validate category
+   IF ITEM.REC<CATEGORY> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Category is required'
+      RETURN
+   END
+
+   * Validate unit of measure
+   IF ITEM.REC<UNIT.OF.MEASURE> = '' THEN
+      ITEM.REC<UNIT.OF.MEASURE> = 'EA'  ; Default to Each
+   END
+   VALID.UOM = 'EA':VM:'CS':VM:'DZ':VM:'LB':VM:'KG':VM:'GAL':VM:'LT':VM:'FT':VM:'MT'
+   LOCATE ITEM.REC<UNIT.OF.MEASURE> IN VALID.UOM<1> USING VM SETTING POS ELSE
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Invalid unit of measure'
+      RETURN
+   END
+
+   * Validate numeric fields
+   IF ITEM.REC<COST> # '' THEN
+      IF NOT(NUM(ITEM.REC<COST>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Cost must be numeric'
+         RETURN
+      END
+      IF ITEM.REC<COST> < 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Cost cannot be negative'
+         RETURN
+      END
+   END
+
+   * Validate prices
+   FOR LEVEL = 1 TO 5
+      PRICE.FIELD = PRICE.LEVEL1 + (LEVEL - 1)
+      IF ITEM.REC<PRICE.FIELD> # '' THEN
+         IF NOT(NUM(ITEM.REC<PRICE.FIELD>)) THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Price level ' : LEVEL : ' must be numeric'
+            RETURN
+         END
+         IF ITEM.REC<PRICE.FIELD> < 0 THEN
+            ERROR.CODE = ERR.INVALID.DATA
+            ERROR.MSG = 'Price level ' : LEVEL : ' cannot be negative'
+            RETURN
+         END
+      END
+   NEXT LEVEL
+
+   * Validate pack size
+   IF ITEM.REC<PACK.SIZE> # '' THEN
+      IF NOT(NUM(ITEM.REC<PACK.SIZE>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Pack size must be numeric'
+         RETURN
+      END
+      IF ITEM.REC<PACK.SIZE> <= 0 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Pack size must be greater than zero'
+         RETURN
+      END
+   END ELSE
+      ITEM.REC<PACK.SIZE> = 1  ; Default
+   END
+
+   * Validate weight and dimensions
+   IF ITEM.REC<WEIGHT> # '' THEN
+      IF NOT(NUM(ITEM.REC<WEIGHT>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Weight must be numeric'
+         RETURN
+      END
+   END
+
+   * Validate commission percentage
+   IF ITEM.REC<COMMISSION.PCT> # '' THEN
+      IF NOT(NUM(ITEM.REC<COMMISSION.PCT>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Commission percentage must be numeric'
+         RETURN
+      END
+      IF ITEM.REC<COMMISSION.PCT> < 0 OR ITEM.REC<COMMISSION.PCT> > 100 THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Commission percentage must be between 0 and 100'
+         RETURN
+      END
+   END
+
+   * Validate flags
+   VALID.FLAGS = 'Y':VM:'N'
+   IF ITEM.REC<TAXABLE> # '' THEN
+      LOCATE ITEM.REC<TAXABLE> IN VALID.FLAGS<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Taxable flag must be Y or N'
+         RETURN
+      END
+   END
+
+   * Validate reorder quantities
+   IF ITEM.REC<REORDER.QTY> # '' THEN
+      IF NOT(NUM(ITEM.REC<REORDER.QTY>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Reorder quantity must be numeric'
+         RETURN
+      END
+   END
+
+   * Validate lead time
+   IF ITEM.REC<LEAD.TIME> # '' THEN
+      IF NOT(NUM(ITEM.REC<LEAD.TIME>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Lead time must be numeric'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Check for Duplicate SKU or UPC
+**************************************************************************
+CHECK.DUPLICATES:
+   * Check for duplicate SKU
+   SELECT.CMD = 'SELECT INVENTORY WITH SKU = "' : ITEM.REC<SKU> : '"'
+   EXECUTE SELECT.CMD
+   READNEXT EXISTING.ID ELSE
+      * No duplicate SKU
+   END
+   IF EXISTING.ID # '' THEN
+      ERROR.CODE = ERR.DUPLICATE.KEY
+      ERROR.MSG = 'SKU already exists: ' : ITEM.REC<SKU>
+      RETURN
+   END
+
+   * Check for duplicate UPC if provided
+   IF ITEM.REC<UPC> # '' THEN
+      SELECT.CMD = 'SELECT INVENTORY WITH UPC = "' : ITEM.REC<UPC> : '"'
+      EXECUTE SELECT.CMD
+      READNEXT EXISTING.ID ELSE
+         * No duplicate UPC
+      END
+      IF EXISTING.ID # '' THEN
+         ERROR.CODE = ERR.DUPLICATE.KEY
+         ERROR.MSG = 'UPC already exists: ' : ITEM.REC<UPC>
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Initialize Store Quantities
+**************************************************************************
+INITIALIZE.STORE.QUANTITIES:
+   * Get list of all active stores
+   SELECT.CMD = 'SELECT STORES WITH STATUS = "' : STATUS.ACTIVE : '"'
+   EXECUTE SELECT.CMD
+
+   STORE.COUNT = 0
+   LOOP
+      READNEXT STORE.ID ELSE EXIT
+      STORE.COUNT += 1
+
+      * Initialize quantities for each store to zero
+      ITEM.REC<QTY.ON.HAND, STORE.COUNT> = 0
+      ITEM.REC<QTY.ALLOCATED, STORE.COUNT> = 0
+      ITEM.REC<QTY.AVAILABLE, STORE.COUNT> = 0
+      ITEM.REC<REORDER.POINT, STORE.COUNT> = 0
+      ITEM.REC<LOCATION, STORE.COUNT> = ''
+      ITEM.REC<BIN.LOCATION, STORE.COUNT> = ''
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Calculate Margins
+**************************************************************************
+CALCULATE.MARGINS:
+   * Calculate markup percentage
+   IF ITEM.REC<COST> > 0 THEN
+      MARKUP = ((ITEM.REC<PRICE.LEVEL1> - ITEM.REC<COST>) / ITEM.REC<COST>) * 100
+   END ELSE
+      MARKUP = 0
+   END
+
+   * Calculate margin percentage
+   IF ITEM.REC<PRICE.LEVEL1> > 0 THEN
+      MARGIN = ((ITEM.REC<PRICE.LEVEL1> - ITEM.REC<COST>) / ITEM.REC<PRICE.LEVEL1>) * 100
+   END ELSE
+      MARGIN = 0
+   END
+
+   * Store calculated values in notes for reference
+   CALC.NOTE = 'Initial Markup: ' : OCONV(MARKUP, 'MD2')
+   CALC.NOTE := '%, Margin: ' : OCONV(MARGIN, 'MD2') : '%'
+   ITEM.REC<ITEM.NOTES, 1> = CALC.NOTE
+   RETURN
+
+**************************************************************************
+* Create Initial Inventory Transaction
+**************************************************************************
+CREATE.INIT.TRANSACTION:
+   * Create transaction record for item creation
+   TRANS.ID = ITEM.ID.OUT : '*INIT*' : SYSTEM.DATE
+   TRANS.REC = ''
+   TRANS.REC<1> = ITEM.ID.OUT
+   TRANS.REC<2> = 'INIT'  ; Transaction type
+   TRANS.REC<3> = SYSTEM.DATE
+   TRANS.REC<4> = SYSTEM.TIME
+   TRANS.REC<5> = USER.ID
+   TRANS.REC<6> = 'Item created in system'
+   TRANS.REC<7> = 0  ; Quantity change
+   TRANS.REC<8> = ITEM.REC<COST>  ; Cost
+   TRANS.REC<9> = CURRENT.STORE
+   TRANS.REC<10> = ''  ; Reference
+
+   * Write transaction
+   WRITE TRANS.REC TO F.INVENTORY.TRANS, TRANS.ID
+   RETURN
+
+END

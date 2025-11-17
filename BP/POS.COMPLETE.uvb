@@ -1,0 +1,540 @@
+SUBROUTINE POS.COMPLETE(TRANS.REC.IO, FINAL.TRANS.ID, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: POS.COMPLETE
+* Purpose: Complete and Finalize POS Transaction
+* Parameters:
+*   TRANS.REC.IO (IN/OUT) - Transaction record
+*   FINAL.TRANS.ID (OUT) - Final transaction ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+FINAL.TRANS.ID = ''
+
+* Validate transaction has items
+LINE.COUNT = TRANS.REC.IO<303>
+IF LINE.COUNT = '' OR LINE.COUNT = 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Transaction has no items'
+   RETURN
+END
+
+* Validate payment is sufficient
+GOSUB VALIDATE.PAYMENT
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Generate final transaction ID
+GOSUB GENERATE.FINAL.TRANS.ID
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Update inventory quantities
+GOSUB UPDATE.INVENTORY
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Process loyalty points
+IF TRANS.REC.IO<T.LOYALTY.ID> # '' THEN
+   GOSUB PROCESS.LOYALTY
+END
+
+* Update customer purchase history
+IF TRANS.REC.IO<CUSTOMER.ID> # '' THEN
+   GOSUB UPDATE.CUSTOMER.HISTORY
+END
+
+* Update employee sales statistics
+GOSUB UPDATE.EMPLOYEE.STATS
+
+* Update store sales statistics
+GOSUB UPDATE.STORE.STATS
+
+* Update promotion usage
+GOSUB UPDATE.PROMOTION.USAGE
+
+* Finalize transaction record
+GOSUB FINALIZE.TRANSACTION
+
+* Write transaction to database
+WRITE TRANS.REC.IO TO F.POS.TRANS, FINAL.TRANS.ID ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write transaction'
+   RETURN
+END
+
+* Update register session
+GOSUB UPDATE.REGISTER.SESSION
+
+* Create accounting entries
+GOSUB CREATE.GL.ENTRIES
+
+* Print receipt
+GOSUB PRINT.RECEIPT
+
+* Send email receipt if requested
+IF TRANS.REC.IO<EMAIL.RECEIPT> = 'Y' THEN
+   GOSUB EMAIL.RECEIPT
+END
+
+* Log transaction completion
+LOG.MSG = 'Transaction completed: ' : FINAL.TRANS.ID
+LOG.MSG := ', Total: ' : TRANS.REC.IO<TOTAL.AMOUNT>
+LOG.MSG := ', Items: ' : LINE.COUNT
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate Payment
+**************************************************************************
+VALIDATE.PAYMENT:
+   * Calculate total paid
+   TOTAL.PAID = 0
+   PAY.COUNT = DCOUNT(TRANS.REC.IO<PAYMENT.AMT>, VM)
+   FOR I = 1 TO PAY.COUNT
+      PAID = TRANS.REC.IO<PAYMENT.AMT, I>
+      IF PAID = '' THEN PAID = 0
+      TOTAL.PAID += PAID
+   NEXT I
+
+   * Get transaction total
+   TRANS.TOTAL = TRANS.REC.IO<TOTAL.AMOUNT>
+   IF TRANS.TOTAL = '' THEN TRANS.TOTAL = 0
+
+   * Validate sufficient payment
+   IF TOTAL.PAID < TRANS.TOTAL THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Insufficient payment'
+      ERROR.MSG := ' (Total: ' : TRANS.TOTAL : ', Paid: ' : TOTAL.PAID : ')'
+      RETURN
+   END
+
+   * Check for overpayment on non-cash
+   IF TOTAL.PAID > TRANS.TOTAL THEN
+      * Verify last payment is cash
+      LAST.PAY.TYPE = TRANS.REC.IO<PAYMENT.TYPE, PAY.COUNT>
+      IF LAST.PAY.TYPE # PAY.CASH THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Overpayment only allowed with cash'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Generate Final Transaction ID
+**************************************************************************
+GENERATE.FINAL.TRANS.ID:
+   * Format: STORE-REGISTER-YYYYMMDD-SEQUENCE
+   STORE.ID.VAL = TRANS.REC.IO<STORE.ID>
+   REGISTER.ID.VAL = TRANS.REC.IO<REGISTER.ID>
+   TRANS.DATE.VAL = TRANS.REC.IO<TRANS.DATE>
+
+   * Get next sequence number for this register/date
+   SEQ.KEY = STORE.ID.VAL : '*' : REGISTER.ID.VAL : '*' : TRANS.DATE.VAL
+
+   OPEN 'TRANS.SEQUENCES' TO F.TRANS.SEQ ELSE
+      EXECUTE 'CREATE.FILE TRANS.SEQUENCES 1 1'
+      OPEN 'TRANS.SEQUENCES' TO F.TRANS.SEQ ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open sequence file'
+         RETURN
+      END
+   END
+
+   READU SEQ.REC FROM F.TRANS.SEQ, SEQ.KEY LOCKED
+      * Wait and retry
+      SLEEP 1
+      READ SEQ.REC FROM F.TRANS.SEQ, SEQ.KEY ELSE
+         SEQ.NUM = 1
+      END
+      SEQ.NUM = SEQ.REC<1>
+   END ELSE
+      SEQ.NUM = 1
+   END
+
+   * Increment and write back
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.TRANS.SEQ, SEQ.KEY
+
+   * Format sequence number
+   SEQ.STR = OCONV(SEQ.NUM, 'R(0)#6')
+
+   * Build transaction ID
+   DATE.STR = OCONV(TRANS.DATE.VAL, 'D4-YMD')
+   DATE.STR = CONVERT('-', '', DATE.STR)
+
+   FINAL.TRANS.ID = STORE.ID.VAL : '-' : REGISTER.ID.VAL : '-'
+   FINAL.TRANS.ID := DATE.STR : '-' : SEQ.STR
+
+   * Update transaction record
+   TRANS.REC.IO<TRANS.ID> = FINAL.TRANS.ID
+   RETURN
+
+**************************************************************************
+* Update Inventory
+**************************************************************************
+UPDATE.INVENTORY:
+   * Deduct sold quantities from inventory
+   LINE.COUNT.VAL = TRANS.REC.IO<303>
+   STORE.ID.VAL = TRANS.REC.IO<STORE.ID>
+
+   FOR LINE.NUM = 1 TO LINE.COUNT.VAL
+      ITEM.ID.VAL = TRANS.REC.IO<T.ITEM.ID, LINE.NUM>
+      ITEM.QTY = TRANS.REC.IO<T.QTY, LINE.NUM>
+
+      * Read item record
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID.VAL LOCKED
+         * Item locked, log warning and continue
+         WARN.MSG = 'Could not lock item for inventory update: ' : ITEM.ID.VAL
+         CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+         CONTINUE
+      END ELSE
+         * Item not found, log error
+         ERR.LOG = 'Item not found during completion: ' : ITEM.ID.VAL
+         CALL UTILS.COMMON('LOG.ERROR', ERR.LOG, 'ERROR')
+         CONTINUE
+      END
+
+      * Find store index
+      GOSUB FIND.STORE.INDEX.FOR.INV
+      IF STORE.INDEX = 0 THEN
+         RELEASE F.INVENTORY, ITEM.ID.VAL
+         CONTINUE
+      END
+
+      * Update quantities
+      OLD.QTY = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+      IF OLD.QTY = '' THEN OLD.QTY = 0
+
+      NEW.QTY = OLD.QTY - ITEM.QTY
+      IF NEW.QTY < 0 THEN
+         WARN.MSG = 'Negative inventory for item ' : ITEM.ID.VAL
+         WARN.MSG := ' at store ' : STORE.ID.VAL
+         CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+      END
+
+      ITEM.REC<QTY.ON.HAND, STORE.INDEX> = NEW.QTY
+
+      * Update allocated quantity
+      ALLOC.QTY = ITEM.REC<QTY.ALLOCATED, STORE.INDEX>
+      IF ALLOC.QTY = '' THEN ALLOC.QTY = 0
+      IF ALLOC.QTY >= ITEM.QTY THEN
+         ITEM.REC<QTY.ALLOCATED, STORE.INDEX> = ALLOC.QTY - ITEM.QTY
+      END
+
+      * Update available quantity
+      AVAIL.QTY = NEW.QTY - ITEM.REC<QTY.ALLOCATED, STORE.INDEX>
+      ITEM.REC<QTY.AVAILABLE, STORE.INDEX> = AVAIL.QTY
+
+      * Update last sale date
+      ITEM.REC<LAST.SALE.DATE> = TRANS.REC.IO<TRANS.DATE>
+
+      * Write updated item
+      WRITE ITEM.REC TO F.INVENTORY, ITEM.ID.VAL
+
+      * Create inventory transaction
+      INV.TRANS.ID = ITEM.ID.VAL : '*SALE*' : STORE.ID.VAL : '*' : FINAL.TRANS.ID
+      INV.TRANS.REC = ''
+      INV.TRANS.REC<1> = ITEM.ID.VAL
+      INV.TRANS.REC<2> = 'SALE'
+      INV.TRANS.REC<3> = TRANS.REC.IO<TRANS.DATE>
+      INV.TRANS.REC<4> = TRANS.REC.IO<TRANS.TIME>
+      INV.TRANS.REC<5> = TRANS.REC.IO<CASHIER.ID>
+      INV.TRANS.REC<6> = 'POS Sale'
+      INV.TRANS.REC<7> = OLD.QTY
+      INV.TRANS.REC<8> = NEW.QTY
+      INV.TRANS.REC<9> = -ITEM.QTY
+      INV.TRANS.REC<10> = STORE.ID.VAL
+      INV.TRANS.REC<11> = ITEM.REC<AVG.COST>
+      INV.TRANS.REC<12> = ITEM.QTY * ITEM.REC<AVG.COST>
+      INV.TRANS.REC<13> = 'POS Transaction: ' : FINAL.TRANS.ID
+      INV.TRANS.REC<14> = FINAL.TRANS.ID
+
+      WRITE INV.TRANS.REC TO F.INVENTORY.TRANS, INV.TRANS.ID
+   NEXT LINE.NUM
+   RETURN
+
+**************************************************************************
+* Find Store Index for Inventory
+**************************************************************************
+FIND.STORE.INDEX.FOR.INV:
+   STORE.INDEX = 0
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT STORE.ID ELSE EXIT
+      CURRENT.INDEX += 1
+      IF STORE.ID = STORE.ID.VAL THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Process Loyalty
+**************************************************************************
+PROCESS.LOYALTY:
+   * Get customer ID
+   CUST.ID.VAL = TRANS.REC.IO<CUSTOMER.ID>
+   IF CUST.ID.VAL = '' THEN RETURN
+
+   * Read customer record
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID.VAL ELSE
+      RETURN
+   END
+
+   * Add earned points
+   POINTS.EARNED.VAL = TRANS.REC.IO<POINTS.EARNED>
+   IF POINTS.EARNED.VAL = '' THEN POINTS.EARNED.VAL = 0
+
+   OLD.POINTS = CUST.REC<LOYALTY.POINTS>
+   IF OLD.POINTS = '' THEN OLD.POINTS = 0
+
+   NEW.POINTS = OLD.POINTS + POINTS.EARNED.VAL
+
+   * Subtract redeemed points (already done in payment)
+   CUST.REC<LOYALTY.POINTS> = NEW.POINTS
+
+   * Update purchase totals
+   TRANS.AMT = TRANS.REC.IO<TOTAL.AMOUNT>
+   CUST.REC<TOTAL.PURCHASES> += TRANS.AMT
+   CUST.REC<LAST.PURCHASE.DATE> = TRANS.REC.IO<TRANS.DATE>
+   CUST.REC<LAST.PURCHASE.AMT> = TRANS.AMT
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID.VAL
+
+   * Create loyalty transaction
+   LOYAL.TRANS.ID = CUST.ID.VAL : '*' : FINAL.TRANS.ID
+   LOYAL.TRANS.REC = ''
+   LOYAL.TRANS.REC<1> = LOYAL.TRANS.ID
+   LOYAL.TRANS.REC<2> = TRANS.REC.IO<T.LOYALTY.ID>
+   LOYAL.TRANS.REC<3> = CUST.ID.VAL
+   LOYAL.TRANS.REC<4> = 'EARN'
+   LOYAL.TRANS.REC<5> = TRANS.REC.IO<TRANS.DATE>
+   LOYAL.TRANS.REC<6> = TRANS.REC.IO<TRANS.TIME>
+   LOYAL.TRANS.REC<7> = TRANS.REC.IO<STORE.ID>
+   LOYAL.TRANS.REC<8> = FINAL.TRANS.ID
+   LOYAL.TRANS.REC<9> = POINTS.EARNED.VAL
+   LOYAL.TRANS.REC<10> = 0
+   LOYAL.TRANS.REC<11> = 0
+   LOYAL.TRANS.REC<12> = NEW.POINTS
+   LOYAL.TRANS.REC<13> = TRANS.AMT
+
+   WRITE LOYAL.TRANS.REC TO F.LOYALTY.TRANS, LOYAL.TRANS.ID
+   RETURN
+
+**************************************************************************
+* Update Customer History
+**************************************************************************
+UPDATE.CUSTOMER.HISTORY:
+   * Already updated in Process Loyalty if loyalty member
+   * For non-loyalty customers, update purchase history
+   IF TRANS.REC.IO<T.LOYALTY.ID> # '' THEN RETURN
+
+   CUST.ID.VAL = TRANS.REC.IO<CUSTOMER.ID>
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID.VAL ELSE
+      RETURN
+   END
+
+   TRANS.AMT = TRANS.REC.IO<TOTAL.AMOUNT>
+   CUST.REC<TOTAL.PURCHASES> += TRANS.AMT
+   CUST.REC<LAST.PURCHASE.DATE> = TRANS.REC.IO<TRANS.DATE>
+   CUST.REC<LAST.PURCHASE.AMT> = TRANS.AMT
+
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID.VAL
+   RETURN
+
+**************************************************************************
+* Update Employee Stats
+**************************************************************************
+UPDATE.EMPLOYEE.STATS:
+   CASHIER.ID.VAL = TRANS.REC.IO<CASHIER.ID>
+
+   READU EMP.REC FROM F.EMPLOYEES, CASHIER.ID.VAL ELSE
+      RETURN
+   END
+
+   * Update YTD sales
+   TRANS.AMT = TRANS.REC.IO<TOTAL.AMOUNT>
+   EMP.REC<72> += TRANS.AMT  ; YTD.GROSS.PAY field
+
+   * Update commission
+   COMM.AMT = TRANS.REC.IO<COMMISSION.AMT>
+   IF COMM.AMT = '' THEN COMM.AMT = 0
+   EMP.REC<73> += COMM.AMT  ; YTD.COMMISSION field
+
+   WRITE EMP.REC TO F.EMPLOYEES, CASHIER.ID.VAL
+   RETURN
+
+**************************************************************************
+* Update Store Stats
+**************************************************************************
+UPDATE.STORE.STATS:
+   STORE.ID.VAL = TRANS.REC.IO<STORE.ID>
+
+   READU STORE.REC FROM F.STORES, STORE.ID.VAL ELSE
+      RETURN
+   END
+
+   TRANS.AMT = TRANS.REC.IO<TOTAL.AMOUNT>
+   STORE.REC<74> += TRANS.AMT  ; YTD.SALES
+   STORE.REC<76> += 1  ; YTD.TRANSACTIONS
+
+   WRITE STORE.REC TO F.STORES, STORE.ID.VAL
+   RETURN
+
+**************************************************************************
+* Update Promotion Usage
+**************************************************************************
+UPDATE.PROMOTION.USAGE:
+   * Already updated in POS.CALCULATE
+   * Additional tracking can be added here
+   RETURN
+
+**************************************************************************
+* Finalize Transaction
+**************************************************************************
+FINALIZE.TRANSACTION:
+   * Set status to complete
+   TRANS.REC.IO<TRANS.STATUS> = STATUS.COMPLETE
+
+   * Set completion timestamp
+   TRANS.REC.IO<TRANS.MODIFIED.BY> = USER.ID
+   TRANS.REC.IO<TRANS.MODIFIED.DATE> = SYSTEM.DATE
+   TRANS.REC.IO<TRANS.MODIFIED.TIME> = SYSTEM.TIME
+
+   * Mark as not posted to GL (will be done in batch)
+   TRANS.REC.IO<POSTED.FLAG> = 'N'
+   RETURN
+
+**************************************************************************
+* Update Register Session
+**************************************************************************
+UPDATE.REGISTER.SESSION:
+   SESSION.ID = TRANS.REC.IO<302>
+   IF SESSION.ID = '' THEN RETURN
+
+   OPEN 'REGISTER.SESSIONS' TO F.REG.SESSIONS ELSE
+      RETURN
+   END
+
+   READU SESSION.REC FROM F.REG.SESSIONS, SESSION.ID ELSE
+      RETURN
+   END
+
+   * Update session totals
+   TRANS.AMT = TRANS.REC.IO<TOTAL.AMOUNT>
+   SESSION.REC<10> += TRANS.AMT  ; Total sales
+   SESSION.REC<11> += 1  ; Transaction count
+
+   * Update payment totals
+   PAY.COUNT = DCOUNT(TRANS.REC.IO<PAYMENT.TYPE>, VM)
+   FOR I = 1 TO PAY.COUNT
+      PAY.TYPE.VAL = TRANS.REC.IO<PAYMENT.TYPE, I>
+      PAY.AMT.VAL = TRANS.REC.IO<PAYMENT.AMT, I>
+
+      BEGIN CASE
+         CASE PAY.TYPE.VAL = PAY.CASH
+            SESSION.REC<12> += PAY.AMT.VAL
+         CASE PAY.TYPE.VAL = PAY.CREDIT
+            SESSION.REC<13> += PAY.AMT.VAL
+         CASE PAY.TYPE.VAL = PAY.DEBIT
+            SESSION.REC<14> += PAY.AMT.VAL
+         CASE PAY.TYPE.VAL = PAY.CHECK
+            SESSION.REC<15> += PAY.AMT.VAL
+      END CASE
+   NEXT I
+
+   WRITE SESSION.REC TO F.REG.SESSIONS, SESSION.ID
+   RETURN
+
+**************************************************************************
+* Create GL Entries
+**************************************************************************
+CREATE.GL.ENTRIES:
+   * Open GL journal file
+   OPEN 'GL.JOURNAL' TO F.GL.JOURNAL ELSE
+      RETURN
+   END
+
+   * Create sales entry
+   JE.ID = 'SALE*' : FINAL.TRANS.ID
+   JE.REC = ''
+   JE.REC<1> = TRANS.REC.IO<TRANS.DATE>
+   JE.REC<2> = 'POS Sale: ' : FINAL.TRANS.ID
+   JE.REC<3> = 'CASH'  ; Debit
+   JE.REC<4> = TRANS.REC.IO<TOTAL.AMOUNT>
+   JE.REC<5> = 'SALES'  ; Credit
+   JE.REC<6> = TRANS.REC.IO<SUBTOTAL>
+   JE.REC<7> = 'SALES.TAX'  ; Credit
+   JE.REC<8> = TRANS.REC.IO<TOTAL.TAX>
+   JE.REC<9> = USER.ID
+   JE.REC<10> = TRANS.REC.IO<STORE.ID>
+
+   WRITE JE.REC TO F.GL.JOURNAL, JE.ID
+
+   * Create COGS entry
+   TOTAL.COST = TRANS.REC.IO<304>
+   IF TOTAL.COST > 0 THEN
+      COGS.ID = 'COGS*' : FINAL.TRANS.ID
+      COGS.REC = ''
+      COGS.REC<1> = TRANS.REC.IO<TRANS.DATE>
+      COGS.REC<2> = 'COGS: ' : FINAL.TRANS.ID
+      COGS.REC<3> = 'COGS'  ; Debit
+      COGS.REC<4> = TOTAL.COST
+      COGS.REC<5> = 'INVENTORY'  ; Credit
+      COGS.REC<6> = TOTAL.COST
+
+      WRITE COGS.REC TO F.GL.JOURNAL, COGS.ID
+   END
+   RETURN
+
+**************************************************************************
+* Print Receipt
+**************************************************************************
+PRINT.RECEIPT:
+   * In production, format and send to printer
+   * For now, create receipt file
+   OPEN 'RECEIPTS.QUEUE' TO F.RECEIPT.QUEUE ELSE
+      RETURN
+   END
+
+   RECEIPT.ID = FINAL.TRANS.ID
+   RECEIPT.REC = TRANS.REC.IO
+
+   WRITE RECEIPT.REC TO F.RECEIPT.QUEUE, RECEIPT.ID
+
+   LOG.MSG = 'Receipt queued for printing: ' : FINAL.TRANS.ID
+   CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+   RETURN
+
+**************************************************************************
+* Email Receipt
+**************************************************************************
+EMAIL.RECEIPT:
+   EMAIL.ADDR = TRANS.REC.IO<RECEIPT.EMAIL>
+   IF EMAIL.ADDR = '' THEN RETURN
+
+   * Queue email
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'RECEIPT*' : FINAL.TRANS.ID
+   EMAIL.REC = ''
+   EMAIL.REC<1> = EMAIL.ADDR
+   EMAIL.REC<2> = 'Receipt: ' : FINAL.TRANS.ID
+   EMAIL.REC<3> = TRANS.REC.IO  ; Transaction data
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

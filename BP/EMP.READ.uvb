@@ -1,0 +1,486 @@
+SUBROUTINE EMP.READ(EMP.ID, EMP.REC, CALC.FLAG, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: EMP.READ
+* Purpose: Read Employee Record with Calculated Fields
+* Parameters:
+*   EMP.ID (IN) - Employee ID to read
+*   EMP.REC (OUT) - Employee record with data
+*   CALC.FLAG (IN) - TRUE to calculate additional fields
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+EMP.REC = ''
+
+* Validate employee ID
+IF EMP.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Employee ID is required'
+   RETURN
+END
+
+* Read employee record
+READ EMP.REC FROM F.EMPLOYEES, EMP.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Employee not found: ' : EMP.ID
+   RETURN
+END
+
+* Check if employee is deleted
+IF EMP.REC<EMP.STATUS> = STATUS.DELETED THEN
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Employee is inactive/deleted'
+   RETURN
+END
+
+* Calculate additional fields if requested
+IF CALC.FLAG THEN
+   GOSUB CALCULATE.TENURE
+   GOSUB CALCULATE.PTO.ACCRUAL
+   GOSUB CALCULATE.BENEFITS.VALUE
+   GOSUB GET.CURRENT.SCHEDULE
+   GOSUB GET.LAST.TIMECARD
+   GOSUB GET.LAST.REVIEW
+   GOSUB CALCULATE.COMMISSION.MTD
+   GOSUB CALCULATE.COMMISSION.YTD
+   GOSUB GET.SUBORDINATE.COUNT
+   GOSUB GET.TRAINING.STATUS
+   GOSUB CHECK.CERTIFICATIONS
+END
+
+RETURN
+
+**************************************************************************
+* Calculate Tenure
+**************************************************************************
+CALCULATE.TENURE:
+   HIRE.DATE = EMP.REC<HIRE.DATE>
+
+   IF HIRE.DATE = '' THEN
+      YEARS.OF.SERVICE = 0
+      MONTHS.OF.SERVICE = 0
+      DAYS.OF.SERVICE = 0
+      RETURN
+   END
+
+   * Calculate days between hire date and today
+   DAYS.DIFF = SYSTEM.DATE - HIRE.DATE
+   DAYS.OF.SERVICE = DAYS.DIFF
+
+   * Calculate years (approximate)
+   YEARS.OF.SERVICE = INT(DAYS.DIFF / 365)
+
+   * Calculate remaining months
+   REMAINING.DAYS = DAYS.DIFF - (YEARS.OF.SERVICE * 365)
+   MONTHS.OF.SERVICE = INT(REMAINING.DAYS / 30)
+
+   * Store in calculated fields (positions 90-92)
+   EMP.REC<90> = YEARS.OF.SERVICE
+   EMP.REC<91> = MONTHS.OF.SERVICE
+   EMP.REC<92> = DAYS.OF.SERVICE
+
+   * Calculate tenure category
+   BEGIN CASE
+      CASE YEARS.OF.SERVICE < 1
+         TENURE.CATEGORY = 'NEW'
+      CASE YEARS.OF.SERVICE >= 1 AND YEARS.OF.SERVICE < 3
+         TENURE.CATEGORY = 'INTERMEDIATE'
+      CASE YEARS.OF.SERVICE >= 3 AND YEARS.OF.SERVICE < 5
+         TENURE.CATEGORY = 'EXPERIENCED'
+      CASE YEARS.OF.SERVICE >= 5 AND YEARS.OF.SERVICE < 10
+         TENURE.CATEGORY = 'SENIOR'
+      CASE 1
+         TENURE.CATEGORY = 'VETERAN'
+   END CASE
+
+   EMP.REC<93> = TENURE.CATEGORY
+   RETURN
+
+**************************************************************************
+* Calculate PTO Accrual
+**************************************************************************
+CALCULATE.PTO.ACCRUAL:
+   * Base accrual rates by tenure (hours per pay period)
+   BEGIN CASE
+      CASE YEARS.OF.SERVICE < 1
+         PTO.ACCRUAL.RATE = 2.0      ; 52 hours/year
+      CASE YEARS.OF.SERVICE >= 1 AND YEARS.OF.SERVICE < 3
+         PTO.ACCRUAL.RATE = 3.0      ; 78 hours/year
+      CASE YEARS.OF.SERVICE >= 3 AND YEARS.OF.SERVICE < 5
+         PTO.ACCRUAL.RATE = 4.0      ; 104 hours/year
+      CASE YEARS.OF.SERVICE >= 5 AND YEARS.OF.SERVICE < 10
+         PTO.ACCRUAL.RATE = 5.0      ; 130 hours/year
+      CASE 1
+         PTO.ACCRUAL.RATE = 6.0      ; 156 hours/year
+   END CASE
+
+   * Store accrual rate
+   EMP.REC<94> = PTO.ACCRUAL.RATE
+
+   * Calculate annual PTO entitlement
+   ANNUAL.PTO = PTO.ACCRUAL.RATE * 26  ; 26 pay periods
+   EMP.REC<95> = ANNUAL.PTO
+
+   * Calculate PTO used YTD
+   GOSUB CALCULATE.PTO.USED
+
+   * Calculate available PTO
+   AVAILABLE.PTO = EMP.REC<PTO.BALANCE> - PTO.USED.YTD
+   EMP.REC<96> = AVAILABLE.PTO
+   RETURN
+
+**************************************************************************
+* Calculate PTO Used
+**************************************************************************
+CALCULATE.PTO.USED:
+   PTO.USED.YTD = 0
+
+   OPEN 'TIMECARDS' TO F.TIMECARDS ELSE
+      RETURN
+   END
+
+   * Get start of year
+   YEAR.START = ICONV('01/01/' : OCONV(SYSTEM.DATE, 'D4/')[7,4], 'D/')
+
+   SELECT.CMD = 'SELECT TIMECARDS WITH @ID LIKE "' : EMP.ID : '*..."'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TC.ID ELSE EXIT
+
+      READ TC.REC FROM F.TIMECARDS, TC.ID ELSE CONTINUE
+
+      TC.DATE = TC.REC<1>
+      IF TC.DATE >= YEAR.START THEN
+         PTO.HOURS = TC.REC<8>  ; PTO hours used
+         IF PTO.HOURS # '' THEN
+            PTO.USED.YTD += PTO.HOURS
+         END
+      END
+   REPEAT
+
+   EMP.REC<97> = PTO.USED.YTD
+   RETURN
+
+**************************************************************************
+* Calculate Benefits Value
+**************************************************************************
+CALCULATE.BENEFITS.VALUE:
+   TOTAL.BENEFITS.VALUE = 0
+
+   * Medical insurance
+   IF EMP.REC<MEDICAL.PLAN> # '' THEN
+      BEGIN CASE
+         CASE EMP.REC<MEDICAL.PLAN> = 'BASIC'
+            MEDICAL.VALUE = 300
+         CASE EMP.REC<MEDICAL.PLAN> = 'STANDARD'
+            MEDICAL.VALUE = 500
+         CASE EMP.REC<MEDICAL.PLAN> = 'PREMIUM'
+            MEDICAL.VALUE = 750
+         CASE 1
+            MEDICAL.VALUE = 0
+      END CASE
+      TOTAL.BENEFITS.VALUE += MEDICAL.VALUE
+   END
+
+   * Dental insurance
+   IF EMP.REC<DENTAL.PLAN> # '' THEN
+      DENTAL.VALUE = 50
+      TOTAL.BENEFITS.VALUE += DENTAL.VALUE
+   END
+
+   * Vision insurance
+   IF EMP.REC<VISION.PLAN> # '' THEN
+      VISION.VALUE = 25
+      TOTAL.BENEFITS.VALUE += VISION.VALUE
+   END
+
+   * 401k match (up to 4% of salary)
+   IF EMP.REC<K401.PERCENT> # '' AND EMP.REC<K401.PERCENT> > 0 THEN
+      IF EMP.REC<PAY.TYPE> = 'SALARY' THEN
+         ANNUAL.SALARY = EMP.REC<PAY.RATE>
+      END ELSE
+         * Estimate for hourly
+         ANNUAL.SALARY = EMP.REC<PAY.RATE> * 2080  ; 40hrs * 52 weeks
+      END
+
+      MATCH.PERCENT = EMP.REC<K401.PERCENT>
+      IF MATCH.PERCENT > 4 THEN MATCH.PERCENT = 4
+
+      K401.VALUE = (ANNUAL.SALARY * MATCH.PERCENT) / 100 / 12
+      TOTAL.BENEFITS.VALUE += K401.VALUE
+   END
+
+   * Life insurance
+   LIFE.VALUE = 10  ; Basic life insurance
+   TOTAL.BENEFITS.VALUE += LIFE.VALUE
+
+   EMP.REC<98> = TOTAL.BENEFITS.VALUE
+   RETURN
+
+**************************************************************************
+* Get Current Schedule
+**************************************************************************
+GET.CURRENT.SCHEDULE:
+   OPEN 'SCHEDULES' TO F.SCHEDULES ELSE
+      EMP.REC<99> = ''
+      RETURN
+   END
+
+   * Get current week's schedule
+   WEEK.START = SYSTEM.DATE - MOD(SYSTEM.DATE, 7)
+   SCHEDULE.ID = EMP.ID : '*' : WEEK.START
+
+   READ SCHEDULE.REC FROM F.SCHEDULES, SCHEDULE.ID ELSE
+      EMP.REC<99> = 'NOT SCHEDULED'
+      RETURN
+   END
+
+   * Calculate scheduled hours for the week
+   SCHEDULED.HOURS = 0
+   FOR I = 1 TO 7
+      SHIFT.HOURS = SCHEDULE.REC<10, I>
+      IF SHIFT.HOURS # '' THEN
+         SCHEDULED.HOURS += SHIFT.HOURS
+      END
+   NEXT I
+
+   EMP.REC<99> = SCHEDULED.HOURS : ' hours scheduled'
+   RETURN
+
+**************************************************************************
+* Get Last Timecard
+**************************************************************************
+GET.LAST.TIMECARD:
+   OPEN 'TIMECARDS' TO F.TIMECARDS ELSE
+      EMP.REC<100> = ''
+      RETURN
+   END
+
+   SELECT.CMD = 'SELECT TIMECARDS WITH @ID LIKE "' : EMP.ID : '*..."'
+   SELECT.CMD := ' BY.DSND @ID'
+   EXECUTE SELECT.CMD
+
+   READNEXT TC.ID ELSE
+      EMP.REC<100> = 'NO TIMECARDS'
+      RETURN
+   END
+
+   READ TC.REC FROM F.TIMECARDS, TC.ID ELSE
+      EMP.REC<100> = ''
+      RETURN
+   END
+
+   LAST.CLOCK.IN = TC.REC<2>
+   LAST.CLOCK.OUT = TC.REC<3>
+   HOURS.WORKED = TC.REC<7>
+
+   EMP.REC<100> = 'Last: ' : OCONV(TC.REC<1>, 'D4/') : ' - '
+   EMP.REC<100> := HOURS.WORKED : ' hours'
+   RETURN
+
+**************************************************************************
+* Get Last Review
+**************************************************************************
+GET.LAST.REVIEW:
+   OPEN 'REVIEWS' TO F.REVIEWS ELSE
+      EMP.REC<101> = ''
+      RETURN
+   END
+
+   SELECT.CMD = 'SELECT REVIEWS WITH @ID LIKE "' : EMP.ID : '*..."'
+   SELECT.CMD := ' BY.DSND @ID'
+   EXECUTE SELECT.CMD
+
+   READNEXT REVIEW.ID ELSE
+      EMP.REC<101> = 'NO REVIEWS'
+      RETURN
+   END
+
+   READ REVIEW.REC FROM F.REVIEWS, REVIEW.ID ELSE
+      EMP.REC<101> = ''
+      RETURN
+   END
+
+   REVIEW.DATE = REVIEW.REC<2>
+   REVIEW.RATING = REVIEW.REC<5>
+
+   EMP.REC<101> = 'Last: ' : OCONV(REVIEW.DATE, 'D4/')
+   EMP.REC<101> := ' - Rating: ' : REVIEW.RATING
+
+   * Calculate days until next review (annual)
+   NEXT.REVIEW = REVIEW.DATE + 365
+   DAYS.UNTIL = NEXT.REVIEW - SYSTEM.DATE
+
+   IF DAYS.UNTIL < 0 THEN
+      EMP.REC<102> = 'OVERDUE'
+   END ELSE IF DAYS.UNTIL < 30 THEN
+      EMP.REC<102> = 'DUE SOON'
+   END ELSE
+      EMP.REC<102> = DAYS.UNTIL : ' days'
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Commission MTD
+**************************************************************************
+CALCULATE.COMMISSION.MTD:
+   COMMISSION.MTD = 0
+
+   * Get start of month
+   MONTH.STR = OCONV(SYSTEM.DATE, 'D4/')[1,7]  ; MM/YYYY
+   MONTH.START = ICONV('01/' : MONTH.STR, 'D/')
+
+   SELECT.CMD = 'SELECT POS.TRANS WITH SALES.PERSON.ID = "' : EMP.ID : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE >= "' : MONTH.START : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Get commission amount
+      COMM.AMT = TRANS.REC<44>  ; Commission amount
+      IF COMM.AMT # '' THEN
+         COMMISSION.MTD += COMM.AMT
+      END
+   REPEAT
+
+   EMP.REC<103> = COMMISSION.MTD
+   RETURN
+
+**************************************************************************
+* Calculate Commission YTD
+**************************************************************************
+CALCULATE.COMMISSION.YTD:
+   COMMISSION.YTD = EMP.REC<YTD.COMMISSION>
+
+   * Verify by recalculating from transactions
+   YEAR.START = ICONV('01/01/' : OCONV(SYSTEM.DATE, 'D4/')[7,4], 'D/')
+
+   SELECT.CMD = 'SELECT POS.TRANS WITH SALES.PERSON.ID = "' : EMP.ID : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE >= "' : YEAR.START : '"'
+   EXECUTE SELECT.CMD
+
+   VERIFIED.YTD = 0
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      COMM.AMT = TRANS.REC<44>
+      IF COMM.AMT # '' THEN
+         VERIFIED.YTD += COMM.AMT
+      END
+   REPEAT
+
+   EMP.REC<104> = VERIFIED.YTD
+   RETURN
+
+**************************************************************************
+* Get Subordinate Count
+**************************************************************************
+GET.SUBORDINATE.COUNT:
+   SUBORDINATE.COUNT = 0
+
+   * Only for managers and supervisors
+   IF EMP.REC<POSITION> # 'MANAGER' AND EMP.REC<POSITION> # 'SUPERVISOR' THEN
+      EMP.REC<105> = 0
+      RETURN
+   END
+
+   * Count employees reporting to this employee
+   SELECT.CMD = 'SELECT EMPLOYEES WITH SUPERVISOR.ID = "' : EMP.ID : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT SUB.EMP.ID ELSE EXIT
+      SUBORDINATE.COUNT += 1
+   REPEAT
+
+   EMP.REC<105> = SUBORDINATE.COUNT
+   RETURN
+
+**************************************************************************
+* Get Training Status
+**************************************************************************
+GET.TRAINING.STATUS:
+   OPEN 'TRAINING' TO F.TRAINING ELSE
+      EMP.REC<106> = 'NO TRAINING DATA'
+      RETURN
+   END
+
+   * Count completed training courses
+   SELECT.CMD = 'SELECT TRAINING WITH @ID LIKE "' : EMP.ID : '*..."'
+   SELECT.CMD := ' AND WITH STATUS = "COMPLETED"'
+   EXECUTE SELECT.CMD
+
+   COMPLETED.COUNT = 0
+   LOOP
+      READNEXT TRAIN.ID ELSE EXIT
+      COMPLETED.COUNT += 1
+   REPEAT
+
+   * Count pending training
+   SELECT.CMD = 'SELECT TRAINING WITH @ID LIKE "' : EMP.ID : '*..."'
+   SELECT.CMD := ' AND WITH STATUS = "PENDING"'
+   EXECUTE SELECT.CMD
+
+   PENDING.COUNT = 0
+   LOOP
+      READNEXT TRAIN.ID ELSE EXIT
+      PENDING.COUNT += 1
+   REPEAT
+
+   EMP.REC<106> = 'Completed: ' : COMPLETED.COUNT
+   EMP.REC<106> := ', Pending: ' : PENDING.COUNT
+   RETURN
+
+**************************************************************************
+* Check Certifications
+**************************************************************************
+CHECK.CERTIFICATIONS:
+   OPEN 'CERTIFICATIONS' TO F.CERTS ELSE
+      EMP.REC<107> = 'NO CERTIFICATIONS'
+      RETURN
+   END
+
+   SELECT.CMD = 'SELECT CERTIFICATIONS WITH @ID LIKE "' : EMP.ID : '*..."'
+   EXECUTE SELECT.CMD
+
+   ACTIVE.CERTS = 0
+   EXPIRED.CERTS = 0
+   EXPIRING.SOON = 0
+
+   LOOP
+      READNEXT CERT.ID ELSE EXIT
+
+      READ CERT.REC FROM F.CERTS, CERT.ID ELSE CONTINUE
+
+      EXPIRY.DATE = CERT.REC<4>
+      IF EXPIRY.DATE = '' THEN
+         ACTIVE.CERTS += 1
+      END ELSE IF EXPIRY.DATE < SYSTEM.DATE THEN
+         EXPIRED.CERTS += 1
+      END ELSE IF EXPIRY.DATE < (SYSTEM.DATE + 30) THEN
+         EXPIRING.SOON += 1
+      END ELSE
+         ACTIVE.CERTS += 1
+      END
+   REPEAT
+
+   EMP.REC<107> = 'Active: ' : ACTIVE.CERTS
+   IF EXPIRED.CERTS > 0 THEN
+      EMP.REC<107> := ', Expired: ' : EXPIRED.CERTS
+   END
+   IF EXPIRING.SOON > 0 THEN
+      EMP.REC<107> := ', Expiring Soon: ' : EXPIRING.SOON
+   END
+   RETURN
+
+END

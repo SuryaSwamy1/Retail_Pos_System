@@ -1,0 +1,359 @@
+SUBROUTINE POS.ADD.ITEM(TRANS.REC.IO, ITEM.ID.IN, QTY.IN, OVERRIDE.PRICE, SALES.REP.IN, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: POS.ADD.ITEM
+* Purpose: Add Item to POS Transaction
+* Parameters:
+*   TRANS.REC.IO (IN/OUT) - Transaction record
+*   ITEM.ID.IN (IN) - Item ID, SKU, or UPC to add
+*   QTY.IN (IN) - Quantity to add
+*   OVERRIDE.PRICE (IN) - Price override (blank = use standard price)
+*   SALES.REP.IN (IN) - Sales rep for this item (blank = use cashier)
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate inputs
+IF ITEM.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Item ID, SKU, or UPC is required'
+   RETURN
+END
+
+IF QTY.IN = '' OR NOT(NUM(QTY.IN)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Quantity must be numeric'
+   RETURN
+END
+
+IF QTY.IN <= 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Quantity must be greater than zero'
+   RETURN
+END
+
+* Validate transaction is active
+IF TRANS.REC.IO<TRANS.STATUS> # 'ACTIVE' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Transaction is not active'
+   RETURN
+END
+
+* Read item record
+CALL INV.READ(ITEM.ID.IN, TRANS.REC.IO<STORE.ID>, ITEM.REC, ITEM.ERROR, ITEM.ERR.MSG)
+IF ITEM.ERROR # ERR.SUCCESS THEN
+   ERROR.CODE = ITEM.ERROR
+   ERROR.MSG = ITEM.ERR.MSG
+   RETURN
+END
+
+* Get actual item ID (in case SKU/UPC was provided)
+ACTUAL.ITEM.ID = ITEM.REC<ITEM.ID>
+
+* Validate item status
+IF ITEM.REC<ITEM.STATUS> # STATUS.ACTIVE THEN
+   ERROR.CODE = ERR.INVALID.ITEM
+   ERROR.MSG = 'Item is not active for sale'
+   RETURN
+END
+
+* Check inventory availability
+GOSUB CHECK.INVENTORY.AVAILABILITY
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Determine selling price
+GOSUB DETERMINE.SELLING.PRICE
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check if item is serialized or lot-controlled
+IF ITEM.REC<SERIALIZED> = 'Y' OR ITEM.REC<LOT.CONTROLLED> = 'Y' THEN
+   GOSUB HANDLE.SERIAL.LOT
+END
+
+* Check for active promotions
+GOSUB CHECK.PROMOTIONS
+
+* Calculate line item details
+GOSUB CALCULATE.LINE.ITEM
+
+* Add item to transaction
+GOSUB ADD.TO.TRANSACTION
+
+* Recalculate transaction totals
+CALL POS.CALCULATE(TRANS.REC.IO, CALC.ERROR, CALC.MSG)
+
+* Log item addition
+LOG.MSG = 'Item added to transaction: ' : ACTUAL.ITEM.ID
+LOG.MSG := ' (SKU: ' : ITEM.REC<SKU> : ', Qty: ' : QTY.IN : ')'
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Check Inventory Availability
+**************************************************************************
+CHECK.INVENTORY.AVAILABILITY:
+   * Get store-specific quantities (calculated in INV.READ)
+   STORE.QTY.AVAIL = ITEM.REC<212>  ; Store available quantity
+
+   IF STORE.QTY.AVAIL = '' THEN STORE.QTY.AVAIL = 0
+
+   * Check if sufficient quantity available
+   IF STORE.QTY.AVAIL < QTY.IN THEN
+      * Check system configuration for oversell policy
+      READ CONFIG.REC FROM F.SYSTEM.CONFIG, 'SYSTEM' ELSE
+         ALLOW.OVERSELL = FALSE
+      END
+      ALLOW.OVERSELL = CONFIG.REC<50>  ; Oversell allowed flag
+      IF ALLOW.OVERSELL = '' THEN ALLOW.OVERSELL = FALSE
+
+      IF NOT(ALLOW.OVERSELL) THEN
+         ERROR.CODE = ERR.INSUFFICIENT.INVENTORY
+         ERROR.MSG = 'Insufficient inventory available'
+         ERROR.MSG := ' (Available: ' : STORE.QTY.AVAIL : ', Requested: ' : QTY.IN : ')'
+         RETURN
+      END ELSE
+         * Log oversell warning
+         WARN.MSG = 'WARNING: Oversell for item ' : ACTUAL.ITEM.ID
+         WARN.MSG := ' (Available: ' : STORE.QTY.AVAIL : ', Requested: ' : QTY.IN : ')'
+         CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Determine Selling Price
+**************************************************************************
+DETERMINE.SELLING.PRICE:
+   * Start with price override if provided
+   IF OVERRIDE.PRICE # '' AND NUM(OVERRIDE.PRICE) THEN
+      IF OVERRIDE.PRICE < 0 THEN
+         ERROR.CODE = ERR.INVALID.PRICE
+         ERROR.MSG = 'Override price cannot be negative'
+         RETURN
+      END
+
+      * Check if override requires manager approval
+      ITEM.COST = ITEM.REC<COST>
+      IF ITEM.COST = '' THEN ITEM.COST = 0
+
+      IF OVERRIDE.PRICE < ITEM.COST AND USER.LEVEL < 7 THEN
+         ERROR.CODE = ERR.PERMISSION.DENIED
+         ERROR.MSG = 'Price below cost requires manager approval'
+         RETURN
+      END
+
+      * Check against minimum price
+      MIN.PRICE.VAL = ITEM.REC<MIN.PRICE>
+      IF MIN.PRICE.VAL = '' THEN MIN.PRICE.VAL = 0
+
+      IF OVERRIDE.PRICE < MIN.PRICE.VAL AND USER.LEVEL < 8 THEN
+         ERROR.CODE = ERR.INVALID.PRICE
+         ERROR.MSG = 'Price below minimum allowed (' : MIN.PRICE.VAL : ')'
+         RETURN
+      END
+
+      SELLING.PRICE = OVERRIDE.PRICE
+      PRICE.OVERRIDDEN = TRUE
+   END ELSE
+      PRICE.OVERRIDDEN = FALSE
+
+      * Check if item is on sale
+      ON.SALE = ITEM.REC<206>  ; Calculated in INV.READ
+      IF ON.SALE = 'Y' THEN
+         SELLING.PRICE = ITEM.REC<SALE.PRICE>
+      END ELSE
+         * Get customer price level if customer assigned
+         CUST.ID = TRANS.REC.IO<CUSTOMER.ID>
+         IF CUST.ID # '' THEN
+            READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE
+               PRICE.LEVEL = 1
+            END
+            PRICE.LEVEL = CUST.REC<PRICE.LEVEL>
+            IF PRICE.LEVEL = '' THEN PRICE.LEVEL = 1
+         END ELSE
+            PRICE.LEVEL = 1  ; Default retail price
+         END
+
+         * Get price from appropriate level
+         PRICE.FIELD = PRICE.LEVEL1 + (PRICE.LEVEL - 1)
+         SELLING.PRICE = ITEM.REC<PRICE.FIELD>
+      END
+   END
+
+   IF SELLING.PRICE = '' OR SELLING.PRICE = 0 THEN
+      ERROR.CODE = ERR.INVALID.PRICE
+      ERROR.MSG = 'No valid price found for item'
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Handle Serial/Lot Numbers
+**************************************************************************
+HANDLE.SERIAL.LOT:
+   * For serialized items, prompt for serial numbers
+   * This is a simplified version - in production would have UI interaction
+   SERIAL.NUMBERS = ''
+   LOT.NUMBERS = ''
+
+   IF ITEM.REC<SERIALIZED> = 'Y' THEN
+      * Would prompt for serial numbers equal to quantity
+      * For now, just initialize empty
+      FOR I = 1 TO QTY.IN
+         SERIAL.NUMBERS<1, I> = ''  ; Would be entered at POS
+      NEXT I
+   END
+
+   IF ITEM.REC<LOT.CONTROLLED> = 'Y' THEN
+      * Would prompt for lot number and verify expiration
+      LOT.NUMBERS = ''  ; Would be entered at POS
+   END
+   RETURN
+
+**************************************************************************
+* Check Promotions
+**************************************************************************
+CHECK.PROMOTIONS:
+   * Check if item has active promotions (calculated in INV.READ)
+   PROMO.ACTIVE = ITEM.REC<240>
+   PROMO.CODES = ITEM.REC<241>
+
+   PROMO.DISCOUNT.PCT = 0
+   PROMO.DISCOUNT.AMT = 0
+   APPLIED.PROMO.CODE = ''
+
+   IF PROMO.ACTIVE = 'Y' AND PROMO.CODES # '' THEN
+      * Apply first matching promotion
+      * In production, would evaluate all and apply best
+      FIRST.PROMO.CODE = PROMO.CODES<1>
+
+      * Read promotion record
+      SELECT.CMD = 'SELECT PROMOTIONS WITH PROMO.CODE = "' : FIRST.PROMO.CODE : '"'
+      EXECUTE SELECT.CMD
+      READNEXT PROMO.ID ELSE
+         RETURN
+      END
+
+      READ PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE
+         RETURN
+      END
+
+      * Get discount from promotion
+      PROMO.DISC.TYPE = PROMO.REC<12>  ; DISCOUNT.TYPE
+      PROMO.DISC.VALUE = PROMO.REC<13>  ; DISCOUNT.VALUE
+
+      IF PROMO.DISC.TYPE = 'PERCENT' THEN
+         PROMO.DISCOUNT.PCT = PROMO.DISC.VALUE
+      END ELSE IF PROMO.DISC.TYPE = 'AMOUNT' THEN
+         PROMO.DISCOUNT.AMT = PROMO.DISC.VALUE
+      END
+
+      APPLIED.PROMO.CODE = FIRST.PROMO.CODE
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Line Item
+**************************************************************************
+CALCULATE.LINE.ITEM:
+   * Calculate extended price (before discount)
+   EXTENDED.PRICE = SELLING.PRICE * QTY.IN
+
+   * Apply item discount
+   LINE.DISCOUNT.PCT = PROMO.DISCOUNT.PCT
+   LINE.DISCOUNT.AMT = PROMO.DISCOUNT.AMT
+
+   * Apply customer discount if applicable
+   CUST.ID = TRANS.REC.IO<CUSTOMER.ID>
+   IF CUST.ID # '' THEN
+      READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE
+         CUST.DISCOUNT = 0
+      END
+      CUST.DISCOUNT = CUST.REC<DISCOUNT.PCT>
+      IF CUST.DISCOUNT = '' THEN CUST.DISCOUNT = 0
+
+      * Use higher discount
+      IF CUST.DISCOUNT > LINE.DISCOUNT.PCT THEN
+         LINE.DISCOUNT.PCT = CUST.DISCOUNT
+         LINE.DISCOUNT.AMT = 0
+         APPLIED.PROMO.CODE = 'CUSTOMER'
+      END
+   END
+
+   * Calculate discount amount
+   IF LINE.DISCOUNT.PCT > 0 THEN
+      CALC.DISC.AMT = EXTENDED.PRICE * (LINE.DISCOUNT.PCT / 100)
+      IF LINE.DISCOUNT.AMT = 0 OR CALC.DISC.AMT > LINE.DISCOUNT.AMT THEN
+         LINE.DISCOUNT.AMT = CALC.DISC.AMT
+      END
+   END
+
+   * Calculate amount after discount
+   AMT.AFTER.DISCOUNT = EXTENDED.PRICE - LINE.DISCOUNT.AMT
+
+   * Calculate tax
+   IF ITEM.REC<TAXABLE> = 'Y' THEN
+      TAX.CODE.VAL = ITEM.REC<TAX.CODE>
+      IF TAX.CODE.VAL = '' THEN TAX.CODE.VAL = 'STD'
+
+      * Get tax rate (use system default)
+      CALL UTILS.COMMON('CALCULATE.TAX', AMT.AFTER.DISCOUNT, '', LINE.TAX.AMT)
+      LINE.TAX.RATE = TAX.RATE  ; From common
+   END ELSE
+      LINE.TAX.AMT = 0
+      LINE.TAX.RATE = 0
+      TAX.CODE.VAL = 'EXEMPT'
+   END
+
+   * Calculate line total
+   LINE.TOTAL = AMT.AFTER.DISCOUNT + LINE.TAX.AMT
+
+   * Round amounts
+   CALL UTILS.COMMON('ROUND.AMOUNT', LINE.DISCOUNT.AMT, LINE.DISCOUNT.AMT)
+   CALL UTILS.COMMON('ROUND.AMOUNT', LINE.TAX.AMT, LINE.TAX.AMT)
+   CALL UTILS.COMMON('ROUND.AMOUNT', LINE.TOTAL, LINE.TOTAL)
+   RETURN
+
+**************************************************************************
+* Add to Transaction
+**************************************************************************
+ADD.TO.TRANSACTION:
+   * Get current line count
+   LINE.COUNT = TRANS.REC.IO<303>
+   IF LINE.COUNT = '' THEN LINE.COUNT = 0
+   LINE.COUNT += 1
+
+   * Add item to multivalued fields
+   TRANS.REC.IO<T.ITEM.ID, LINE.COUNT> = ACTUAL.ITEM.ID
+   TRANS.REC.IO<T.SKU, LINE.COUNT> = ITEM.REC<SKU>
+   TRANS.REC.IO<T.ITEM.DESC, LINE.COUNT> = ITEM.REC<ITEM.DESC>
+   TRANS.REC.IO<T.QTY, LINE.COUNT> = QTY.IN
+   TRANS.REC.IO<T.UNIT.PRICE, LINE.COUNT> = SELLING.PRICE
+   TRANS.REC.IO<T.EXTENDED.PRICE, LINE.COUNT> = EXTENDED.PRICE
+   TRANS.REC.IO<T.COST, LINE.COUNT> = ITEM.REC<COST>
+   TRANS.REC.IO<T.DISCOUNT.CODE, LINE.COUNT> = APPLIED.PROMO.CODE
+   TRANS.REC.IO<T.DISCOUNT.PCT, LINE.COUNT> = LINE.DISCOUNT.PCT
+   TRANS.REC.IO<T.DISCOUNT.AMT, LINE.COUNT> = LINE.DISCOUNT.AMT
+   TRANS.REC.IO<T.TAX.CODE, LINE.COUNT> = TAX.CODE.VAL
+   TRANS.REC.IO<T.TAX.RATE, LINE.COUNT> = LINE.TAX.RATE
+   TRANS.REC.IO<T.TAX.AMT, LINE.COUNT> = LINE.TAX.AMT
+   TRANS.REC.IO<T.LINE.TOTAL, LINE.COUNT> = LINE.TOTAL
+   TRANS.REC.IO<T.SERIAL.NUMBERS, LINE.COUNT> = SERIAL.NUMBERS
+   TRANS.REC.IO<T.LOT.NUMBERS, LINE.COUNT> = LOT.NUMBERS
+
+   * Update line count
+   TRANS.REC.IO<303> = LINE.COUNT
+
+   * Update modified fields
+   TRANS.REC.IO<TRANS.MODIFIED.BY> = USER.ID
+   TRANS.REC.IO<TRANS.MODIFIED.DATE> = SYSTEM.DATE
+   TRANS.REC.IO<TRANS.MODIFIED.TIME> = SYSTEM.TIME
+   RETURN
+
+END

@@ -1,0 +1,293 @@
+SUBROUTINE VENDOR.CREATE(VENDOR.REC, VENDOR.ID.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: VENDOR.CREATE
+* Purpose: Create New Vendor Record
+* Parameters:
+*   VENDOR.REC (IN) - Vendor record with all fields populated
+*   VENDOR.ID.OUT (OUT) - Generated vendor ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+VENDOR.ID.OUT = ''
+
+* Validate required fields
+GOSUB VALIDATE.VENDOR
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Check for duplicate vendor
+GOSUB CHECK.DUPLICATE.VENDOR
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Generate vendor ID
+GOSUB GENERATE.VENDOR.ID
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Set default values
+GOSUB SET.DEFAULT.VALUES
+
+* Set audit fields
+VENDOR.REC<VENDOR.ID> = VENDOR.ID.OUT
+VENDOR.REC<CREATED.BY> = USER.ID
+VENDOR.REC<CREATED.DATE> = SYSTEM.DATE
+VENDOR.REC<CREATED.TIME> = SYSTEM.TIME
+VENDOR.REC<MODIFIED.BY> = USER.ID
+VENDOR.REC<MODIFIED.DATE> = SYSTEM.DATE
+VENDOR.REC<MODIFIED.TIME> = SYSTEM.TIME
+
+* Write vendor record
+WRITE VENDOR.REC TO F.VENDORS, VENDOR.ID.OUT ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write vendor record'
+   RETURN
+END
+
+* Create vendor contacts
+GOSUB CREATE.VENDOR.CONTACTS
+
+* Send welcome email
+GOSUB SEND.VENDOR.WELCOME
+
+LOG.MSG = 'Vendor created: ' : VENDOR.ID.OUT : ' - ' : VENDOR.REC<VENDOR.NAME>
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Validate Vendor
+**************************************************************************
+VALIDATE.VENDOR:
+   * Check required fields
+   IF VENDOR.REC<VENDOR.NAME> = '' THEN
+      ERROR.CODE = ERR.INVALID.DATA
+      ERROR.MSG = 'Vendor name is required'
+      RETURN
+   END
+
+   * Validate tax ID format
+   IF VENDOR.REC<TAX.ID> # '' THEN
+      TAX.ID.CLEAN = CONVERT('-', '', VENDOR.REC<TAX.ID>)
+      IF LEN(TAX.ID.CLEAN) # 9 OR NOT(NUM(TAX.ID.CLEAN)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid tax ID format (XXX-XX-XXXX)'
+         RETURN
+      END
+   END
+
+   * Validate email
+   IF VENDOR.REC<VENDOR.EMAIL> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.EMAIL', VENDOR.REC<VENDOR.EMAIL>, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid email address'
+         RETURN
+      END
+   END
+
+   * Validate phone
+   IF VENDOR.REC<VENDOR.PHONE> # '' THEN
+      CALL UTILS.COMMON('VALIDATE.PHONE', VENDOR.REC<VENDOR.PHONE>, FMT.PHONE, VALID.FLAG)
+      IF NOT(VALID.FLAG) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid phone number'
+         RETURN
+      END
+      VENDOR.REC<VENDOR.PHONE> = FMT.PHONE
+   END
+
+   * Validate payment terms
+   IF VENDOR.REC<PAYMENT.TERMS> # '' THEN
+      VALID.TERMS = 'NET30':VM:'NET60':VM:'NET90':VM:'COD':VM:'PREPAID'
+      LOCATE VENDOR.REC<PAYMENT.TERMS> IN VALID.TERMS<1> USING VM SETTING POS ELSE
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Invalid payment terms'
+         RETURN
+      END
+   END
+
+   * Validate lead time
+   IF VENDOR.REC<LEAD.TIME.DAYS> # '' THEN
+      IF NOT(NUM(VENDOR.REC<LEAD.TIME.DAYS>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Lead time must be numeric'
+         RETURN
+      END
+   END
+
+   * Validate minimum order
+   IF VENDOR.REC<MIN.ORDER.AMT> # '' THEN
+      IF NOT(NUM(VENDOR.REC<MIN.ORDER.AMT>)) THEN
+         ERROR.CODE = ERR.INVALID.DATA
+         ERROR.MSG = 'Minimum order amount must be numeric'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Check Duplicate Vendor
+**************************************************************************
+CHECK.DUPLICATE.VENDOR:
+   VENDOR.NAME = VENDOR.REC<VENDOR.NAME>
+
+   SELECT.CMD = 'SELECT VENDORS'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT EXISTING.ID ELSE EXIT
+
+      READ EXISTING.REC FROM F.VENDORS, EXISTING.ID ELSE CONTINUE
+
+      IF EXISTING.REC<VENDOR.NAME> = VENDOR.NAME THEN
+         ERROR.CODE = ERR.DUPLICATE.KEY
+         ERROR.MSG = 'Vendor name already exists'
+         RETURN
+      END
+
+      * Check tax ID if provided
+      IF VENDOR.REC<TAX.ID> # '' THEN
+         IF EXISTING.REC<TAX.ID> = VENDOR.REC<TAX.ID> THEN
+            ERROR.CODE = ERR.DUPLICATE.KEY
+            ERROR.MSG = 'Tax ID already exists'
+            RETURN
+         END
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Generate Vendor ID
+**************************************************************************
+GENERATE.VENDOR.ID:
+   * Format: VEND-YYYYMMDD-XXX
+
+   DATE.STR = OCONV(SYSTEM.DATE, 'D4-YMD')
+   DATE.STR = CONVERT('-', '', DATE.STR)
+
+   SEQ.KEY = 'VENDOR-SEQ*' : SYSTEM.DATE
+
+   OPEN 'VENDOR.SEQUENCES' TO F.VENDOR.SEQ ELSE
+      EXECUTE 'CREATE.FILE VENDOR.SEQUENCES 1 1'
+      OPEN 'VENDOR.SEQUENCES' TO F.VENDOR.SEQ ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open vendor sequence file'
+         RETURN
+      END
+   END
+
+   READU SEQ.REC FROM F.VENDOR.SEQ, SEQ.KEY ELSE
+      SEQ.NUM = 1
+   END
+   SEQ.NUM = SEQ.REC<1>
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.VENDOR.SEQ, SEQ.KEY
+
+   SEQ.STR = OCONV(SEQ.NUM, 'R(0)#3')
+   VENDOR.ID.OUT = 'VEND-' : DATE.STR : '-' : SEQ.STR
+   RETURN
+
+**************************************************************************
+* Set Default Values
+**************************************************************************
+SET.DEFAULT.VALUES:
+   * Set default status
+   IF VENDOR.REC<VENDOR.STATUS> = '' THEN
+      VENDOR.REC<VENDOR.STATUS> = 'ACTIVE'
+   END
+
+   * Initialize numeric fields
+   IF VENDOR.REC<YTD.PURCHASES> = '' THEN
+      VENDOR.REC<YTD.PURCHASES> = 0
+   END
+
+   IF VENDOR.REC<YTD.PURCHASE.AMT> = '' THEN
+      VENDOR.REC<YTD.PURCHASE.AMT> = 0
+   END
+
+   IF VENDOR.REC<TOTAL.PURCHASES> = '' THEN
+      VENDOR.REC<TOTAL.PURCHASES> = 0
+   END
+
+   IF VENDOR.REC<TOTAL.PURCHASE.AMT> = '' THEN
+      VENDOR.REC<TOTAL.PURCHASE.AMT> = 0
+   END
+
+   IF VENDOR.REC<ON.TIME.DELIVERIES> = '' THEN
+      VENDOR.REC<ON.TIME.DELIVERIES> = 0
+   END
+
+   IF VENDOR.REC<LATE.DELIVERIES> = '' THEN
+      VENDOR.REC<LATE.DELIVERIES> = 0
+   END
+
+   IF VENDOR.REC<QUALITY.RATING> = '' THEN
+      VENDOR.REC<QUALITY.RATING> = 0
+   END
+
+   * Set default payment terms
+   IF VENDOR.REC<PAYMENT.TERMS> = '' THEN
+      VENDOR.REC<PAYMENT.TERMS> = 'NET30'
+   END
+
+   * Set default lead time
+   IF VENDOR.REC<LEAD.TIME.DAYS> = '' THEN
+      VENDOR.REC<LEAD.TIME.DAYS> = 7
+   END
+   RETURN
+
+**************************************************************************
+* Create Vendor Contacts
+**************************************************************************
+CREATE.VENDOR.CONTACTS:
+   * Create contact records if contact info provided
+
+   CONTACT.NAME = VENDOR.REC<PRIMARY.CONTACT>
+   IF CONTACT.NAME = '' THEN RETURN
+
+   OPEN 'VENDOR.CONTACTS' TO F.CONTACTS ELSE
+      EXECUTE 'CREATE.FILE VENDOR.CONTACTS 1 101'
+      OPEN 'VENDOR.CONTACTS' TO F.CONTACTS ELSE RETURN
+   END
+
+   CONTACT.ID = VENDOR.ID.OUT : '*PRIMARY'
+   CONTACT.REC = ''
+   CONTACT.REC<1> = VENDOR.ID.OUT
+   CONTACT.REC<2> = CONTACT.NAME
+   CONTACT.REC<3> = VENDOR.REC<CONTACT.TITLE>
+   CONTACT.REC<4> = VENDOR.REC<CONTACT.PHONE>
+   CONTACT.REC<5> = VENDOR.REC<CONTACT.EMAIL>
+   CONTACT.REC<6> = 'PRIMARY'
+   CONTACT.REC<7> = SYSTEM.DATE
+
+   WRITE CONTACT.REC TO F.CONTACTS, CONTACT.ID
+   RETURN
+
+**************************************************************************
+* Send Vendor Welcome
+**************************************************************************
+SEND.VENDOR.WELCOME:
+   IF VENDOR.REC<VENDOR.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   EMAIL.ID = 'VENDOR.WELCOME*' : VENDOR.ID.OUT
+   EMAIL.REC = ''
+   EMAIL.REC<1> = VENDOR.REC<VENDOR.EMAIL>
+   EMAIL.REC<2> = 'Welcome as Our New Vendor Partner'
+   EMAIL.REC<3> = 'Welcome ' : VENDOR.REC<VENDOR.NAME> : ',' : AM : AM
+   EMAIL.REC<3> := 'Your vendor account has been created.' : AM
+   EMAIL.REC<3> := 'Vendor ID: ' : VENDOR.ID.OUT : AM : AM
+   EMAIL.REC<3> := 'We look forward to a successful partnership.' : AM
+   EMAIL.REC<3> := 'Please contact us with any questions.'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

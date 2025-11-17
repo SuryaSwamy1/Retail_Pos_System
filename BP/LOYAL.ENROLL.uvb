@@ -1,0 +1,393 @@
+SUBROUTINE LOYAL.ENROLL(CUST.ID, TIER.LEVEL, ENROLL.SOURCE, LOYAL.ID.OUT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: LOYAL.ENROLL
+* Purpose: Enroll Customer in Loyalty Program
+* Parameters:
+*   CUST.ID (IN) - Customer ID to enroll
+*   TIER.LEVEL (IN) - Initial tier (BRONZE, SILVER, GOLD, PLATINUM)
+*   ENROLL.SOURCE (IN) - Enrollment source (POS, ONLINE, MOBILE, etc.)
+*   LOYAL.ID.OUT (OUT) - Generated loyalty ID
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+LOYAL.ID.OUT = ''
+
+* Validate customer ID
+IF CUST.ID = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Customer ID is required'
+   RETURN
+END
+
+* Read customer record
+READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Customer not found'
+   RETURN
+END
+
+* Check if already enrolled
+IF CUST.REC<LOYALTY.ID> # '' THEN
+   ERROR.CODE = ERR.DUPLICATE.KEY
+   ERROR.MSG = 'Customer is already enrolled in loyalty program'
+   LOYAL.ID.OUT = CUST.REC<LOYALTY.ID>
+   RELEASE F.CUSTOMERS, CUST.ID
+   RETURN
+END
+
+* Validate tier level
+IF TIER.LEVEL = '' THEN TIER.LEVEL = 'BRONZE'
+
+VALID.TIERS = 'BRONZE':VM:'SILVER':VM:'GOLD':VM:'PLATINUM'
+LOCATE TIER.LEVEL IN VALID.TIERS<1> USING VM SETTING POS ELSE
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid tier level: ' : TIER.LEVEL
+   RELEASE F.CUSTOMERS, CUST.ID
+   RETURN
+END
+
+* Generate loyalty ID with Luhn check digit
+GOSUB GENERATE.LOYALTY.ID
+IF ERROR.CODE # ERR.SUCCESS THEN
+   RELEASE F.CUSTOMERS, CUST.ID
+   RETURN
+END
+
+* Update customer record
+CUST.REC<LOYALTY.ID> = LOYAL.ID.OUT
+CUST.REC<LOYALTY.TIER> = TIER.LEVEL
+CUST.REC<LOYALTY.POINTS> = 0
+CUST.REC<LOYALTY.LIFETIME.POINTS> = 0
+CUST.REC<LOYALTY.JOIN.DATE> = SYSTEM.DATE
+CUST.REC<LOYALTY.TIER.DATE> = SYSTEM.DATE
+CUST.REC<LOYALTY.STATUS> = 'ACTIVE'
+
+* Set tier benefits
+GOSUB SET.TIER.BENEFITS
+
+WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+
+* Create loyalty account record
+GOSUB CREATE.LOYALTY.ACCOUNT
+
+* Create welcome bonus transaction
+GOSUB CREATE.WELCOME.BONUS
+
+* Send welcome email
+GOSUB SEND.WELCOME.EMAIL
+
+* Log enrollment
+LOG.MSG = 'Loyalty enrollment: ' : LOYAL.ID.OUT : ' - ' : CUST.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Generate Loyalty ID
+**************************************************************************
+GENERATE.LOYALTY.ID:
+   * Format: 16 digits with Luhn check digit
+   * First 2 digits: Year (YY)
+   * Next 6 digits: Sequential number
+   * Next 7 digits: Random
+   * Last digit: Luhn check digit
+
+   YEAR.PART = OCONV(SYSTEM.DATE, 'D4/')[9,2]
+
+   * Get sequence number
+   OPEN 'LOYAL.SEQUENCES' TO F.LOYAL.SEQ ELSE
+      EXECUTE 'CREATE.FILE LOYAL.SEQUENCES 1 1'
+      OPEN 'LOYAL.SEQUENCES' TO F.LOYAL.SEQ ELSE
+         ERROR.CODE = ERR.DATABASE.ERROR
+         ERROR.MSG = 'Cannot open loyalty sequence file'
+         RETURN
+      END
+   END
+
+   SEQ.KEY = 'LOYAL-SEQ'
+   READU SEQ.REC FROM F.LOYAL.SEQ, SEQ.KEY ELSE
+      SEQ.NUM = 1
+   END
+   SEQ.NUM = SEQ.REC<1>
+
+   SEQ.NUM += 1
+   SEQ.REC<1> = SEQ.NUM
+   WRITE SEQ.REC TO F.LOYAL.SEQ, SEQ.KEY
+
+   SEQ.PART = OCONV(SEQ.NUM, 'R(0)#6')
+
+   * Generate 7 random digits
+   RANDOM.PART = ''
+   FOR I = 1 TO 7
+      RANDOM.DIGIT = RND(10)
+      RANDOM.PART := RANDOM.DIGIT
+   NEXT I
+
+   * Combine parts (15 digits)
+   LOYALTY.NUM = YEAR.PART : SEQ.PART : RANDOM.PART
+
+   * Calculate Luhn check digit
+   GOSUB CALCULATE.LUHN.CHECK
+   LOYAL.ID.OUT = LOYALTY.NUM : CHECK.DIGIT
+
+   * Verify uniqueness
+   GOSUB VERIFY.LOYALTY.ID.UNIQUE
+   IF NOT(IS.UNIQUE) THEN
+      * Recursively try again
+      GOSUB GENERATE.LOYALTY.ID
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Luhn Check Digit
+**************************************************************************
+CALCULATE.LUHN.CHECK:
+   CHECK.DIGIT = 0
+   SUM = 0
+
+   FOR I = 1 TO LEN(LOYALTY.NUM)
+      DIGIT = LOYALTY.NUM[I,1]
+
+      * Double every second digit from right
+      POSITION.FROM.RIGHT = LEN(LOYALTY.NUM) - I + 1
+      IF MOD(POSITION.FROM.RIGHT, 2) = 0 THEN
+         DIGIT = DIGIT * 2
+         IF DIGIT > 9 THEN
+            DIGIT = DIGIT - 9
+         END
+      END
+
+      SUM += DIGIT
+   NEXT I
+
+   CHECK.DIGIT = MOD(10 - MOD(SUM, 10), 10)
+   RETURN
+
+**************************************************************************
+* Verify Loyalty ID Unique
+**************************************************************************
+VERIFY.LOYALTY.ID.UNIQUE:
+   IS.UNIQUE = TRUE
+
+   SELECT.CMD = 'SELECT CUSTOMERS WITH LOYALTY.ID = "' : LOYAL.ID.OUT : '"'
+   EXECUTE SELECT.CMD
+
+   READNEXT EXISTING.CUST.ID THEN
+      IS.UNIQUE = FALSE
+   END
+   RETURN
+
+**************************************************************************
+* Set Tier Benefits
+**************************************************************************
+SET.TIER.BENEFITS:
+   * Set benefits based on tier level
+
+   BEGIN CASE
+      CASE TIER.LEVEL = 'BRONZE'
+         CUST.REC<LOYALTY.DISCOUNT.PCT> = 5  ; 5% discount
+         CUST.REC<LOYALTY.POINTS.MULTIPLIER> = 1  ; 1x points
+         CUST.REC<LOYALTY.FREE.SHIPPING> = 'N'
+         CUST.REC<LOYALTY.BIRTHDAY.BONUS> = 100
+
+      CASE TIER.LEVEL = 'SILVER'
+         CUST.REC<LOYALTY.DISCOUNT.PCT> = 10  ; 10% discount
+         CUST.REC<LOYALTY.POINTS.MULTIPLIER> = 1.5  ; 1.5x points
+         CUST.REC<LOYALTY.FREE.SHIPPING> = 'Y'
+         CUST.REC<LOYALTY.BIRTHDAY.BONUS> = 250
+
+      CASE TIER.LEVEL = 'GOLD'
+         CUST.REC<LOYALTY.DISCOUNT.PCT> = 15  ; 15% discount
+         CUST.REC<LOYALTY.POINTS.MULTIPLIER> = 2  ; 2x points
+         CUST.REC<LOYALTY.FREE.SHIPPING> = 'Y'
+         CUST.REC<LOYALTY.BIRTHDAY.BONUS> = 500
+
+      CASE TIER.LEVEL = 'PLATINUM'
+         CUST.REC<LOYALTY.DISCOUNT.PCT> = 20  ; 20% discount
+         CUST.REC<LOYALTY.POINTS.MULTIPLIER> = 3  ; 3x points
+         CUST.REC<LOYALTY.FREE.SHIPPING> = 'Y'
+         CUST.REC<LOYALTY.BIRTHDAY.BONUS> = 1000
+   END CASE
+
+   * Set tier upgrade thresholds
+   CUST.REC<LOYALTY.NEXT.TIER.POINTS> = ''
+
+   BEGIN CASE
+      CASE TIER.LEVEL = 'BRONZE'
+         CUST.REC<LOYALTY.NEXT.TIER> = 'SILVER'
+         CUST.REC<LOYALTY.NEXT.TIER.POINTS> = 5000
+
+      CASE TIER.LEVEL = 'SILVER'
+         CUST.REC<LOYALTY.NEXT.TIER> = 'GOLD'
+         CUST.REC<LOYALTY.NEXT.TIER.POINTS> = 15000
+
+      CASE TIER.LEVEL = 'GOLD'
+         CUST.REC<LOYALTY.NEXT.TIER> = 'PLATINUM'
+         CUST.REC<LOYALTY.NEXT.TIER.POINTS> = 50000
+
+      CASE TIER.LEVEL = 'PLATINUM'
+         CUST.REC<LOYALTY.NEXT.TIER> = ''
+         CUST.REC<LOYALTY.NEXT.TIER.POINTS> = 0
+   END CASE
+   RETURN
+
+**************************************************************************
+* Create Loyalty Account
+**************************************************************************
+CREATE.LOYALTY.ACCOUNT:
+   OPEN 'LOYALTY.ACCOUNTS' TO F.LOYAL.ACCT ELSE
+      EXECUTE 'CREATE.FILE LOYALTY.ACCOUNTS 1 101'
+      OPEN 'LOYALTY.ACCOUNTS' TO F.LOYAL.ACCT ELSE
+         RETURN
+      END
+   END
+
+   ACCT.REC = ''
+   ACCT.REC<1> = LOYAL.ID.OUT
+   ACCT.REC<2> = CUST.ID
+   ACCT.REC<3> = CUST.REC<CUST.NAME>
+   ACCT.REC<4> = TIER.LEVEL
+   ACCT.REC<5> = 0  ; Current points
+   ACCT.REC<6> = 0  ; Lifetime points
+   ACCT.REC<7> = 0  ; Points earned YTD
+   ACCT.REC<8> = 0  ; Points redeemed YTD
+   ACCT.REC<9> = SYSTEM.DATE  ; Enrollment date
+   ACCT.REC<10> = SYSTEM.DATE  ; Tier date
+   ACCT.REC<11> = 'ACTIVE'  ; Status
+   ACCT.REC<12> = ENROLL.SOURCE
+   ACCT.REC<13> = 0  ; Total transactions
+   ACCT.REC<14> = 0  ; Total spent
+   ACCT.REC<15> = 0  ; Total saved
+
+   WRITE ACCT.REC TO F.LOYAL.ACCT, LOYAL.ID.OUT
+   RETURN
+
+**************************************************************************
+* Create Welcome Bonus
+**************************************************************************
+CREATE.WELCOME.BONUS:
+   * Award welcome bonus points
+
+   WELCOME.POINTS = 0
+
+   BEGIN CASE
+      CASE TIER.LEVEL = 'BRONZE'
+         WELCOME.POINTS = 100
+      CASE TIER.LEVEL = 'SILVER'
+         WELCOME.POINTS = 250
+      CASE TIER.LEVEL = 'GOLD'
+         WELCOME.POINTS = 500
+      CASE TIER.LEVEL = 'PLATINUM'
+         WELCOME.POINTS = 1000
+   END CASE
+
+   IF WELCOME.POINTS <= 0 THEN RETURN
+
+   * Create loyalty transaction
+   OPEN 'LOYALTY.TRANS' TO F.LOYAL.TRANS ELSE
+      EXECUTE 'CREATE.FILE LOYALTY.TRANS 1 101'
+      OPEN 'LOYALTY.TRANS' TO F.LOYAL.TRANS ELSE
+         RETURN
+      END
+   END
+
+   TRANS.ID = LOYAL.ID.OUT : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   TRANS.REC = ''
+   TRANS.REC<1> = LOYAL.ID.OUT
+   TRANS.REC<2> = CUST.ID
+   TRANS.REC<3> = SYSTEM.DATE
+   TRANS.REC<4> = SYSTEM.TIME
+   TRANS.REC<5> = 'EARN'
+   TRANS.REC<6> = WELCOME.POINTS
+   TRANS.REC<7> = ''  ; Transaction ID
+   TRANS.REC<8> = 'WELCOME BONUS'
+   TRANS.REC<9> = 0  ; Amount spent
+   TRANS.REC<10> = 0  ; Points balance before
+   TRANS.REC<11> = WELCOME.POINTS  ; Points balance after
+   TRANS.REC<12> = TIER.LEVEL
+   TRANS.REC<13> = ''  ; Expiry date (180 days)
+   TRANS.REC<14> = 'ACTIVE'
+
+   * Set expiry date (180 days from now)
+   EXPIRY.DATE = SYSTEM.DATE + 180
+   TRANS.REC<13> = EXPIRY.DATE
+
+   WRITE TRANS.REC TO F.LOYAL.TRANS, TRANS.ID
+
+   * Update customer points
+   READU CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE RETURN
+   CUST.REC<LOYALTY.POINTS> = WELCOME.POINTS
+   CUST.REC<LOYALTY.LIFETIME.POINTS> = WELCOME.POINTS
+   WRITE CUST.REC TO F.CUSTOMERS, CUST.ID
+
+   * Update loyalty account
+   READU ACCT.REC FROM F.LOYAL.ACCT, LOYAL.ID.OUT ELSE RETURN
+   ACCT.REC<5> = WELCOME.POINTS
+   ACCT.REC<6> = WELCOME.POINTS
+   ACCT.REC<7> = WELCOME.POINTS
+   WRITE ACCT.REC TO F.LOYAL.ACCT, LOYAL.ID.OUT
+   RETURN
+
+**************************************************************************
+* Send Welcome Email
+**************************************************************************
+SEND.WELCOME.EMAIL:
+   IF CUST.REC<CUST.EMAIL> = '' THEN RETURN
+
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE
+      RETURN
+   END
+
+   EMAIL.ID = 'LOYAL.WELCOME*' : LOYAL.ID.OUT
+   EMAIL.REC = ''
+   EMAIL.REC<1> = CUST.REC<CUST.EMAIL>
+   EMAIL.REC<2> = 'Welcome to Our Loyalty Program!'
+   EMAIL.REC<3> = 'Dear ' : CUST.REC<CUST.NAME> : ',' : AM : AM
+   EMAIL.REC<3> := 'Welcome to our loyalty program!' : AM : AM
+   EMAIL.REC<3> := 'Your Loyalty ID: ' : LOYAL.ID.OUT : AM
+   EMAIL.REC<3> := 'Tier Level: ' : TIER.LEVEL : AM
+   EMAIL.REC<3> := 'Welcome Bonus: ' : WELCOME.POINTS : ' points' : AM : AM
+   EMAIL.REC<3> := 'Your Benefits:' : AM
+
+   * Add tier-specific benefits
+   BEGIN CASE
+      CASE TIER.LEVEL = 'BRONZE'
+         EMAIL.REC<3> := '- 5% discount on all purchases' : AM
+         EMAIL.REC<3> := '- Earn 1 point per dollar spent' : AM
+         EMAIL.REC<3> := '- Birthday bonus: 100 points' : AM
+
+      CASE TIER.LEVEL = 'SILVER'
+         EMAIL.REC<3> := '- 10% discount on all purchases' : AM
+         EMAIL.REC<3> := '- Earn 1.5 points per dollar spent' : AM
+         EMAIL.REC<3> := '- Free shipping on all orders' : AM
+         EMAIL.REC<3> := '- Birthday bonus: 250 points' : AM
+
+      CASE TIER.LEVEL = 'GOLD'
+         EMAIL.REC<3> := '- 15% discount on all purchases' : AM
+         EMAIL.REC<3> := '- Earn 2 points per dollar spent' : AM
+         EMAIL.REC<3> := '- Free shipping on all orders' : AM
+         EMAIL.REC<3> := '- Birthday bonus: 500 points' : AM
+         EMAIL.REC<3> := '- Exclusive early access to sales' : AM
+
+      CASE TIER.LEVEL = 'PLATINUM'
+         EMAIL.REC<3> := '- 20% discount on all purchases' : AM
+         EMAIL.REC<3> := '- Earn 3 points per dollar spent' : AM
+         EMAIL.REC<3> := '- Free shipping on all orders' : AM
+         EMAIL.REC<3> := '- Birthday bonus: 1000 points' : AM
+         EMAIL.REC<3> := '- Exclusive early access to sales' : AM
+         EMAIL.REC<3> := '- VIP customer support' : AM
+         EMAIL.REC<3> := '- Special event invitations' : AM
+   END CASE
+
+   EMAIL.REC<3> := AM : 'Start earning points today!'
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END

@@ -1,0 +1,556 @@
+SUBROUTINE RPT.VENDOR.ANALYSIS(START.DATE, END.DATE, REPORT.REC, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: RPT.VENDOR.ANALYSIS
+* Purpose: Generate Vendor Analysis Report
+* Parameters:
+*   START.DATE (IN) - Start date for analysis
+*   END.DATE (IN) - End date for analysis
+*   REPORT.REC (OUT) - Generated report
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+REPORT.REC = ''
+
+* Validate dates
+IF START.DATE = '' THEN START.DATE = SYSTEM.DATE - 90
+IF END.DATE = '' THEN END.DATE = SYSTEM.DATE
+
+IF END.DATE < START.DATE THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'End date cannot be before start date'
+   RETURN
+END
+
+* Initialize analysis
+GOSUB INITIALIZE.ANALYSIS
+
+* Gather vendor data
+GOSUB GATHER.VENDOR.DATA
+
+* Calculate vendor metrics
+GOSUB CALCULATE.VENDOR.METRICS
+
+* Rank vendors
+GOSUB RANK.VENDORS
+
+* Generate report
+GOSUB GENERATE.REPORT
+
+RETURN
+
+**************************************************************************
+* Initialize Analysis
+**************************************************************************
+INITIALIZE.ANALYSIS:
+   * Initialize vendor tracking arrays
+   VENDOR.LIST = ''
+   VENDOR.NAMES = ''
+   VENDOR.PO.COUNTS = ''
+   VENDOR.PO.AMOUNTS = ''
+   VENDOR.RECEIPT.COUNTS = ''
+   VENDOR.RECEIPT.AMOUNTS = ''
+   VENDOR.ON.TIME = ''
+   VENDOR.LATE = ''
+   VENDOR.CANCELLED = ''
+   VENDOR.LEAD.TIMES = ''
+   VENDOR.RATINGS = ''
+
+   TOTAL.POS = 0
+   TOTAL.PO.AMT = 0
+   TOTAL.RECEIPTS = 0
+   TOTAL.RECEIPT.AMT = 0
+   RETURN
+
+**************************************************************************
+* Gather Vendor Data
+**************************************************************************
+GATHER.VENDOR.DATA:
+   * Select purchase orders in date range
+   SELECT.CMD = 'SELECT PURCHASE.ORDERS WITH PO.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH PO.DATE <= "' : END.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT PO.ID ELSE EXIT
+
+      READ PO.REC FROM F.PURCHASE.ORDERS, PO.ID ELSE CONTINUE
+
+      * Get vendor ID
+      VENDOR.ID = PO.REC<VENDOR.ID>
+      IF VENDOR.ID = '' THEN CONTINUE
+
+      * Get PO total
+      PO.TOTAL = PO.REC<PO.TOTAL>
+      IF PO.TOTAL = '' THEN PO.TOTAL = 0
+
+      * Locate or add vendor
+      LOCATE VENDOR.ID IN VENDOR.LIST<1> USING VM SETTING POS ELSE
+         * Add new vendor
+         VENDOR.LIST<1, -1> = VENDOR.ID
+
+         READ VENDOR.REC FROM F.VENDORS, VENDOR.ID ELSE
+            VENDOR.NAME = 'Unknown'
+         END
+         VENDOR.NAME = VENDOR.REC<VENDOR.NAME>
+         VENDOR.NAMES<1, -1> = VENDOR.NAME
+
+         VENDOR.PO.COUNTS<1, -1> = 1
+         VENDOR.PO.AMOUNTS<1, -1> = PO.TOTAL
+         VENDOR.RECEIPT.COUNTS<1, -1> = 0
+         VENDOR.RECEIPT.AMOUNTS<1, -1> = 0
+         VENDOR.ON.TIME<1, -1> = 0
+         VENDOR.LATE<1, -1> = 0
+         VENDOR.CANCELLED<1, -1> = 0
+         VENDOR.LEAD.TIMES<1, -1> = 0
+         VENDOR.RATINGS<1, -1> = 0
+
+         POS = DCOUNT(VENDOR.LIST, VM)
+      END ELSE
+         * Update existing vendor
+         COUNT = VENDOR.PO.COUNTS<1, POS>
+         IF COUNT = '' THEN COUNT = 0
+         VENDOR.PO.COUNTS<1, POS> = COUNT + 1
+
+         AMT = VENDOR.PO.AMOUNTS<1, POS>
+         IF AMT = '' THEN AMT = 0
+         VENDOR.PO.AMOUNTS<1, POS> = AMT + PO.TOTAL
+      END
+
+      * Check if cancelled
+      IF PO.REC<PO.STATUS> = 'CANCELLED' THEN
+         CANCEL.COUNT = VENDOR.CANCELLED<1, POS>
+         IF CANCEL.COUNT = '' THEN CANCEL.COUNT = 0
+         VENDOR.CANCELLED<1, POS> = CANCEL.COUNT + 1
+      END
+
+      TOTAL.POS += 1
+      TOTAL.PO.AMT += PO.TOTAL
+   REPEAT
+
+   * Gather receipt data
+   GOSUB GATHER.RECEIPT.DATA
+   RETURN
+
+**************************************************************************
+* Gather Receipt Data
+**************************************************************************
+GATHER.RECEIPT.DATA:
+   SELECT.CMD = 'SELECT RECEIPTS WITH RECEIPT.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH RECEIPT.DATE <= "' : END.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT RECEIPT.ID ELSE EXIT
+
+      READ RECEIPT.REC FROM F.RECEIPTS, RECEIPT.ID ELSE CONTINUE
+
+      * Get vendor ID
+      VENDOR.ID = RECEIPT.REC<1>
+      IF VENDOR.ID = '' THEN CONTINUE
+
+      * Get PO number
+      PO.NUM = RECEIPT.REC<2>
+
+      * Get receipt total
+      RECEIPT.TOTAL = RECEIPT.REC<12>
+      IF RECEIPT.TOTAL = '' THEN RECEIPT.TOTAL = 0
+
+      * Locate vendor
+      LOCATE VENDOR.ID IN VENDOR.LIST<1> USING VM SETTING POS ELSE CONTINUE
+
+      * Update receipt count
+      RCV.COUNT = VENDOR.RECEIPT.COUNTS<1, POS>
+      IF RCV.COUNT = '' THEN RCV.COUNT = 0
+      VENDOR.RECEIPT.COUNTS<1, POS> = RCV.COUNT + 1
+
+      * Update receipt amount
+      RCV.AMT = VENDOR.RECEIPT.AMOUNTS<1, POS>
+      IF RCV.AMT = '' THEN RCV.AMT = 0
+      VENDOR.RECEIPT.AMOUNTS<1, POS> = RCV.AMT + RECEIPT.TOTAL
+
+      * Check delivery timing
+      IF PO.NUM # '' THEN
+         GOSUB CHECK.DELIVERY.TIMING
+      END
+
+      TOTAL.RECEIPTS += 1
+      TOTAL.RECEIPT.AMT += RECEIPT.TOTAL
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Check Delivery Timing
+**************************************************************************
+CHECK.DELIVERY.TIMING:
+   READ PO.REC FROM F.PURCHASE.ORDERS, PO.NUM ELSE RETURN
+
+   * Get expected date
+   EXPECTED.DATE = PO.REC<EXPECTED.DATE>
+   IF EXPECTED.DATE = '' THEN RETURN
+
+   * Get actual receipt date
+   ACTUAL.DATE = RECEIPT.REC<4>
+
+   * Calculate lead time
+   ACTUAL.LEAD = ACTUAL.DATE - PO.REC<PO.DATE>
+   CURRENT.LEAD = VENDOR.LEAD.TIMES<1, POS>
+   IF CURRENT.LEAD = '' THEN CURRENT.LEAD = 0
+   VENDOR.LEAD.TIMES<1, POS> = CURRENT.LEAD + ACTUAL.LEAD
+
+   * Check if on time
+   IF ACTUAL.DATE <= EXPECTED.DATE THEN
+      ON.TIME.COUNT = VENDOR.ON.TIME<1, POS>
+      IF ON.TIME.COUNT = '' THEN ON.TIME.COUNT = 0
+      VENDOR.ON.TIME<1, POS> = ON.TIME.COUNT + 1
+   END ELSE
+      LATE.COUNT = VENDOR.LATE<1, POS>
+      IF LATE.COUNT = '' THEN LATE.COUNT = 0
+      VENDOR.LATE<1, POS> = LATE.COUNT + 1
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Vendor Metrics
+**************************************************************************
+CALCULATE.VENDOR.METRICS:
+   IF VENDOR.LIST = '' THEN RETURN
+
+   VENDOR.COUNT = DCOUNT(VENDOR.LIST, VM)
+
+   FOR I = 1 TO VENDOR.COUNT
+      VENDOR.ID = VENDOR.LIST<1, I>
+      PO.COUNT = VENDOR.PO.COUNTS<1, I>
+      RECEIPT.COUNT = VENDOR.RECEIPT.COUNTS<1, I>
+      ON.TIME.COUNT = VENDOR.ON.TIME<1, I>
+      LATE.COUNT = VENDOR.LATE<1, I>
+      CANCEL.COUNT = VENDOR.CANCELLED<1, I>
+
+      IF PO.COUNT = '' THEN PO.COUNT = 0
+      IF RECEIPT.COUNT = '' THEN RECEIPT.COUNT = 0
+      IF ON.TIME.COUNT = '' THEN ON.TIME.COUNT = 0
+      IF LATE.COUNT = '' THEN LATE.COUNT = 0
+      IF CANCEL.COUNT = '' THEN CANCEL.COUNT = 0
+
+      * Calculate metrics
+      TOTAL.DELIVERIES = ON.TIME.COUNT + LATE.COUNT
+
+      * On-time percentage
+      IF TOTAL.DELIVERIES > 0 THEN
+         ON.TIME.PCT = (ON.TIME.COUNT / TOTAL.DELIVERIES) * 100
+      END ELSE
+         ON.TIME.PCT = 0
+      END
+
+      * Fulfillment rate
+      IF PO.COUNT > 0 THEN
+         FULFILLMENT.RATE = (RECEIPT.COUNT / PO.COUNT) * 100
+      END ELSE
+         FULFILLMENT.RATE = 0
+      END
+
+      * Cancellation rate
+      IF PO.COUNT > 0 THEN
+         CANCEL.RATE = (CANCEL.COUNT / PO.COUNT) * 100
+      END ELSE
+         CANCEL.RATE = 0
+      END
+
+      * Calculate overall rating (0-100)
+      * 50% - On-time delivery
+      * 30% - Fulfillment rate
+      * 20% - Low cancellation rate
+
+      DELIVERY.SCORE = ON.TIME.PCT * 0.5
+      FULFILLMENT.SCORE = FULFILLMENT.RATE * 0.3
+      CANCEL.SCORE = (100 - CANCEL.RATE) * 0.2
+
+      OVERALL.RATING = DELIVERY.SCORE + FULFILLMENT.SCORE + CANCEL.SCORE
+
+      VENDOR.RATINGS<1, I> = OVERALL.RATING
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Rank Vendors
+**************************************************************************
+RANK.VENDORS:
+   * Sort vendors by rating (descending)
+   IF VENDOR.LIST = '' THEN RETURN
+
+   VENDOR.COUNT = DCOUNT(VENDOR.LIST, VM)
+
+   * Bubble sort
+   FOR I = 1 TO VENDOR.COUNT - 1
+      FOR J = I + 1 TO VENDOR.COUNT
+         RATING.I = VENDOR.RATINGS<1, I>
+         RATING.J = VENDOR.RATINGS<1, J>
+
+         IF RATING.I = '' THEN RATING.I = 0
+         IF RATING.J = '' THEN RATING.J = 0
+
+         IF RATING.J > RATING.I THEN
+            * Swap all arrays
+            GOSUB SWAP.VENDOR.DATA
+         END
+      NEXT J
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Swap Vendor Data
+**************************************************************************
+SWAP.VENDOR.DATA:
+   TEMP = VENDOR.LIST<1, I>
+   VENDOR.LIST<1, I> = VENDOR.LIST<1, J>
+   VENDOR.LIST<1, J> = TEMP
+
+   TEMP = VENDOR.NAMES<1, I>
+   VENDOR.NAMES<1, I> = VENDOR.NAMES<1, J>
+   VENDOR.NAMES<1, J> = TEMP
+
+   TEMP = VENDOR.PO.COUNTS<1, I>
+   VENDOR.PO.COUNTS<1, I> = VENDOR.PO.COUNTS<1, J>
+   VENDOR.PO.COUNTS<1, J> = TEMP
+
+   TEMP = VENDOR.PO.AMOUNTS<1, I>
+   VENDOR.PO.AMOUNTS<1, I> = VENDOR.PO.AMOUNTS<1, J>
+   VENDOR.PO.AMOUNTS<1, J> = TEMP
+
+   TEMP = VENDOR.RECEIPT.COUNTS<1, I>
+   VENDOR.RECEIPT.COUNTS<1, I> = VENDOR.RECEIPT.COUNTS<1, J>
+   VENDOR.RECEIPT.COUNTS<1, J> = TEMP
+
+   TEMP = VENDOR.RECEIPT.AMOUNTS<1, I>
+   VENDOR.RECEIPT.AMOUNTS<1, I> = VENDOR.RECEIPT.AMOUNTS<1, J>
+   VENDOR.RECEIPT.AMOUNTS<1, J> = TEMP
+
+   TEMP = VENDOR.ON.TIME<1, I>
+   VENDOR.ON.TIME<1, I> = VENDOR.ON.TIME<1, J>
+   VENDOR.ON.TIME<1, J> = TEMP
+
+   TEMP = VENDOR.LATE<1, I>
+   VENDOR.LATE<1, I> = VENDOR.LATE<1, J>
+   VENDOR.LATE<1, J> = TEMP
+
+   TEMP = VENDOR.CANCELLED<1, I>
+   VENDOR.CANCELLED<1, I> = VENDOR.CANCELLED<1, J>
+   VENDOR.CANCELLED<1, J> = TEMP
+
+   TEMP = VENDOR.LEAD.TIMES<1, I>
+   VENDOR.LEAD.TIMES<1, I> = VENDOR.LEAD.TIMES<1, J>
+   VENDOR.LEAD.TIMES<1, J> = TEMP
+
+   TEMP = VENDOR.RATINGS<1, I>
+   VENDOR.RATINGS<1, I> = VENDOR.RATINGS<1, J>
+   VENDOR.RATINGS<1, J> = TEMP
+   RETURN
+
+**************************************************************************
+* Generate Report
+**************************************************************************
+GENERATE.REPORT:
+   REPORT.REC = ''
+
+   * Header
+   REPORT.REC<1> = '========================================='
+   REPORT.REC<2> = '        VENDOR ANALYSIS REPORT           '
+   REPORT.REC<3> = '========================================='
+   REPORT.REC<4> = ''
+   REPORT.REC<5> = 'Analysis Period: ' : OCONV(START.DATE, 'D4/') : ' to ' : OCONV(END.DATE, 'D4/')
+   REPORT.REC<6> = 'Generated: ' : OCONV(SYSTEM.DATE, 'D4/') : ' ' : OCONV(SYSTEM.TIME, 'MTS')
+   REPORT.REC<7> = ''
+   REPORT.REC<8> = '-----------------------------------------'
+   REPORT.REC<9> = 'OVERALL SUMMARY'
+   REPORT.REC<10> = '-----------------------------------------'
+
+   IF VENDOR.LIST = '' THEN
+      REPORT.REC<11> = 'No vendor data found for this period'
+      RETURN
+   END
+
+   VENDOR.COUNT = DCOUNT(VENDOR.LIST, VM)
+
+   REPORT.REC<11> = 'Total Vendors: ' : VENDOR.COUNT
+   REPORT.REC<12> = 'Total Purchase Orders: ' : TOTAL.POS
+   REPORT.REC<13> = 'Total PO Amount: $' : TOTAL.PO.AMT
+   REPORT.REC<14> = 'Total Receipts: ' : TOTAL.RECEIPTS
+   REPORT.REC<15> = 'Total Receipt Amount: $' : TOTAL.RECEIPT.AMT
+   REPORT.REC<16> = ''
+
+   * Average PO amount
+   IF TOTAL.POS > 0 THEN
+      AVG.PO = TOTAL.PO.AMT / TOTAL.POS
+      REPORT.REC<17> = 'Average PO Amount: $' : AVG.PO
+   END ELSE
+      REPORT.REC<17> = 'Average PO Amount: $0'
+   END
+
+   * Average receipt amount
+   IF TOTAL.RECEIPTS > 0 THEN
+      AVG.RCV = TOTAL.RECEIPT.AMT / TOTAL.RECEIPTS
+      REPORT.REC<18> = 'Average Receipt Amount: $' : AVG.RCV
+   END ELSE
+      REPORT.REC<18> = 'Average Receipt Amount: $0'
+   END
+
+   REPORT.REC<19> = ''
+   REPORT.REC<20> = '-----------------------------------------'
+   REPORT.REC<21> = 'VENDOR DETAILS (Ranked by Rating)'
+   REPORT.REC<22> = '-----------------------------------------'
+
+   LINE.NUM = 23
+
+   FOR I = 1 TO VENDOR.COUNT
+      VENDOR.ID = VENDOR.LIST<1, I>
+      VENDOR.NAME = VENDOR.NAMES<1, I>
+      PO.COUNT = VENDOR.PO.COUNTS<1, I>
+      PO.AMT = VENDOR.PO.AMOUNTS<1, I>
+      RCV.COUNT = VENDOR.RECEIPT.COUNTS<1, I>
+      RCV.AMT = VENDOR.RECEIPT.AMOUNTS<1, I>
+      ON.TIME.COUNT = VENDOR.ON.TIME<1, I>
+      LATE.COUNT = VENDOR.LATE<1, I>
+      CANCEL.COUNT = VENDOR.CANCELLED<1, I>
+      RATING = VENDOR.RATINGS<1, I>
+
+      IF PO.COUNT = '' THEN PO.COUNT = 0
+      IF PO.AMT = '' THEN PO.AMT = 0
+      IF RCV.COUNT = '' THEN RCV.COUNT = 0
+      IF RCV.AMT = '' THEN RCV.AMT = 0
+      IF ON.TIME.COUNT = '' THEN ON.TIME.COUNT = 0
+      IF LATE.COUNT = '' THEN LATE.COUNT = 0
+      IF CANCEL.COUNT = '' THEN CANCEL.COUNT = 0
+      IF RATING = '' THEN RATING = 0
+
+      * Calculate metrics
+      TOTAL.DELIVERIES = ON.TIME.COUNT + LATE.COUNT
+
+      IF TOTAL.DELIVERIES > 0 THEN
+         ON.TIME.PCT = (ON.TIME.COUNT / TOTAL.DELIVERIES) * 100
+      END ELSE
+         ON.TIME.PCT = 0
+      END
+
+      IF PO.COUNT > 0 THEN
+         FULFILLMENT.RATE = (RCV.COUNT / PO.COUNT) * 100
+         CANCEL.RATE = (CANCEL.COUNT / PO.COUNT) * 100
+      END ELSE
+         FULFILLMENT.RATE = 0
+         CANCEL.RATE = 0
+      END
+
+      * Determine rating category
+      BEGIN CASE
+         CASE RATING >= 90
+            RATING.CAT = 'EXCELLENT'
+         CASE RATING >= 80
+            RATING.CAT = 'GOOD'
+         CASE RATING >= 70
+            RATING.CAT = 'FAIR'
+         CASE RATING >= 60
+            RATING.CAT = 'POOR'
+         CASE 1
+            RATING.CAT = 'UNACCEPTABLE'
+      END CASE
+
+      * Format output
+      REPORT.REC<LINE.NUM> = ''
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = 'Rank #' : I : ': ' : VENDOR.NAME : ' (' : VENDOR.ID : ')'
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  Overall Rating: ' : RATING : ' (' : RATING.CAT : ')'
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  '
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  Purchase Orders:'
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    Count: ' : PO.COUNT
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    Total Amount: $' : PO.AMT
+      LINE.NUM += 1
+
+      IF PO.COUNT > 0 THEN
+         AVG.PO.AMT = PO.AMT / PO.COUNT
+         REPORT.REC<LINE.NUM> = '    Average Amount: $' : AVG.PO.AMT
+         LINE.NUM += 1
+      END
+
+      REPORT.REC<LINE.NUM> = '  '
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  Receipts:'
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    Count: ' : RCV.COUNT
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    Total Amount: $' : RCV.AMT
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    Fulfillment Rate: ' : FULFILLMENT.RATE : '%'
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  '
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  Delivery Performance:'
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    On-Time Deliveries: ' : ON.TIME.COUNT
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    Late Deliveries: ' : LATE.COUNT
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    On-Time Percentage: ' : ON.TIME.PCT : '%'
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  '
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  Order Management:'
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    Cancelled Orders: ' : CANCEL.COUNT
+      LINE.NUM += 1
+      REPORT.REC<LINE.NUM> = '    Cancellation Rate: ' : CANCEL.RATE : '%'
+      LINE.NUM += 1
+
+      REPORT.REC<LINE.NUM> = '  -----------------------------------------'
+      LINE.NUM += 1
+   NEXT I
+
+   * Top 5 vendors summary
+   REPORT.REC<LINE.NUM> = ''
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = 'TOP 5 VENDORS'
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+
+   TOP.COUNT = VENDOR.COUNT
+   IF TOP.COUNT > 5 THEN TOP.COUNT = 5
+
+   FOR I = 1 TO TOP.COUNT
+      VENDOR.NAME = VENDOR.NAMES<1, I>
+      RATING = VENDOR.RATINGS<1, I>
+      IF RATING = '' THEN RATING = 0
+
+      REPORT.REC<LINE.NUM> = I : '. ' : VENDOR.NAME : ' - Rating: ' : RATING
+      LINE.NUM += 1
+   NEXT I
+
+   REPORT.REC<LINE.NUM> = ''
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '           END OF REPORT                 '
+   LINE.NUM += 1
+   REPORT.REC<LINE.NUM> = '========================================='
+
+   RETURN
+
+END

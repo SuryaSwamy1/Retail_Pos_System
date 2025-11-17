@@ -1,0 +1,17 @@
+========================================
+RETAIL POS SYSTEM - ERROR LOG
+========================================
+Log Date: [DATE]
+Store ID: [STORE_ID]
+========================================
+
+[TIMESTAMP] [ERROR_CODE] [MODULE] [ERROR_MESSAGE] [STACK_TRACE] [USER_ID]
+
+Example entries:
+2025-10-07 09:15:23 E1001 INVENTORY Item not found in database: INV999 Line 245 in INV.READ EMP002
+2025-10-07 10:30:45 E2001 PAYMENT Payment gateway connection timeout Stack: POS.PAYMENT:312 EMP003
+2025-10-07 11:45:12 E3001 DATABASE Database lock timeout on CUSTOMERS file Stack: CUST.UPDATE:87 EMP001
+2025-10-07 13:00:00 E1002 INVENTORY Negative quantity detected for INV005 Stack: INV.ADJUST:156 EMP004
+2025-10-07 14:15:30 E4001 PRINTER Receipt printer offline - LPT1 Stack: POS.COMPLETE:445 EMP002
+2025-10-07 15:30:00 E5001 SECURITY Invalid login attempt - max retries exceeded N/A UNKNOWN
+2025-10-07 16:45:00 E2002 PAYMENT Credit card declined - insufficient funds Stack: POS.PAYMENT:298 EMP005

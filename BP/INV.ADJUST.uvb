@@ -1,0 +1,270 @@
+SUBROUTINE INV.ADJUST(ITEM.ID.IN, STORE.ID.IN, ADJ.QTY, ADJ.REASON, ADJ.NOTES, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: INV.ADJUST
+* Purpose: Adjust Inventory Quantity (Cycle Count, Damage, Shrinkage, etc.)
+* Parameters:
+*   ITEM.ID.IN (IN) - Item ID to adjust
+*   STORE.ID.IN (IN) - Store ID for adjustment
+*   ADJ.QTY (IN) - Adjustment quantity (positive or negative)
+*   ADJ.REASON (IN) - Reason code (COUNT, DAMAGE, SHRINK, FOUND, CORRECTION)
+*   ADJ.NOTES (IN) - Additional notes
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+* Initialize outputs
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Validate inputs
+IF ITEM.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Item ID is required'
+   RETURN
+END
+
+IF STORE.ID.IN = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Store ID is required'
+   RETURN
+END
+
+IF ADJ.QTY = '' OR NOT(NUM(ADJ.QTY)) THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Adjustment quantity must be numeric'
+   RETURN
+END
+
+IF ADJ.REASON = '' THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Adjustment reason is required'
+   RETURN
+END
+
+* Validate reason code
+VALID.REASONS = 'COUNT':VM:'DAMAGE':VM:'SHRINK':VM:'FOUND':VM:'CORRECTION':VM:'EXPIRED':VM:'LOST':VM:'TRANSFER'
+LOCATE ADJ.REASON IN VALID.REASONS<1> USING VM SETTING POS ELSE
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid adjustment reason code'
+   RETURN
+END
+
+* Check user permissions for adjustments
+IF USER.LEVEL < 5 THEN
+   ERROR.CODE = ERR.PERMISSION.DENIED
+   ERROR.MSG = 'Insufficient permissions for inventory adjustment'
+   RETURN
+END
+
+* Large adjustments require manager approval
+IF ABS(ADJ.QTY) > 100 AND USER.LEVEL < 7 THEN
+   ERROR.CODE = ERR.PERMISSION.DENIED
+   ERROR.MSG = 'Large adjustments (>100 units) require manager approval'
+   RETURN
+END
+
+* Read item record with lock
+READU ITEM.REC FROM F.INVENTORY, ITEM.ID.IN LOCKED
+   ERROR.CODE = ERR.RECORD.LOCKED
+   ERROR.MSG = 'Item record is locked by another user'
+   RETURN
+END ELSE
+   ERROR.CODE = ERR.RECORD.NOT.FOUND
+   ERROR.MSG = 'Item not found: ' : ITEM.ID.IN
+   RETURN
+END
+
+* Find store index in multivalued fields
+GOSUB FIND.STORE.INDEX
+IF STORE.INDEX = 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Store not found: ' : STORE.ID.IN
+   RELEASE F.INVENTORY, ITEM.ID.IN
+   RETURN
+END
+
+* Get current quantities
+OLD.QTY.OH = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+OLD.QTY.ALLOC = ITEM.REC<QTY.ALLOCATED, STORE.INDEX>
+IF OLD.QTY.OH = '' THEN OLD.QTY.OH = 0
+IF OLD.QTY.ALLOC = '' THEN OLD.QTY.ALLOC = 0
+
+* Calculate new quantity
+NEW.QTY.OH = OLD.QTY.OH + ADJ.QTY
+
+* Validate new quantity (can't go negative)
+IF NEW.QTY.OH < 0 THEN
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Adjustment would result in negative inventory'
+   ERROR.MSG := ' (Current: ' : OLD.QTY.OH : ', Adjustment: ' : ADJ.QTY : ')'
+   RELEASE F.INVENTORY, ITEM.ID.IN
+   RETURN
+END
+
+* Check if new quantity is less than allocated quantity
+NEW.QTY.AVAIL = NEW.QTY.OH - OLD.QTY.ALLOC
+IF NEW.QTY.AVAIL < 0 THEN
+   WARN.MSG = 'WARNING: Adjustment results in negative available quantity'
+   WARN.MSG := ' for item ' : ITEM.ID.IN : ' at store ' : STORE.ID.IN
+   WARN.MSG := ' (Available: ' : NEW.QTY.AVAIL : ')'
+   CALL UTILS.COMMON('LOG.ERROR', WARN.MSG, 'WARNING')
+END
+
+* Update quantity on hand
+ITEM.REC<QTY.ON.HAND, STORE.INDEX> = NEW.QTY.OH
+ITEM.REC<QTY.AVAILABLE, STORE.INDEX> = NEW.QTY.AVAIL
+
+* Update audit fields
+ITEM.REC<ITEM.MODIFIED.BY> = USER.ID
+ITEM.REC<ITEM.MODIFIED.DATE> = SYSTEM.DATE
+ITEM.REC<ITEM.MODIFIED.TIME> = SYSTEM.TIME
+
+* Write updated item record
+WRITE ITEM.REC TO F.INVENTORY, ITEM.ID.IN ELSE
+   ERROR.CODE = ERR.DATABASE.ERROR
+   ERROR.MSG = 'Failed to write updated item record'
+   RETURN
+END
+
+* Create inventory transaction record
+GOSUB CREATE.INV.TRANSACTION
+
+* Log adjustment
+LOG.MSG = 'Inventory adjusted for item ' : ITEM.ID.IN
+LOG.MSG := ' at store ' : STORE.ID.IN
+LOG.MSG := ': ' : OLD.QTY.OH : ' -> ' : NEW.QTY.OH
+LOG.MSG := ' (Adj: ' : ADJ.QTY : ', Reason: ' : ADJ.REASON : ')'
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+* Update cost of goods sold for shrinkage/damage
+IF ADJ.REASON = 'DAMAGE' OR ADJ.REASON = 'SHRINK' OR ADJ.REASON = 'EXPIRED' OR ADJ.REASON = 'LOST' THEN
+   IF ADJ.QTY < 0 THEN
+      GOSUB UPDATE.COGS
+   END
+END
+
+* Send email alert for large adjustments
+IF ABS(ADJ.QTY) > 50 THEN
+   GOSUB SEND.ADJUSTMENT.ALERT
+END
+
+RETURN
+
+**************************************************************************
+* Find Store Index
+**************************************************************************
+FIND.STORE.INDEX:
+   STORE.INDEX = 0
+
+   * Get list of all stores to find index
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT STORE.ID ELSE EXIT
+      CURRENT.INDEX += 1
+
+      IF STORE.ID = STORE.ID.IN THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Create Inventory Transaction
+**************************************************************************
+CREATE.INV.TRANSACTION:
+   * Generate unique transaction ID
+   TRANS.ID = ITEM.ID.IN : '*' : STORE.ID.IN : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+
+   * Build transaction record
+   TRANS.REC = ''
+   TRANS.REC<1> = ITEM.ID.IN
+   TRANS.REC<2> = 'ADJUST'
+   TRANS.REC<3> = SYSTEM.DATE
+   TRANS.REC<4> = SYSTEM.TIME
+   TRANS.REC<5> = USER.ID
+   TRANS.REC<6> = ADJ.REASON
+   TRANS.REC<7> = OLD.QTY.OH
+   TRANS.REC<8> = NEW.QTY.OH
+   TRANS.REC<9> = ADJ.QTY
+   TRANS.REC<10> = STORE.ID.IN
+   TRANS.REC<11> = ITEM.REC<AVG.COST>
+   TRANS.REC<12> = ADJ.QTY * ITEM.REC<AVG.COST>  ; Value impact
+   TRANS.REC<13> = ADJ.NOTES
+   TRANS.REC<14> = ''  ; Reference number
+   TRANS.REC<15> = CURRENT.REGISTER  ; Register ID
+
+   * Write transaction record
+   WRITE TRANS.REC TO F.INVENTORY.TRANS, TRANS.ID ELSE
+      * Log error but don't fail the adjustment
+      ERR.LOG = 'Failed to write inventory transaction: ' : TRANS.ID
+      CALL UTILS.COMMON('LOG.ERROR', ERR.LOG, 'ERROR')
+   END
+   RETURN
+
+**************************************************************************
+* Update Cost of Goods Sold
+**************************************************************************
+UPDATE.COGS:
+   * Calculate COGS impact (negative adjustment = expense)
+   UNITS.LOST = ABS(ADJ.QTY)
+   UNIT.COST = ITEM.REC<AVG.COST>
+   IF UNIT.COST = '' THEN UNIT.COST = 0
+
+   COGS.AMOUNT = UNITS.LOST * UNIT.COST
+
+   * Create GL entry for COGS (if GL integration exists)
+   OPEN 'GL.JOURNAL' TO F.GL.JOURNAL ELSE
+      * GL file doesn't exist, just log
+      GL.LOG = 'COGS impact for adjustment: ' : COGS.AMOUNT
+      GL.LOG := ' (Item: ' : ITEM.ID.IN : ', Reason: ' : ADJ.REASON : ')'
+      CALL UTILS.COMMON('LOG.ERROR', GL.LOG, 'INFO')
+      RETURN
+   END
+
+   * Create journal entry
+   JE.ID = 'INV-ADJ*' : ITEM.ID.IN : '*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   JE.REC = ''
+   JE.REC<1> = SYSTEM.DATE
+   JE.REC<2> = 'Inventory Adjustment - ' : ADJ.REASON
+   JE.REC<3> = 'COGS'  ; Account code
+   JE.REC<4> = COGS.AMOUNT  ; Debit
+   JE.REC<5> = 'INVENTORY'  ; Account code
+   JE.REC<6> = COGS.AMOUNT  ; Credit
+   JE.REC<7> = USER.ID
+   JE.REC<8> = ITEM.ID.IN
+   JE.REC<9> = STORE.ID.IN
+
+   WRITE JE.REC TO F.GL.JOURNAL, JE.ID
+   RETURN
+
+**************************************************************************
+* Send Adjustment Alert
+**************************************************************************
+SEND.ADJUSTMENT.ALERT:
+   * Build alert message
+   ALERT.MSG = 'Large inventory adjustment alert' : AM
+   ALERT.MSG := 'Item: ' : ITEM.ID.IN : ' - ' : ITEM.REC<ITEM.DESC> : AM
+   ALERT.MSG := 'Store: ' : STORE.ID.IN : AM
+   ALERT.MSG := 'Old Qty: ' : OLD.QTY.OH : AM
+   ALERT.MSG := 'New Qty: ' : NEW.QTY.OH : AM
+   ALERT.MSG := 'Adjustment: ' : ADJ.QTY : AM
+   ALERT.MSG := 'Reason: ' : ADJ.REASON : AM
+   ALERT.MSG := 'Notes: ' : ADJ.NOTES : AM
+   ALERT.MSG := 'User: ' : USER.ID : AM
+   ALERT.MSG := 'Date/Time: ' : OCONV(SYSTEM.DATE, 'D4/') : ' ' : OCONV(SYSTEM.TIME, 'MTS')
+
+   * Log alert
+   CALL UTILS.COMMON('LOG.ERROR', ALERT.MSG, 'WARNING')
+
+   * In production, would send email to store manager/regional manager
+   EMAIL.LOG = 'Adjustment alert email sent for item ' : ITEM.ID.IN
+   CALL UTILS.COMMON('LOG.ERROR', EMAIL.LOG, 'INFO')
+   RETURN
+
+END

@@ -1,0 +1,611 @@
+SUBROUTINE PROMO.EVALUATE(TRANS.REC, APPLICABLE.PROMOS, BEST.DISCOUNT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: PROMO.EVALUATE
+* Purpose: Evaluate and Apply Promotions to Transaction
+* Parameters:
+*   TRANS.REC (IN/OUT) - Transaction record with items
+*   APPLICABLE.PROMOS (OUT) - List of applicable promotion IDs
+*   BEST.DISCOUNT (OUT) - Best discount amount
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+APPLICABLE.PROMOS = ''
+BEST.DISCOUNT = 0
+
+* Get transaction details
+TRANS.DATE = TRANS.REC<TRANS.DATE>
+IF TRANS.DATE = '' THEN TRANS.DATE = SYSTEM.DATE
+
+TRANS.SUBTOTAL = TRANS.REC<SUBTOTAL>
+IF TRANS.SUBTOTAL = '' THEN TRANS.SUBTOTAL = 0
+
+TRANS.ITEMS = TRANS.REC<ITEM.IDS>
+IF TRANS.ITEMS = '' THEN RETURN
+
+CUST.ID = TRANS.REC<CUSTOMER.ID>
+
+* Find all active promotions
+GOSUB FIND.ACTIVE.PROMOTIONS
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Evaluate each promotion
+GOSUB EVALUATE.ALL.PROMOTIONS
+
+* Select best promotion(s)
+GOSUB SELECT.BEST.PROMOTIONS
+
+* Apply selected promotions
+GOSUB APPLY.PROMOTIONS.TO.TRANS
+
+RETURN
+
+**************************************************************************
+* Find Active Promotions
+**************************************************************************
+FIND.ACTIVE.PROMOTIONS:
+   ACTIVE.PROMOS = ''
+
+   SELECT.CMD = 'SELECT PROMOTIONS WITH STATUS = "ACTIVE"'
+   SELECT.CMD := ' AND WITH START.DATE <= "' : TRANS.DATE : '"'
+   SELECT.CMD := ' AND WITH END.DATE >= "' : TRANS.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT PROMO.ID ELSE EXIT
+
+      READ PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE CONTINUE
+
+      * Add to active promotions list
+      IF ACTIVE.PROMOS = '' THEN
+         ACTIVE.PROMOS = PROMO.ID
+      END ELSE
+         ACTIVE.PROMOS := VM : PROMO.ID
+      END
+   REPEAT
+
+   IF ACTIVE.PROMOS = '' THEN
+      * No active promotions
+      RETURN
+   END
+   RETURN
+
+**************************************************************************
+* Evaluate All Promotions
+**************************************************************************
+EVALUATE.ALL.PROMOTIONS:
+   IF ACTIVE.PROMOS = '' THEN RETURN
+
+   PROMO.COUNT = DCOUNT(ACTIVE.PROMOS, VM)
+
+   FOR I = 1 TO PROMO.COUNT
+      PROMO.ID = ACTIVE.PROMOS<1, I>
+
+      READ PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE CONTINUE
+
+      * Check if promotion applies to this transaction
+      GOSUB CHECK.PROMOTION.ELIGIBILITY
+
+      IF ELIGIBLE THEN
+         * Calculate discount for this promotion
+         GOSUB CALCULATE.PROMO.DISCOUNT
+
+         IF PROMO.DISCOUNT > 0 THEN
+            * Store promotion details
+            GOSUB STORE.APPLICABLE.PROMO
+         END
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Check Promotion Eligibility
+**************************************************************************
+CHECK.PROMOTION.ELIGIBILITY:
+   ELIGIBLE = FALSE
+
+   * Check minimum purchase requirement
+   MIN.PURCHASE = PROMO.REC<MIN.PURCHASE>
+   IF MIN.PURCHASE # '' AND MIN.PURCHASE > 0 THEN
+      IF TRANS.SUBTOTAL < MIN.PURCHASE THEN
+         RETURN
+      END
+   END
+
+   * Check maximum uses
+   MAX.USES = PROMO.REC<MAX.USES>
+   IF MAX.USES # '' AND MAX.USES > 0 THEN
+      USAGE.COUNT = PROMO.REC<USAGE.COUNT>
+      IF USAGE.COUNT = '' THEN USAGE.COUNT = 0
+
+      IF USAGE.COUNT >= MAX.USES THEN
+         RETURN
+      END
+   END
+
+   * Check customer-specific restrictions
+   IF CUST.ID # '' THEN
+      GOSUB CHECK.CUSTOMER.ELIGIBILITY
+      IF NOT(CUSTOMER.ELIGIBLE) THEN RETURN
+   END
+
+   * Check store restrictions
+   STORE.ID = TRANS.REC<STORE.ID>
+   IF STORE.ID # '' THEN
+      GOSUB CHECK.STORE.ELIGIBILITY
+      IF NOT(STORE.ELIGIBLE) THEN RETURN
+   END
+
+   * Check item applicability
+   GOSUB CHECK.ITEM.APPLICABILITY
+   IF NOT(ITEMS.APPLICABLE) THEN RETURN
+
+   * Check day of week restrictions
+   IF PROMO.REC<VALID.DAYS> # '' THEN
+      DAY.OF.WEEK = MOD(TRANS.DATE, 7) + 1
+
+      LOCATE DAY.OF.WEEK IN PROMO.REC<VALID.DAYS, 1> USING VM SETTING POS ELSE
+         RETURN
+      END
+   END
+
+   * Check time of day restrictions
+   IF PROMO.REC<VALID.HOURS> # '' THEN
+      TRANS.TIME = TRANS.REC<TRANS.TIME>
+      IF TRANS.TIME = '' THEN TRANS.TIME = SYSTEM.TIME
+
+      START.HOUR = PROMO.REC<START.HOUR>
+      END.HOUR = PROMO.REC<END.HOUR>
+
+      IF START.HOUR # '' AND END.HOUR # '' THEN
+         CURRENT.HOUR = INT(TRANS.TIME / 3600)
+
+         IF CURRENT.HOUR < START.HOUR OR CURRENT.HOUR > END.HOUR THEN
+            RETURN
+         END
+      END
+   END
+
+   * Check coupon code requirement
+   IF PROMO.REC<REQUIRES.COUPON> = 'Y' THEN
+      COUPON.CODE = TRANS.REC<COUPON.CODE>
+
+      IF COUPON.CODE # PROMO.REC<COUPON.CODE> THEN
+         RETURN
+      END
+   END
+
+   ELIGIBLE = TRUE
+   RETURN
+
+**************************************************************************
+* Check Customer Eligibility
+**************************************************************************
+CHECK.CUSTOMER.ELIGIBILITY:
+   CUSTOMER.ELIGIBLE = TRUE
+
+   READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE
+      CUSTOMER.ELIGIBLE = FALSE
+      RETURN
+   END
+
+   * Check tier restrictions
+   ELIGIBLE.TIERS = PROMO.REC<ELIGIBLE.TIERS>
+   IF ELIGIBLE.TIERS # '' THEN
+      CUST.TIER = CUST.REC<LOYALTY.TIER>
+
+      LOCATE CUST.TIER IN ELIGIBLE.TIERS<1> USING VM SETTING POS ELSE
+         CUSTOMER.ELIGIBLE = FALSE
+         RETURN
+      END
+   END
+
+   * Check new customer only
+   IF PROMO.REC<NEW.CUSTOMERS.ONLY> = 'Y' THEN
+      FIRST.PURCHASE = CUST.REC<FIRST.PURCHASE.DATE>
+
+      IF FIRST.PURCHASE # '' AND FIRST.PURCHASE # TRANS.DATE THEN
+         CUSTOMER.ELIGIBLE = FALSE
+         RETURN
+      END
+   END
+
+   * Check usage limit per customer
+   MAX.USES.PER.CUST = PROMO.REC<MAX.USES.PER.CUSTOMER>
+   IF MAX.USES.PER.CUST # '' AND MAX.USES.PER.CUST > 0 THEN
+      GOSUB COUNT.CUSTOMER.PROMO.USES
+
+      IF CUST.USAGE.COUNT >= MAX.USES.PER.CUST THEN
+         CUSTOMER.ELIGIBLE = FALSE
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Count Customer Promo Uses
+**************************************************************************
+COUNT.CUSTOMER.PROMO.USES:
+   CUST.USAGE.COUNT = 0
+
+   SELECT.CMD = 'SELECT POS.TRANS WITH CUSTOMER.ID = "' : CUST.ID : '"'
+   SELECT.CMD := ' AND WITH PROMO.ID = "' : PROMO.ID : '"'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT PT.ID ELSE EXIT
+      CUST.USAGE.COUNT += 1
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Check Store Eligibility
+**************************************************************************
+CHECK.STORE.ELIGIBILITY:
+   STORE.ELIGIBLE = TRUE
+
+   ELIGIBLE.STORES = PROMO.REC<ELIGIBLE.STORES>
+   IF ELIGIBLE.STORES = '' THEN RETURN
+
+   LOCATE STORE.ID IN ELIGIBLE.STORES<1> USING VM SETTING POS ELSE
+      STORE.ELIGIBLE = FALSE
+   END
+   RETURN
+
+**************************************************************************
+* Check Item Applicability
+**************************************************************************
+CHECK.ITEM.APPLICABILITY:
+   ITEMS.APPLICABLE = FALSE
+
+   PROMO.ITEMS = PROMO.REC<PROMO.ITEMS>
+   PROMO.CATEGORIES = PROMO.REC<PROMO.CATEGORIES>
+
+   * If no item/category restrictions, applies to all
+   IF PROMO.ITEMS = '' AND PROMO.CATEGORIES = '' THEN
+      ITEMS.APPLICABLE = TRUE
+      APPLICABLE.ITEM.LIST = TRANS.ITEMS
+      RETURN
+   END
+
+   * Check which transaction items match
+   APPLICABLE.ITEM.LIST = ''
+   TRANS.ITEM.COUNT = DCOUNT(TRANS.ITEMS, VM)
+
+   FOR I = 1 TO TRANS.ITEM.COUNT
+      ITEM.ID = TRANS.ITEMS<1, I>
+
+      * Check if item is in promotion item list
+      IF PROMO.ITEMS # '' THEN
+         LOCATE ITEM.ID IN PROMO.ITEMS<1> USING VM SETTING POS THEN
+            ITEMS.APPLICABLE = TRUE
+            IF APPLICABLE.ITEM.LIST = '' THEN
+               APPLICABLE.ITEM.LIST = ITEM.ID
+            END ELSE
+               APPLICABLE.ITEM.LIST := VM : ITEM.ID
+            END
+            CONTINUE
+         END
+      END
+
+      * Check if item's category is in promotion
+      IF PROMO.CATEGORIES # '' THEN
+         READ ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+         ITEM.CATEGORY = ITEM.REC<CATEGORY>
+
+         LOCATE ITEM.CATEGORY IN PROMO.CATEGORIES<1> USING VM SETTING POS THEN
+            ITEMS.APPLICABLE = TRUE
+            IF APPLICABLE.ITEM.LIST = '' THEN
+               APPLICABLE.ITEM.LIST = ITEM.ID
+            END ELSE
+               APPLICABLE.ITEM.LIST := VM : ITEM.ID
+            END
+         END
+      END
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Calculate Promo Discount
+**************************************************************************
+CALCULATE.PROMO.DISCOUNT:
+   PROMO.DISCOUNT = 0
+   PROMO.TYPE = PROMO.REC<PROMO.TYPE>
+
+   BEGIN CASE
+      CASE PROMO.TYPE = 'PERCENT.OFF'
+         GOSUB CALC.PERCENT.OFF
+
+      CASE PROMO.TYPE = 'DOLLAR.OFF'
+         GOSUB CALC.DOLLAR.OFF
+
+      CASE PROMO.TYPE = 'BOGO'
+         GOSUB CALC.BOGO
+
+      CASE PROMO.TYPE = 'BUY.X.GET.Y'
+         GOSUB CALC.BUY.X.GET.Y
+
+      CASE PROMO.TYPE = 'FREE.SHIPPING'
+         GOSUB CALC.FREE.SHIPPING
+
+      CASE PROMO.TYPE = 'TIERED.DISCOUNT'
+         GOSUB CALC.TIERED.DISCOUNT
+
+      CASE 1
+         PROMO.DISCOUNT = 0
+   END CASE
+
+   * Apply maximum discount limit if specified
+   MAX.DISCOUNT = PROMO.REC<MAX.DISCOUNT.AMOUNT>
+   IF MAX.DISCOUNT # '' AND MAX.DISCOUNT > 0 THEN
+      IF PROMO.DISCOUNT > MAX.DISCOUNT THEN
+         PROMO.DISCOUNT = MAX.DISCOUNT
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Calculate Percent Off
+**************************************************************************
+CALC.PERCENT.OFF:
+   DISCOUNT.PCT = PROMO.REC<DISCOUNT.PERCENT>
+   IF DISCOUNT.PCT = '' THEN DISCOUNT.PCT = 0
+
+   * Calculate discount on applicable items only
+   DISCOUNT.AMOUNT = 0
+
+   IF APPLICABLE.ITEM.LIST = '' THEN
+      * Applies to entire transaction
+      DISCOUNT.AMOUNT = TRANS.SUBTOTAL * (DISCOUNT.PCT / 100)
+   END ELSE
+      * Calculate subtotal of applicable items
+      APPLICABLE.SUBTOTAL = 0
+
+      ITEM.COUNT = DCOUNT(APPLICABLE.ITEM.LIST, VM)
+      FOR I = 1 TO ITEM.COUNT
+         ITEM.ID = APPLICABLE.ITEM.LIST<1, I>
+
+         * Find item in transaction
+         LOCATE ITEM.ID IN TRANS.ITEMS<1> USING VM SETTING POS THEN
+            ITEM.PRICE = TRANS.REC<ITEM.PRICES, POS>
+            ITEM.QTY = TRANS.REC<ITEM.QTYS, POS>
+
+            IF ITEM.PRICE # '' AND ITEM.QTY # '' THEN
+               APPLICABLE.SUBTOTAL += (ITEM.PRICE * ITEM.QTY)
+            END
+         END
+      NEXT I
+
+      DISCOUNT.AMOUNT = APPLICABLE.SUBTOTAL * (DISCOUNT.PCT / 100)
+   END
+
+   PROMO.DISCOUNT = DISCOUNT.AMOUNT
+   RETURN
+
+**************************************************************************
+* Calculate Dollar Off
+**************************************************************************
+CALC.DOLLAR.OFF:
+   DISCOUNT.AMT = PROMO.REC<DISCOUNT.AMOUNT>
+   IF DISCOUNT.AMT = '' THEN DISCOUNT.AMT = 0
+
+   * Don't exceed transaction total
+   IF DISCOUNT.AMT > TRANS.SUBTOTAL THEN
+      PROMO.DISCOUNT = TRANS.SUBTOTAL
+   END ELSE
+      PROMO.DISCOUNT = DISCOUNT.AMT
+   END
+   RETURN
+
+**************************************************************************
+* Calculate BOGO (Buy One Get One)
+**************************************************************************
+CALC.BOGO:
+   * Buy one get one free/discounted
+
+   BOGO.DISCOUNT.PCT = PROMO.REC<BOGO.DISCOUNT.PCT>
+   IF BOGO.DISCOUNT.PCT = '' THEN BOGO.DISCOUNT.PCT = 100  ; Free
+
+   TOTAL.DISCOUNT = 0
+
+   IF APPLICABLE.ITEM.LIST = '' THEN RETURN
+
+   ITEM.COUNT = DCOUNT(APPLICABLE.ITEM.LIST, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = APPLICABLE.ITEM.LIST<1, I>
+
+      * Find item in transaction
+      LOCATE ITEM.ID IN TRANS.ITEMS<1> USING VM SETTING POS THEN
+         ITEM.PRICE = TRANS.REC<ITEM.PRICES, POS>
+         ITEM.QTY = TRANS.REC<ITEM.QTYS, POS>
+
+         IF ITEM.QTY >= 2 THEN
+            * Calculate number of free items
+            FREE.QTY = INT(ITEM.QTY / 2)
+
+            ITEM.DISCOUNT = FREE.QTY * ITEM.PRICE * (BOGO.DISCOUNT.PCT / 100)
+            TOTAL.DISCOUNT += ITEM.DISCOUNT
+         END
+      END
+   NEXT I
+
+   PROMO.DISCOUNT = TOTAL.DISCOUNT
+   RETURN
+
+**************************************************************************
+* Calculate Buy X Get Y
+**************************************************************************
+CALC.BUY.X.GET.Y:
+   BUY.QTY = PROMO.REC<BUY.QUANTITY>
+   GET.QTY = PROMO.REC<GET.QUANTITY>
+   GET.DISCOUNT.PCT = PROMO.REC<GET.DISCOUNT.PCT>
+
+   IF BUY.QTY = '' THEN BUY.QTY = 1
+   IF GET.QTY = '' THEN GET.QTY = 1
+   IF GET.DISCOUNT.PCT = '' THEN GET.DISCOUNT.PCT = 100
+
+   TOTAL.DISCOUNT = 0
+
+   IF APPLICABLE.ITEM.LIST = '' THEN RETURN
+
+   ITEM.COUNT = DCOUNT(APPLICABLE.ITEM.LIST, VM)
+
+   FOR I = 1 TO ITEM.COUNT
+      ITEM.ID = APPLICABLE.ITEM.LIST<1, I>
+
+      LOCATE ITEM.ID IN TRANS.ITEMS<1> USING VM SETTING POS THEN
+         ITEM.PRICE = TRANS.REC<ITEM.PRICES, POS>
+         ITEM.QTY = TRANS.REC<ITEM.QTYS, POS>
+
+         IF ITEM.QTY >= BUY.QTY THEN
+            * Calculate number of sets
+            SETS = INT(ITEM.QTY / (BUY.QTY + GET.QTY))
+
+            IF SETS > 0 THEN
+               FREE.ITEMS = SETS * GET.QTY
+               ITEM.DISCOUNT = FREE.ITEMS * ITEM.PRICE * (GET.DISCOUNT.PCT / 100)
+               TOTAL.DISCOUNT += ITEM.DISCOUNT
+            END
+         END
+      END
+   NEXT I
+
+   PROMO.DISCOUNT = TOTAL.DISCOUNT
+   RETURN
+
+**************************************************************************
+* Calculate Free Shipping
+**************************************************************************
+CALC.FREE.SHIPPING:
+   SHIPPING.AMT = TRANS.REC<SHIPPING.AMOUNT>
+   IF SHIPPING.AMT = '' THEN SHIPPING.AMT = 0
+
+   PROMO.DISCOUNT = SHIPPING.AMT
+   PROMO.FREE.SHIPPING = TRUE
+   RETURN
+
+**************************************************************************
+* Calculate Tiered Discount
+**************************************************************************
+CALC.TIERED.DISCOUNT:
+   * Discount increases with purchase amount
+
+   TIER.LEVELS = PROMO.REC<TIER.LEVELS>
+   TIER.DISCOUNTS = PROMO.REC<TIER.DISCOUNTS>
+
+   IF TIER.LEVELS = '' THEN RETURN
+
+   TIER.COUNT = DCOUNT(TIER.LEVELS, VM)
+   APPLICABLE.DISCOUNT = 0
+
+   * Find highest applicable tier
+   FOR I = TIER.COUNT TO 1 STEP -1
+      TIER.THRESHOLD = TIER.LEVELS<1, I>
+      TIER.DISCOUNT = TIER.DISCOUNTS<1, I>
+
+      IF TRANS.SUBTOTAL >= TIER.THRESHOLD THEN
+         APPLICABLE.DISCOUNT = TIER.DISCOUNT
+         EXIT
+      END
+   NEXT I
+
+   IF APPLICABLE.DISCOUNT > 0 THEN
+      PROMO.DISCOUNT = TRANS.SUBTOTAL * (APPLICABLE.DISCOUNT / 100)
+   END
+   RETURN
+
+**************************************************************************
+* Store Applicable Promo
+**************************************************************************
+STORE.APPLICABLE.PROMO:
+   * Store promotion details for comparison
+
+   IF APPLICABLE.PROMOS = '' THEN
+      APPLICABLE.PROMOS = PROMO.ID
+   END ELSE
+      APPLICABLE.PROMOS := VM : PROMO.ID
+   END
+
+   * Store discount amount (using subvalue mark)
+   APPLICABLE.PROMOS := SVM : PROMO.DISCOUNT
+
+   * Store promotion priority
+   PRIORITY = PROMO.REC<PRIORITY>
+   IF PRIORITY = '' THEN PRIORITY = 999
+
+   APPLICABLE.PROMOS := SVM : PRIORITY
+   RETURN
+
+**************************************************************************
+* Select Best Promotions
+**************************************************************************
+SELECT.BEST.PROMOTIONS:
+   IF APPLICABLE.PROMOS = '' THEN RETURN
+
+   PROMO.COUNT = DCOUNT(APPLICABLE.PROMOS, VM)
+
+   * Check if stacking is allowed
+   ALLOW.STACKING = FALSE
+
+   * Find promotion with highest discount
+   BEST.DISCOUNT = 0
+   BEST.PROMO.ID = ''
+
+   FOR I = 1 TO PROMO.COUNT
+      PROMO.DATA = APPLICABLE.PROMOS<1, I>
+
+      PROMO.ID = PROMO.DATA<1, 1, 1>
+      DISCOUNT.AMT = PROMO.DATA<1, 1, 2>
+      PRIORITY = PROMO.DATA<1, 1, 3>
+
+      IF DISCOUNT.AMT > BEST.DISCOUNT THEN
+         BEST.DISCOUNT = DISCOUNT.AMT
+         BEST.PROMO.ID = PROMO.ID
+      END ELSE IF DISCOUNT.AMT = BEST.DISCOUNT THEN
+         * Same discount - use priority
+         IF PRIORITY < BEST.PRIORITY THEN
+            BEST.DISCOUNT = DISCOUNT.AMT
+            BEST.PROMO.ID = PROMO.ID
+         END
+      END
+   NEXT I
+
+   SELECTED.PROMOS = BEST.PROMO.ID
+   RETURN
+
+**************************************************************************
+* Apply Promotions to Trans
+**************************************************************************
+APPLY.PROMOTIONS.TO.TRANS:
+   IF BEST.PROMO.ID = '' THEN RETURN
+
+   READ PROMO.REC FROM F.PROMOTIONS, BEST.PROMO.ID ELSE RETURN
+
+   * Update transaction
+   TRANS.REC<PROMO.ID> = BEST.PROMO.ID
+   TRANS.REC<PROMO.NAME> = PROMO.REC<PROMO.NAME>
+   TRANS.REC<PROMO.DISCOUNT> = BEST.DISCOUNT
+
+   * Update usage count
+   READU PROMO.REC FROM F.PROMOTIONS, BEST.PROMO.ID ELSE RETURN
+
+   USAGE.COUNT = PROMO.REC<USAGE.COUNT>
+   IF USAGE.COUNT = '' THEN USAGE.COUNT = 0
+
+   PROMO.REC<USAGE.COUNT> = USAGE.COUNT + 1
+
+   TOTAL.DISCOUNT = PROMO.REC<TOTAL.DISCOUNT.AMT>
+   IF TOTAL.DISCOUNT = '' THEN TOTAL.DISCOUNT = 0
+
+   PROMO.REC<TOTAL.DISCOUNT.AMT> = TOTAL.DISCOUNT + BEST.DISCOUNT
+
+   WRITE PROMO.REC TO F.PROMOTIONS, BEST.PROMO.ID
+   RETURN
+
+END

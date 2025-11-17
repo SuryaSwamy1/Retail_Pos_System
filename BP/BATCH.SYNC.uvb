@@ -1,0 +1,537 @@
+SUBROUTINE BATCH.SYNC(SYNC.TYPE, STORE.ID, SYNC.RESULT, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: BATCH.SYNC
+* Purpose: Multi-Store Data Synchronization
+* Parameters:
+*   SYNC.TYPE (IN) - Type of sync: INVENTORY, PRICING, PROMOTIONS, ALL
+*   STORE.ID (IN) - Specific store ID (optional, '' = all stores)
+*   SYNC.RESULT (OUT) - Synchronization results
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+SYNC.RESULT = ''
+
+* Validate sync type
+VALID.TYPES = 'INVENTORY':VM:'PRICING':VM:'PROMOTIONS':VM:'ALL'
+LOCATE SYNC.TYPE IN VALID.TYPES<1> USING VM SETTING POS ELSE
+   ERROR.CODE = ERR.INVALID.DATA
+   ERROR.MSG = 'Invalid sync type. Valid types: INVENTORY, PRICING, PROMOTIONS, ALL'
+   RETURN
+END
+
+* Initialize sync tracking
+GOSUB INITIALIZE.SYNC
+
+* Get store list
+GOSUB GET.STORE.LIST
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Perform synchronization
+BEGIN CASE
+   CASE SYNC.TYPE = 'INVENTORY'
+      GOSUB SYNC.INVENTORY
+
+   CASE SYNC.TYPE = 'PRICING'
+      GOSUB SYNC.PRICING
+
+   CASE SYNC.TYPE = 'PROMOTIONS'
+      GOSUB SYNC.PROMOTIONS
+
+   CASE SYNC.TYPE = 'ALL'
+      GOSUB SYNC.INVENTORY
+      GOSUB SYNC.PRICING
+      GOSUB SYNC.PROMOTIONS
+END CASE
+
+* Update sync statistics
+GOSUB UPDATE.SYNC.STATISTICS
+
+* Generate sync result
+GOSUB GENERATE.SYNC.RESULT
+
+LOG.MSG = 'Batch sync completed: Type=' : SYNC.TYPE
+IF STORE.ID # '' THEN LOG.MSG := ', Store=' : STORE.ID
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Initialize Sync
+**************************************************************************
+INITIALIZE.SYNC:
+   SYNC.START.TIME = SYSTEM.TIME
+   SYNC.START.DATE = SYSTEM.DATE
+
+   INV.SYNCED = 0
+   INV.ERRORS = 0
+   PRICE.SYNCED = 0
+   PRICE.ERRORS = 0
+   PROMO.SYNCED = 0
+   PROMO.ERRORS = 0
+   TOTAL.SYNCED = 0
+   TOTAL.ERRORS = 0
+   RETURN
+
+**************************************************************************
+* Get Store List
+**************************************************************************
+GET.STORE.LIST:
+   STORE.LIST = ''
+   STORE.NAMES = ''
+
+   IF STORE.ID # '' THEN
+      * Sync specific store
+      READ STORE.REC FROM F.STORES, STORE.ID ELSE
+         ERROR.CODE = ERR.RECORD.NOT.FOUND
+         ERROR.MSG = 'Store not found: ' : STORE.ID
+         RETURN
+      END
+
+      STORE.LIST<1, 1> = STORE.ID
+      STORE.NAMES<1, 1> = STORE.REC<STORE.NAME>
+   END ELSE
+      * Sync all active stores
+      SELECT.CMD = 'SELECT STORES WITH STATUS = "ACTIVE"'
+      EXECUTE SELECT.CMD
+
+      LOOP
+         READNEXT ST.ID ELSE EXIT
+
+         READ STORE.REC FROM F.STORES, ST.ID ELSE CONTINUE
+
+         STORE.LIST<1, -1> = ST.ID
+         STORE.NAMES<1, -1> = STORE.REC<STORE.NAME>
+      REPEAT
+
+      IF STORE.LIST = '' THEN
+         ERROR.CODE = ERR.RECORD.NOT.FOUND
+         ERROR.MSG = 'No active stores found'
+         RETURN
+      END
+   END
+   RETURN
+
+**************************************************************************
+* Sync Inventory
+**************************************************************************
+SYNC.INVENTORY:
+   * Synchronize inventory data across stores
+   * - Ensure all stores have all items
+   * - Sync item master data (names, descriptions, etc.)
+   * - Check for negative quantities
+   * - Update reorder points based on store size
+
+   SELECT.CMD = 'SELECT INVENTORY'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      SYNC.ERRORS = ''
+      ITEM.CHANGED = 'N'
+
+      * Ensure all stores have quantity fields
+      STORE.COUNT = DCOUNT(STORE.LIST, VM)
+
+      FOR I = 1 TO STORE.COUNT
+         ST.ID = STORE.LIST<1, I>
+
+         * Find store index
+         STORE.INDEX = 0
+         GOSUB FIND.STORE.INDEX
+
+         IF STORE.INDEX = 0 THEN
+            SYNC.ERRORS<1, -1> = 'Store index not found: ' : ST.ID
+            INV.ERRORS += 1
+            CONTINUE
+         END
+
+         * Check if quantity field exists
+         QTY = ITEM.REC<QTY.ON.HAND, STORE.INDEX>
+         IF QTY = '' THEN
+            ITEM.REC<QTY.ON.HAND, STORE.INDEX> = 0
+            ITEM.CHANGED = 'Y'
+         END
+
+         * Check for negative quantities
+         IF QTY < 0 THEN
+            SYNC.ERRORS<1, -1> = 'Negative quantity at store ' : ST.ID : ': ' : QTY
+            * Reset to zero
+            ITEM.REC<QTY.ON.HAND, STORE.INDEX> = 0
+            ITEM.CHANGED = 'Y'
+         END
+
+         * Initialize other store-specific fields if needed
+         IF ITEM.REC<QTY.COMMITTED, STORE.INDEX> = '' THEN
+            ITEM.REC<QTY.COMMITTED, STORE.INDEX> = 0
+            ITEM.CHANGED = 'Y'
+         END
+
+         IF ITEM.REC<QTY.ON.ORDER, STORE.INDEX> = '' THEN
+            ITEM.REC<QTY.ON.ORDER, STORE.INDEX> = 0
+            ITEM.CHANGED = 'Y'
+         END
+      NEXT I
+
+      * Write updated record if changed
+      IF ITEM.CHANGED = 'Y' THEN
+         WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+         INV.SYNCED += 1
+         TOTAL.SYNCED += 1
+      END ELSE
+         RELEASE F.INVENTORY, ITEM.ID
+      END
+
+      * Log errors if any
+      IF SYNC.ERRORS # '' THEN
+         ERROR.COUNT = DCOUNT(SYNC.ERRORS, VM)
+         FOR I = 1 TO ERROR.COUNT
+            LOG.MSG = 'Inventory sync error for ' : ITEM.ID : ': ' : SYNC.ERRORS<1, I>
+            CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'WARN')
+         NEXT I
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Find Store Index
+**************************************************************************
+FIND.STORE.INDEX:
+   SELECT.CMD = 'SELECT STORES'
+   EXECUTE SELECT.CMD
+
+   CURRENT.INDEX = 0
+   LOOP
+      READNEXT TEMP.ST.ID ELSE EXIT
+      CURRENT.INDEX += 1
+      IF TEMP.ST.ID = ST.ID THEN
+         STORE.INDEX = CURRENT.INDEX
+         EXIT
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Sync Pricing
+**************************************************************************
+SYNC.PRICING:
+   * Synchronize pricing data across stores
+   * - Ensure pricing consistency
+   * - Check for zero/negative prices
+   * - Sync promotional pricing
+   * - Validate cost vs. selling price
+
+   SELECT.CMD = 'SELECT INVENTORY'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT ITEM.ID ELSE EXIT
+
+      READU ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE CONTINUE
+
+      SYNC.ERRORS = ''
+      ITEM.CHANGED = 'N'
+
+      * Validate selling price
+      SELLING.PRICE = ITEM.REC<SELLING.PRICE>
+      IF SELLING.PRICE = '' OR SELLING.PRICE <= 0 THEN
+         SYNC.ERRORS<1, -1> = 'Invalid selling price: ' : SELLING.PRICE
+         PRICE.ERRORS += 1
+
+         * Set default price based on cost
+         AVG.COST = ITEM.REC<AVG.COST>
+         IF AVG.COST > 0 THEN
+            ITEM.REC<SELLING.PRICE> = AVG.COST * 1.5  ; 50% markup
+            ITEM.CHANGED = 'Y'
+         END
+      END
+
+      * Validate cost
+      AVG.COST = ITEM.REC<AVG.COST>
+      IF AVG.COST = '' OR AVG.COST < 0 THEN
+         SYNC.ERRORS<1, -1> = 'Invalid average cost: ' : AVG.COST
+         ITEM.REC<AVG.COST> = 0
+         ITEM.CHANGED = 'Y'
+         PRICE.ERRORS += 1
+      END
+
+      * Check cost vs. selling price
+      IF AVG.COST > 0 AND SELLING.PRICE > 0 THEN
+         IF SELLING.PRICE < AVG.COST THEN
+            SYNC.ERRORS<1, -1> = 'Selling price below cost: ' : SELLING.PRICE : ' < ' : AVG.COST
+         END
+      END
+
+      * Validate MSRP
+      MSRP = ITEM.REC<MSRP>
+      IF MSRP # '' AND MSRP < 0 THEN
+         ITEM.REC<MSRP> = 0
+         ITEM.CHANGED = 'Y'
+         PRICE.ERRORS += 1
+      END
+
+      * Write updated record if changed
+      IF ITEM.CHANGED = 'Y' THEN
+         WRITE ITEM.REC TO F.INVENTORY, ITEM.ID
+         PRICE.SYNCED += 1
+         TOTAL.SYNCED += 1
+      END ELSE
+         RELEASE F.INVENTORY, ITEM.ID
+      END
+
+      * Log errors if any
+      IF SYNC.ERRORS # '' THEN
+         ERROR.COUNT = DCOUNT(SYNC.ERRORS, VM)
+         FOR I = 1 TO ERROR.COUNT
+            LOG.MSG = 'Pricing sync error for ' : ITEM.ID : ': ' : SYNC.ERRORS<1, I>
+            CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'WARN')
+         NEXT I
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Sync Promotions
+**************************************************************************
+SYNC.PROMOTIONS:
+   * Synchronize promotions across stores
+   * - Validate promotion dates
+   * - Check discount logic
+   * - Ensure store assignments are valid
+   * - Deactivate expired promotions
+
+   SELECT.CMD = 'SELECT PROMOTIONS'
+   EXECUTE SELECT.CMD
+
+   LOOP
+      READNEXT PROMO.ID ELSE EXIT
+
+      READU PROMO.REC FROM F.PROMOTIONS, PROMO.ID ELSE CONTINUE
+
+      SYNC.ERRORS = ''
+      PROMO.CHANGED = 'N'
+
+      * Check promotion dates
+      START.DATE = PROMO.REC<START.DATE>
+      END.DATE = PROMO.REC<END.DATE>
+
+      IF START.DATE = '' OR END.DATE = '' THEN
+         SYNC.ERRORS<1, -1> = 'Missing start or end date'
+         PROMO.ERRORS += 1
+         RELEASE F.PROMOTIONS, PROMO.ID
+         CONTINUE
+      END
+
+      * Check if promotion has expired
+      IF END.DATE < SYSTEM.DATE THEN
+         IF PROMO.REC<PROMO.STATUS> = 'ACTIVE' THEN
+            PROMO.REC<PROMO.STATUS> = 'EXPIRED'
+            PROMO.CHANGED = 'Y'
+         END
+      END
+
+      * Validate discount values
+      DISCOUNT.TYPE = PROMO.REC<DISCOUNT.TYPE>
+      DISCOUNT.VALUE = PROMO.REC<DISCOUNT.VALUE>
+
+      IF DISCOUNT.VALUE = '' OR DISCOUNT.VALUE <= 0 THEN
+         SYNC.ERRORS<1, -1> = 'Invalid discount value: ' : DISCOUNT.VALUE
+         PROMO.ERRORS += 1
+      END
+
+      IF DISCOUNT.TYPE = 'PERCENT' AND DISCOUNT.VALUE > 100 THEN
+         SYNC.ERRORS<1, -1> = 'Discount percentage exceeds 100%: ' : DISCOUNT.VALUE
+         PROMO.ERRORS += 1
+      END
+
+      * Validate store assignments
+      STORE.IDS = PROMO.REC<STORE.IDS>
+      IF STORE.IDS # '' THEN
+         STORE.ID.COUNT = DCOUNT(STORE.IDS, VM)
+
+         FOR I = 1 TO STORE.ID.COUNT
+            ST.ID = STORE.IDS<1, I>
+
+            READ TEMP.STORE.REC FROM F.STORES, ST.ID ELSE
+               SYNC.ERRORS<1, -1> = 'Invalid store ID: ' : ST.ID
+               PROMO.ERRORS += 1
+            END
+         NEXT I
+      END
+
+      * Validate item assignments
+      ITEM.IDS = PROMO.REC<ITEM.IDS>
+      IF ITEM.IDS # '' THEN
+         ITEM.ID.COUNT = DCOUNT(ITEM.IDS, VM)
+
+         FOR I = 1 TO ITEM.ID.COUNT
+            ITEM.ID = ITEM.IDS<1, I>
+
+            READ TEMP.ITEM.REC FROM F.INVENTORY, ITEM.ID ELSE
+               SYNC.ERRORS<1, -1> = 'Invalid item ID: ' : ITEM.ID
+               PROMO.ERRORS += 1
+            END
+         NEXT I
+      END
+
+      * Write updated record if changed
+      IF PROMO.CHANGED = 'Y' THEN
+         WRITE PROMO.REC TO F.PROMOTIONS, PROMO.ID
+         PROMO.SYNCED += 1
+         TOTAL.SYNCED += 1
+      END ELSE
+         RELEASE F.PROMOTIONS, PROMO.ID
+      END
+
+      * Log errors if any
+      IF SYNC.ERRORS # '' THEN
+         ERROR.COUNT = DCOUNT(SYNC.ERRORS, VM)
+         FOR I = 1 TO ERROR.COUNT
+            LOG.MSG = 'Promotion sync error for ' : PROMO.ID : ': ' : SYNC.ERRORS<1, I>
+            CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'WARN')
+         NEXT I
+      END
+   REPEAT
+   RETURN
+
+**************************************************************************
+* Update Sync Statistics
+**************************************************************************
+UPDATE.SYNC.STATISTICS:
+   OPEN 'SYNC.STATISTICS' TO F.SYNC.STATS ELSE
+      EXECUTE 'CREATE.FILE SYNC.STATISTICS 1 101'
+      OPEN 'SYNC.STATISTICS' TO F.SYNC.STATS ELSE RETURN
+   END
+
+   STAT.ID = 'SYNC*' : OCONV(SYSTEM.DATE, 'D4-YMD') : '*' : SYSTEM.TIME
+
+   STAT.REC = ''
+   STAT.REC<1> = SYNC.START.DATE
+   STAT.REC<2> = SYNC.START.TIME
+   STAT.REC<3> = SYSTEM.DATE
+   STAT.REC<4> = SYSTEM.TIME
+   STAT.REC<5> = SYNC.TYPE
+   STAT.REC<6> = STORE.ID
+   STAT.REC<7> = TOTAL.SYNCED
+   STAT.REC<8> = TOTAL.ERRORS
+   STAT.REC<9> = INV.SYNCED
+   STAT.REC<10> = INV.ERRORS
+   STAT.REC<11> = PRICE.SYNCED
+   STAT.REC<12> = PRICE.ERRORS
+   STAT.REC<13> = PROMO.SYNCED
+   STAT.REC<14> = PROMO.ERRORS
+
+   WRITE STAT.REC TO F.SYNC.STATS, STAT.ID
+   RETURN
+
+**************************************************************************
+* Generate Sync Result
+**************************************************************************
+GENERATE.SYNC.RESULT:
+   SYNC.RESULT = ''
+
+   SYNC.RESULT<1> = '========================================='
+   SYNC.RESULT<2> = '    MULTI-STORE SYNC RESULTS            '
+   SYNC.RESULT<3> = '========================================='
+   SYNC.RESULT<4> = ''
+   SYNC.RESULT<5> = 'Sync Date: ' : OCONV(SYNC.START.DATE, 'D4/')
+   SYNC.RESULT<6> = 'Sync Time: ' : OCONV(SYNC.START.TIME, 'MTS')
+   SYNC.RESULT<7> = 'Sync Type: ' : SYNC.TYPE
+   SYNC.RESULT<8> = ''
+
+   IF STORE.ID # '' THEN
+      SYNC.RESULT<9> = 'Store: ' : STORE.ID
+      SYNC.RESULT<10> = ''
+      LINE.NUM = 11
+   END ELSE
+      STORE.COUNT = DCOUNT(STORE.LIST, VM)
+      SYNC.RESULT<9> = 'Stores Synced: ' : STORE.COUNT
+      SYNC.RESULT<10> = ''
+      LINE.NUM = 11
+   END
+
+   SYNC.RESULT<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = 'SYNCHRONIZATION SUMMARY'
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+
+   IF SYNC.TYPE = 'INVENTORY' OR SYNC.TYPE = 'ALL' THEN
+      SYNC.RESULT<LINE.NUM> = 'Inventory:'
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = '  Records Synced: ' : INV.SYNCED
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = '  Errors: ' : INV.ERRORS
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = ''
+      LINE.NUM += 1
+   END
+
+   IF SYNC.TYPE = 'PRICING' OR SYNC.TYPE = 'ALL' THEN
+      SYNC.RESULT<LINE.NUM> = 'Pricing:'
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = '  Records Synced: ' : PRICE.SYNCED
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = '  Errors: ' : PRICE.ERRORS
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = ''
+      LINE.NUM += 1
+   END
+
+   IF SYNC.TYPE = 'PROMOTIONS' OR SYNC.TYPE = 'ALL' THEN
+      SYNC.RESULT<LINE.NUM> = 'Promotions:'
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = '  Records Synced: ' : PROMO.SYNCED
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = '  Errors: ' : PROMO.ERRORS
+      LINE.NUM += 1
+      SYNC.RESULT<LINE.NUM> = ''
+      LINE.NUM += 1
+   END
+
+   SYNC.RESULT<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = 'TOTALS'
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = '-----------------------------------------'
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = 'Total Records Synced: ' : TOTAL.SYNCED
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = 'Total Errors: ' : TOTAL.ERRORS
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = ''
+   LINE.NUM += 1
+
+   * Calculate elapsed time
+   ELAPSED.TIME = SYSTEM.TIME - SYNC.START.TIME
+   SYNC.RESULT<LINE.NUM> = 'Elapsed Time: ' : OCONV(ELAPSED.TIME, 'MTS')
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = ''
+   LINE.NUM += 1
+
+   IF TOTAL.ERRORS = 0 THEN
+      SYNC.RESULT<LINE.NUM> = 'Status: COMPLETED SUCCESSFULLY'
+   END ELSE
+      SYNC.RESULT<LINE.NUM> = 'Status: COMPLETED WITH ERRORS'
+   END
+   LINE.NUM += 1
+
+   SYNC.RESULT<LINE.NUM> = ''
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = '========================================='
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = '           END OF RESULTS                '
+   LINE.NUM += 1
+   SYNC.RESULT<LINE.NUM> = '========================================='
+
+   RETURN
+
+END

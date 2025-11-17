@@ -1,0 +1,637 @@
+SUBROUTINE RPT.CUSTOMER.ANALYSIS(REPORT.PARAMS, OUTPUT.TYPE, ERROR.CODE, ERROR.MSG)
+**************************************************************************
+* Program: RPT.CUSTOMER.ANALYSIS
+* Purpose: Generate Customer Analysis Report
+* Parameters:
+*   REPORT.PARAMS (IN) - Report parameters:
+*                        <1> = Start date
+*                        <2> = End date
+*                        <3> = Tier filter (BRONZE/SILVER/GOLD/PLATINUM)
+*                        <4> = Minimum purchases
+*                        <5> = Sort order (SALES/PURCHASES/POINTS/NAME)
+*   OUTPUT.TYPE (IN) - Output destination:
+*                      SCREEN, PRINT, FILE, EMAIL
+*   ERROR.CODE (OUT) - Error code (0 = success)
+*   ERROR.MSG (OUT) - Error message if any
+**************************************************************************
+
+$INCLUDE COMMON.INCLUDES
+
+ERROR.CODE = ERR.SUCCESS
+ERROR.MSG = ''
+
+* Parse report parameters
+START.DATE = REPORT.PARAMS<1>
+END.DATE = REPORT.PARAMS<2>
+TIER.FILTER = REPORT.PARAMS<3>
+MIN.PURCHASES = REPORT.PARAMS<4>
+SORT.ORDER = REPORT.PARAMS<5>
+
+* Default to current month if no dates specified
+IF START.DATE = '' THEN
+   MONTH.STR = OCONV(SYSTEM.DATE, 'D4/')[1,7]
+   START.DATE = ICONV('01/' : MONTH.STR, 'D/')
+END
+
+IF END.DATE = '' THEN
+   END.DATE = SYSTEM.DATE
+END
+
+IF MIN.PURCHASES = '' THEN MIN.PURCHASES = 0
+IF SORT.ORDER = '' THEN SORT.ORDER = 'SALES'
+
+* Initialize report
+GOSUB INITIALIZE.REPORT
+
+* Collect customer data
+GOSUB COLLECT.CUSTOMER.DATA
+IF ERROR.CODE # ERR.SUCCESS THEN RETURN
+
+* Sort data
+GOSUB SORT.CUSTOMER.DATA
+
+* Generate report output
+GOSUB GENERATE.REPORT.OUTPUT
+
+* Output report
+GOSUB OUTPUT.REPORT
+
+LOG.MSG = 'Customer analysis report generated: ' : OUTPUT.TYPE
+CALL UTILS.COMMON('LOG.ERROR', LOG.MSG, 'INFO')
+
+RETURN
+
+**************************************************************************
+* Initialize Report
+**************************************************************************
+INITIALIZE.REPORT:
+   REPORT.TITLE = 'CUSTOMER ANALYSIS REPORT'
+   REPORT.DATE = SYSTEM.DATE
+   REPORT.TIME = SYSTEM.TIME
+   REPORT.USER = USER.ID
+
+   * Initialize counters
+   TOTAL.CUSTOMERS = 0
+   TOTAL.TRANSACTIONS = 0
+   TOTAL.SALES = 0
+   TOTAL.POINTS.EARNED = 0
+   TOTAL.POINTS.REDEEMED = 0
+
+   * Initialize data storage
+   REPORT.DATA = ''
+   RETURN
+
+**************************************************************************
+* Collect Customer Data
+**************************************************************************
+COLLECT.CUSTOMER.DATA:
+   * Build selection criteria
+   SELECT.CMD = 'SELECT CUSTOMERS WITH STATUS = "ACTIVE"'
+
+   IF TIER.FILTER # '' THEN
+      SELECT.CMD := ' AND WITH LOYALTY.TIER = "' : TIER.FILTER : '"'
+   END
+
+   EXECUTE SELECT.CMD
+
+   CUSTOMER.COUNT = 0
+
+   LOOP
+      READNEXT CUST.ID ELSE EXIT
+
+      READ CUST.REC FROM F.CUSTOMERS, CUST.ID ELSE CONTINUE
+
+      * Calculate customer metrics
+      GOSUB CALCULATE.CUSTOMER.METRICS
+
+      * Apply filters
+      IF CUST.PURCHASES < MIN.PURCHASES THEN CONTINUE
+
+      * Store customer data
+      GOSUB STORE.CUSTOMER.DATA
+
+      CUSTOMER.COUNT += 1
+   REPEAT
+
+   IF CUSTOMER.COUNT = 0 THEN
+      ERROR.CODE = ERR.RECORD.NOT.FOUND
+      ERROR.MSG = 'No customers found matching criteria'
+      RETURN
+   END
+
+   TOTAL.CUSTOMERS = CUSTOMER.COUNT
+   RETURN
+
+**************************************************************************
+* Calculate Customer Metrics
+**************************************************************************
+CALCULATE.CUSTOMER.METRICS:
+   * Customer identification
+   CUST.NAME = CUST.REC<CUST.NAME>
+   CUST.EMAIL = CUST.REC<CUST.EMAIL>
+   CUST.PHONE = CUST.REC<PHONE.MOBILE>
+   LOYALTY.ID = CUST.REC<LOYALTY.ID>
+   LOYALTY.TIER = CUST.REC<LOYALTY.TIER>
+
+   * Initialize metrics
+   CUST.PURCHASES = 0
+   CUST.TOTAL.SALES = 0
+   CUST.AVG.SALE = 0
+   CUST.POINTS.EARNED = 0
+   CUST.POINTS.REDEEMED = 0
+   CUST.LAST.PURCHASE = ''
+
+   * Get transaction history
+   SELECT.CMD = 'SELECT POS.TRANS WITH CUSTOMER.ID = "' : CUST.ID : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE <= "' : END.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   TRANS.COUNT = 0
+
+   LOOP
+      READNEXT TRANS.ID ELSE EXIT
+
+      READ TRANS.REC FROM F.POS.TRANS, TRANS.ID ELSE CONTINUE
+
+      * Count transaction
+      TRANS.COUNT += 1
+
+      * Get transaction amount
+      TRANS.TOTAL = TRANS.REC<TOTAL>
+      IF TRANS.TOTAL # '' THEN
+         CUST.TOTAL.SALES += TRANS.TOTAL
+      END
+
+      * Track last purchase
+      TRANS.DATE = TRANS.REC<TRANS.DATE>
+      IF CUST.LAST.PURCHASE = '' OR TRANS.DATE > CUST.LAST.PURCHASE THEN
+         CUST.LAST.PURCHASE = TRANS.DATE
+      END
+   REPEAT
+
+   CUST.PURCHASES = TRANS.COUNT
+
+   * Calculate average sale
+   IF CUST.PURCHASES > 0 THEN
+      CUST.AVG.SALE = CUST.TOTAL.SALES / CUST.PURCHASES
+   END
+
+   * Get loyalty points
+   IF LOYALTY.ID # '' THEN
+      GOSUB GET.LOYALTY.POINTS
+   END
+
+   * Calculate days since last purchase
+   IF CUST.LAST.PURCHASE # '' THEN
+      DAYS.SINCE.PURCHASE = SYSTEM.DATE - CUST.LAST.PURCHASE
+   END ELSE
+      DAYS.SINCE.PURCHASE = 999
+   END
+
+   * Customer lifetime value
+   LIFETIME.SALES = CUST.REC<TOTAL.PURCHASES.AMT>
+   IF LIFETIME.SALES = '' THEN LIFETIME.SALES = 0
+
+   * Update totals
+   TOTAL.TRANSACTIONS += CUST.PURCHASES
+   TOTAL.SALES += CUST.TOTAL.SALES
+   TOTAL.POINTS.EARNED += CUST.POINTS.EARNED
+   TOTAL.POINTS.REDEEMED += CUST.POINTS.REDEEMED
+   RETURN
+
+**************************************************************************
+* Get Loyalty Points
+**************************************************************************
+GET.LOYALTY.POINTS:
+   * Get points earned in period
+   SELECT.CMD = 'SELECT LOYALTY.TRANS WITH LOYALTY.ID = "' : LOYALTY.ID : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE >= "' : START.DATE : '"'
+   SELECT.CMD := ' AND WITH TRANS.DATE <= "' : END.DATE : '"'
+   EXECUTE SELECT.CMD
+
+   POINTS.EARNED = 0
+   POINTS.REDEEMED = 0
+
+   LOOP
+      READNEXT LT.ID ELSE EXIT
+
+      READ LT.REC FROM F.LOYALTY.TRANS, LT.ID ELSE CONTINUE
+
+      TRANS.TYPE = LT.REC<5>
+      POINTS.AMT = LT.REC<6>
+      IF POINTS.AMT = '' THEN POINTS.AMT = 0
+
+      IF TRANS.TYPE = 'EARN' THEN
+         POINTS.EARNED += POINTS.AMT
+      END ELSE IF TRANS.TYPE = 'REDEEM' THEN
+         POINTS.REDEEMED += POINTS.AMT
+      END
+   REPEAT
+
+   CUST.POINTS.EARNED = POINTS.EARNED
+   CUST.POINTS.REDEEMED = POINTS.REDEEMED
+   RETURN
+
+**************************************************************************
+* Store Customer Data
+**************************************************************************
+STORE.CUSTOMER.DATA:
+   * Store data row
+   DATA.ROW = CUST.ID
+   DATA.ROW := AM : CUST.NAME
+   DATA.ROW := AM : CUST.EMAIL
+   DATA.ROW := AM : LOYALTY.TIER
+   DATA.ROW := AM : CUST.PURCHASES
+   DATA.ROW := AM : CUST.TOTAL.SALES
+   DATA.ROW := AM : CUST.AVG.SALE
+   DATA.ROW := AM : CUST.POINTS.EARNED
+   DATA.ROW := AM : CUST.POINTS.REDEEMED
+   DATA.ROW := AM : CUST.LAST.PURCHASE
+   DATA.ROW := AM : DAYS.SINCE.PURCHASE
+   DATA.ROW := AM : LIFETIME.SALES
+
+   * Add to report data
+   IF REPORT.DATA = '' THEN
+      REPORT.DATA = DATA.ROW
+   END ELSE
+      REPORT.DATA := VM : DATA.ROW
+   END
+   RETURN
+
+**************************************************************************
+* Sort Customer Data
+**************************************************************************
+SORT.CUSTOMER.DATA:
+   IF REPORT.DATA = '' THEN RETURN
+
+   ROW.COUNT = DCOUNT(REPORT.DATA, VM)
+   IF ROW.COUNT <= 1 THEN RETURN
+
+   * Bubble sort
+   FOR I = 1 TO ROW.COUNT - 1
+      FOR J = I + 1 TO ROW.COUNT
+         ROW1 = REPORT.DATA<1, I>
+         ROW2 = REPORT.DATA<1, J>
+
+         GOSUB COMPARE.CUSTOMER.ROWS
+
+         IF SWAP.ROWS THEN
+            REPORT.DATA<1, I> = ROW2
+            REPORT.DATA<1, J> = ROW1
+         END
+      NEXT J
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Compare Customer Rows
+**************************************************************************
+COMPARE.CUSTOMER.ROWS:
+   SWAP.ROWS = FALSE
+
+   BEGIN CASE
+      CASE SORT.ORDER = 'NAME'
+         NAME1 = ROW1<1, 1, 2>
+         NAME2 = ROW2<1, 1, 2>
+         IF NAME1 > NAME2 THEN SWAP.ROWS = TRUE
+
+      CASE SORT.ORDER = 'SALES'
+         SALES1 = ROW1<1, 1, 6>
+         SALES2 = ROW2<1, 1, 6>
+         IF SALES1 < SALES2 THEN SWAP.ROWS = TRUE  ; Descending
+
+      CASE SORT.ORDER = 'PURCHASES'
+         PURCH1 = ROW1<1, 1, 5>
+         PURCH2 = ROW2<1, 1, 5>
+         IF PURCH1 < PURCH2 THEN SWAP.ROWS = TRUE  ; Descending
+
+      CASE SORT.ORDER = 'POINTS'
+         POINTS1 = ROW1<1, 1, 8>
+         POINTS2 = ROW2<1, 1, 8>
+         IF POINTS1 < POINTS2 THEN SWAP.ROWS = TRUE  ; Descending
+   END CASE
+   RETURN
+
+**************************************************************************
+* Generate Report Output
+**************************************************************************
+GENERATE.REPORT.OUTPUT:
+   REPORT.OUTPUT = ''
+
+   * Report header
+   GOSUB BUILD.CUSTOMER.REPORT.HEADER
+
+   * Column headers
+   GOSUB BUILD.CUSTOMER.COLUMN.HEADERS
+
+   * Detail lines
+   GOSUB BUILD.CUSTOMER.DETAIL.LINES
+
+   * Summary statistics
+   GOSUB BUILD.SUMMARY.STATISTICS
+
+   * Report footer
+   GOSUB BUILD.CUSTOMER.REPORT.FOOTER
+   RETURN
+
+**************************************************************************
+* Build Customer Report Header
+**************************************************************************
+BUILD.CUSTOMER.REPORT.HEADER:
+   SEPARATOR = CONVERT(' ', '=', SPACE(140))
+
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := '                    ' : REPORT.TITLE : CHAR(10)
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := CHAR(10)
+
+   REPORT.OUTPUT := 'Report Date: ' : OCONV(REPORT.DATE, 'D4/') : CHAR(10)
+   CALL UTILS.COMMON('FORMAT.TIME', REPORT.TIME, FMT.TIME)
+   REPORT.OUTPUT := 'Report Time: ' : FMT.TIME : CHAR(10)
+   REPORT.OUTPUT := 'Run By: ' : REPORT.USER : CHAR(10)
+   REPORT.OUTPUT := CHAR(10)
+
+   REPORT.OUTPUT := 'Period: ' : OCONV(START.DATE, 'D4/')
+   REPORT.OUTPUT := ' to ' : OCONV(END.DATE, 'D4/') : CHAR(10)
+
+   IF TIER.FILTER # '' THEN
+      REPORT.OUTPUT := 'Tier Filter: ' : TIER.FILTER : CHAR(10)
+   END
+
+   IF MIN.PURCHASES > 0 THEN
+      REPORT.OUTPUT := 'Minimum Purchases: ' : MIN.PURCHASES : CHAR(10)
+   END
+
+   REPORT.OUTPUT := CHAR(10) : SEPARATOR : CHAR(10) : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Build Customer Column Headers
+**************************************************************************
+BUILD.CUSTOMER.COLUMN.HEADERS:
+   HEADER.LINE = ''
+   HEADER.LINE := 'Customer Name' : SPACE(17)
+   HEADER.LINE := 'Tier' : SPACE(6)
+   HEADER.LINE := 'Purchases' : SPACE(2)
+   HEADER.LINE := 'Total Sales' : SPACE(3)
+   HEADER.LINE := 'Avg Sale' : SPACE(4)
+   HEADER.LINE := 'Points Earned' : SPACE(1)
+   HEADER.LINE := 'Points Used' : SPACE(2)
+   HEADER.LINE := 'Last Purchase' : SPACE(3)
+   HEADER.LINE := 'Days Since'
+
+   REPORT.OUTPUT := HEADER.LINE : CHAR(10)
+
+   UNDERLINE = CONVERT(' ', '-', SPACE(140))
+   REPORT.OUTPUT := UNDERLINE : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Build Customer Detail Lines
+**************************************************************************
+BUILD.CUSTOMER.DETAIL.LINES:
+   IF REPORT.DATA = '' THEN RETURN
+
+   ROW.COUNT = DCOUNT(REPORT.DATA, VM)
+
+   FOR I = 1 TO ROW.COUNT
+      DATA.ROW = REPORT.DATA<1, I>
+
+      CUST.ID = DATA.ROW<1, 1, 1>
+      CUST.NAME = DATA.ROW<1, 1, 2>
+      CUST.EMAIL = DATA.ROW<1, 1, 3>
+      LOYALTY.TIER = DATA.ROW<1, 1, 4>
+      CUST.PURCHASES = DATA.ROW<1, 1, 5>
+      CUST.TOTAL.SALES = DATA.ROW<1, 1, 6>
+      CUST.AVG.SALE = DATA.ROW<1, 1, 7>
+      CUST.POINTS.EARNED = DATA.ROW<1, 1, 8>
+      CUST.POINTS.REDEEMED = DATA.ROW<1, 1, 9>
+      CUST.LAST.PURCHASE = DATA.ROW<1, 1, 10>
+      DAYS.SINCE.PURCHASE = DATA.ROW<1, 1, 11>
+
+      * Format data
+      NAME.STR = CUST.NAME[1,30]
+      TIER.STR = LOYALTY.TIER[1,10]
+
+      PURCH.STR = OCONV(CUST.PURCHASES, 'R(####)')
+
+      CALL UTILS.COMMON('FORMAT.AMOUNT', CUST.TOTAL.SALES, FMT.SALES)
+      CALL UTILS.COMMON('FORMAT.AMOUNT', CUST.AVG.SALE, FMT.AVG)
+
+      EARNED.STR = OCONV(CUST.POINTS.EARNED, 'R(#####)')
+      USED.STR = OCONV(CUST.POINTS.REDEEMED, 'R(#####)')
+
+      IF CUST.LAST.PURCHASE # '' THEN
+         LAST.STR = OCONV(CUST.LAST.PURCHASE, 'D4/')
+      END ELSE
+         LAST.STR = 'N/A'
+      END
+
+      DAYS.STR = OCONV(DAYS.SINCE.PURCHASE, 'R(###)')
+
+      * Build detail line
+      DETAIL.LINE = ''
+      DETAIL.LINE := NAME.STR : SPACE(31 - LEN(NAME.STR))
+      DETAIL.LINE := TIER.STR : SPACE(11 - LEN(TIER.STR))
+      DETAIL.LINE := PURCH.STR : SPACE(12 - LEN(PURCH.STR))
+      DETAIL.LINE := FMT.SALES : SPACE(15 - LEN(FMT.SALES))
+      DETAIL.LINE := FMT.AVG : SPACE(13 - LEN(FMT.AVG))
+      DETAIL.LINE := EARNED.STR : SPACE(15 - LEN(EARNED.STR))
+      DETAIL.LINE := USED.STR : SPACE(13 - LEN(USED.STR))
+      DETAIL.LINE := LAST.STR : SPACE(17 - LEN(LAST.STR))
+      DETAIL.LINE := DAYS.STR
+
+      REPORT.OUTPUT := DETAIL.LINE : CHAR(10)
+   NEXT I
+   RETURN
+
+**************************************************************************
+* Build Summary Statistics
+**************************************************************************
+BUILD.SUMMARY.STATISTICS:
+   SEPARATOR = CONVERT(' ', '=', SPACE(140))
+
+   REPORT.OUTPUT := CHAR(10) : SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := 'SUMMARY STATISTICS' : CHAR(10)
+   REPORT.OUTPUT := SEPARATOR : CHAR(10) : CHAR(10)
+
+   * Format totals
+   CALL UTILS.COMMON('FORMAT.AMOUNT', TOTAL.SALES, FMT.TOTAL.SALES)
+
+   * Calculate averages
+   IF TOTAL.CUSTOMERS > 0 THEN
+      AVG.PURCHASES = TOTAL.TRANSACTIONS / TOTAL.CUSTOMERS
+      AVG.SALES.PER.CUST = TOTAL.SALES / TOTAL.CUSTOMERS
+   END ELSE
+      AVG.PURCHASES = 0
+      AVG.SALES.PER.CUST = 0
+   END
+
+   IF TOTAL.TRANSACTIONS > 0 THEN
+      AVG.TRANSACTION = TOTAL.SALES / TOTAL.TRANSACTIONS
+   END ELSE
+      AVG.TRANSACTION = 0
+   END
+
+   CALL UTILS.COMMON('FORMAT.AMOUNT', AVG.SALES.PER.CUST, FMT.AVG.CUST)
+   CALL UTILS.COMMON('FORMAT.AMOUNT', AVG.TRANSACTION, FMT.AVG.TRANS)
+
+   REPORT.OUTPUT := 'Total Customers: ' : TOTAL.CUSTOMERS : CHAR(10)
+   REPORT.OUTPUT := 'Total Transactions: ' : TOTAL.TRANSACTIONS : CHAR(10)
+   REPORT.OUTPUT := 'Total Sales: $' : FMT.TOTAL.SALES : CHAR(10)
+   REPORT.OUTPUT := CHAR(10)
+
+   REPORT.OUTPUT := 'Average Purchases per Customer: '
+   REPORT.OUTPUT := OCONV(AVG.PURCHASES, 'MD2') : CHAR(10)
+
+   REPORT.OUTPUT := 'Average Sales per Customer: $' : FMT.AVG.CUST : CHAR(10)
+   REPORT.OUTPUT := 'Average Transaction: $' : FMT.AVG.TRANS : CHAR(10)
+   REPORT.OUTPUT := CHAR(10)
+
+   REPORT.OUTPUT := 'Total Points Earned: ' : TOTAL.POINTS.EARNED : CHAR(10)
+   REPORT.OUTPUT := 'Total Points Redeemed: ' : TOTAL.POINTS.REDEEMED : CHAR(10)
+
+   * Tier breakdown
+   REPORT.OUTPUT := CHAR(10) : 'TIER BREAKDOWN:' : CHAR(10)
+   GOSUB CALCULATE.TIER.BREAKDOWN
+
+   REPORT.OUTPUT := CHAR(10)
+   RETURN
+
+**************************************************************************
+* Calculate Tier Breakdown
+**************************************************************************
+CALCULATE.TIER.BREAKDOWN:
+   BRONZE.COUNT = 0
+   SILVER.COUNT = 0
+   GOLD.COUNT = 0
+   PLATINUM.COUNT = 0
+
+   BRONZE.SALES = 0
+   SILVER.SALES = 0
+   GOLD.SALES = 0
+   PLATINUM.SALES = 0
+
+   IF REPORT.DATA = '' THEN RETURN
+
+   ROW.COUNT = DCOUNT(REPORT.DATA, VM)
+
+   FOR I = 1 TO ROW.COUNT
+      DATA.ROW = REPORT.DATA<1, I>
+
+      TIER = DATA.ROW<1, 1, 4>
+      SALES = DATA.ROW<1, 1, 6>
+      IF SALES = '' THEN SALES = 0
+
+      BEGIN CASE
+         CASE TIER = 'BRONZE'
+            BRONZE.COUNT += 1
+            BRONZE.SALES += SALES
+
+         CASE TIER = 'SILVER'
+            SILVER.COUNT += 1
+            SILVER.SALES += SALES
+
+         CASE TIER = 'GOLD'
+            GOLD.COUNT += 1
+            GOLD.SALES += SALES
+
+         CASE TIER = 'PLATINUM'
+            PLATINUM.COUNT += 1
+            PLATINUM.SALES += SALES
+      END CASE
+   NEXT I
+
+   * Output tier breakdown
+   IF BRONZE.COUNT > 0 THEN
+      CALL UTILS.COMMON('FORMAT.AMOUNT', BRONZE.SALES, FMT.BRONZE)
+      REPORT.OUTPUT := 'Bronze: ' : BRONZE.COUNT : ' customers, $'
+      REPORT.OUTPUT := FMT.BRONZE : CHAR(10)
+   END
+
+   IF SILVER.COUNT > 0 THEN
+      CALL UTILS.COMMON('FORMAT.AMOUNT', SILVER.SALES, FMT.SILVER)
+      REPORT.OUTPUT := 'Silver: ' : SILVER.COUNT : ' customers, $'
+      REPORT.OUTPUT := FMT.SILVER : CHAR(10)
+   END
+
+   IF GOLD.COUNT > 0 THEN
+      CALL UTILS.COMMON('FORMAT.AMOUNT', GOLD.SALES, FMT.GOLD)
+      REPORT.OUTPUT := 'Gold: ' : GOLD.COUNT : ' customers, $'
+      REPORT.OUTPUT := FMT.GOLD : CHAR(10)
+   END
+
+   IF PLATINUM.COUNT > 0 THEN
+      CALL UTILS.COMMON('FORMAT.AMOUNT', PLATINUM.SALES, FMT.PLAT)
+      REPORT.OUTPUT := 'Platinum: ' : PLATINUM.COUNT : ' customers, $'
+      REPORT.OUTPUT := FMT.PLAT : CHAR(10)
+   END
+   RETURN
+
+**************************************************************************
+* Build Customer Report Footer
+**************************************************************************
+BUILD.CUSTOMER.REPORT.FOOTER:
+   SEPARATOR = CONVERT(' ', '=', SPACE(140))
+
+   REPORT.OUTPUT := SEPARATOR : CHAR(10)
+   REPORT.OUTPUT := 'End of Report' : CHAR(10)
+   RETURN
+
+**************************************************************************
+* Output Report
+**************************************************************************
+OUTPUT.REPORT:
+   BEGIN CASE
+      CASE OUTPUT.TYPE = 'SCREEN'
+         CRT REPORT.OUTPUT
+
+      CASE OUTPUT.TYPE = 'PRINT'
+         PRINTER ON
+         PRINT REPORT.OUTPUT
+         PRINTER OFF
+
+      CASE OUTPUT.TYPE = 'FILE'
+         GOSUB OUTPUT.CUSTOMER.TO.FILE
+
+      CASE OUTPUT.TYPE = 'EMAIL'
+         GOSUB OUTPUT.CUSTOMER.TO.EMAIL
+
+      CASE 1
+         CRT REPORT.OUTPUT
+   END CASE
+   RETURN
+
+**************************************************************************
+* Output Customer to File
+**************************************************************************
+OUTPUT.CUSTOMER.TO.FILE:
+   OPEN 'REPORTS' TO F.REPORTS ELSE
+      EXECUTE 'CREATE.FILE REPORTS 1 101'
+      OPEN 'REPORTS' TO F.REPORTS ELSE RETURN
+   END
+
+   REPORT.ID = 'CUST.ANALYSIS*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   WRITE REPORT.OUTPUT TO F.REPORTS, REPORT.ID
+
+   CRT 'Report saved: ' : REPORT.ID
+   RETURN
+
+**************************************************************************
+* Output Customer to Email
+**************************************************************************
+OUTPUT.CUSTOMER.TO.EMAIL:
+   OPEN 'EMAIL.QUEUE' TO F.EMAIL.QUEUE ELSE RETURN
+
+   EMAIL.ID = 'RPT.CUST*' : SYSTEM.DATE : '*' : SYSTEM.TIME
+   EMAIL.REC = ''
+   EMAIL.REC<1> = 'marketing@company.com'
+   EMAIL.REC<2> = 'Customer Analysis Report - ' : OCONV(SYSTEM.DATE, 'D4/')
+   EMAIL.REC<3> = REPORT.OUTPUT
+   EMAIL.REC<4> = 'PENDING'
+
+   WRITE EMAIL.REC TO F.EMAIL.QUEUE, EMAIL.ID
+   RETURN
+
+END
